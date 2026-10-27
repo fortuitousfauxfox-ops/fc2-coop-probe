@@ -79,71 +79,93 @@ static int (WINAPI *o_connect)(SOCKET, const struct sockaddr *, int);
 static VOID (WINAPI *o_ExitProcess)(UINT);
 static VOID (WINAPI *o_PostQuitMessage)(int);
 
+/* lanfwd: copies of our broadcasts also go to this address (two copies on different interfaces can find each
+ * other's LAN matches); 0 = off */
+static unsigned long g_lanfwd;
 static int WINAPI h_sendto(SOCKET s, const char *b, int l, int f, const struct sockaddr *to, int tl)
 {
     char a[40], h[40];
-    int r = o_sendto(s, b, l, f, to, tl);
-    addr_str(to, a, sizeof a); hex_str(b, l, h, sizeof h);
-    logf_("sendto s=%u -> %s len=%d ret=%d data=%s", (unsigned)s, a, l, r, h);
+    int r = o_sendto(s, b, l, f, to, tl); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
+    static unsigned n, fw;
+    if (g_lanfwd && to && to->sa_family == AF_INET && (((const struct sockaddr_in *)to)->sin_addr.s_addr | 0x00FFFFFFu) == 0xFFFFFFFFu) {
+        struct sockaddr_in d = *(const struct sockaddr_in *)to;
+        d.sin_addr.s_addr = g_lanfwd;
+        o_sendto(s, b, l, f, (struct sockaddr *)&d, sizeof d);
+        if (++fw <= 20) logf_("lanfwd: broadcast to port %u (len %d) copied to %s", ntohs(d.sin_port), l, inet_ntoa(d.sin_addr));
+    }
+    /* the game's own traffic (MP sessions) is busy: log the first 40 packets, then every 500th */
+    if (++n <= 40 || n % 500 == 0) {
+        addr_str(to, a, sizeof a); hex_str(b, l, h, sizeof h);
+        logf_("sendto #%u s=%u -> %s len=%d ret=%d data=%s", n, (unsigned)s, a, l, r, h);
+    }
+    SetLastError(le);
     return r;
 }
 static int WINAPI h_recvfrom(SOCKET s, char *b, int l, int f, struct sockaddr *from, int *fl)
 {
-    int r = o_recvfrom(s, b, l, f, from, fl);
-    if (r > 0) {
+    int r = o_recvfrom(s, b, l, f, from, fl); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
+    static unsigned n;
+    if (r > 0 && (++n <= 40 || n % 500 == 0)) {
         char a[40], h[40];
         addr_str(from, a, sizeof a); hex_str(b, r, h, sizeof h);
-        logf_("recvfrom s=%u <- %s len=%d data=%s", (unsigned)s, a, r, h);
+        logf_("recvfrom #%u s=%u <- %s len=%d data=%s", n, (unsigned)s, a, r, h);
     }
+    SetLastError(le);
     return r;
 }
 static int WINAPI h_WSASendTo(SOCKET s, LPWSABUF b, DWORD c, LPDWORD sent, DWORD f, const struct sockaddr *to, int tl, LPWSAOVERLAPPED o, LPWSAOVERLAPPED_COMPLETION_ROUTINE cr)
 {
     char a[40], h[40] = "", cs[96];
-    int r = o_WSASendTo(s, b, c, sent, f, to, tl, o, cr);
+    int r = o_WSASendTo(s, b, c, sent, f, to, tl, o, cr); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
     addr_str(to, a, sizeof a);
     if (c) hex_str(b[0].buf, (int)b[0].len, h, sizeof h);
     logf_("WSASendTo s=%u -> %s len=%lu ret=%d data=%s from %s", (unsigned)s, a, c ? b[0].len : 0, r, h, CALLER(cs));
+    SetLastError(le);
     return r;
 }
 static int WINAPI h_WSARecvFrom(SOCKET s, LPWSABUF b, DWORD c, LPDWORD got, LPDWORD f, struct sockaddr *from, LPINT fl, LPWSAOVERLAPPED o, LPWSAOVERLAPPED_COMPLETION_ROUTINE cr)
 {
-    int r = o_WSARecvFrom(s, b, c, got, f, from, fl, o, cr);
+    int r = o_WSARecvFrom(s, b, c, got, f, from, fl, o, cr); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
     if (r == 0 && got && *got) {
         char a[40], h[40];
         addr_str(from, a, sizeof a); hex_str(b[0].buf, (int)*got, h, sizeof h);
         logf_("WSARecvFrom s=%u <- %s len=%lu data=%s", (unsigned)s, a, *got, h);
     }
+    SetLastError(le);
     return r;
 }
 static int WINAPI h_getaddrinfo(const char *n, const char *sv, const void *hints, void **res)
 {
     char cs[96];
-    int r = o_getaddrinfo(n, sv, hints, res);
+    int r = o_getaddrinfo(n, sv, hints, res); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
     logf_("getaddrinfo(%s, %s) ret=%d from %s", n ? n : "(null)", sv ? sv : "(null)", r, CALLER(cs));
+    SetLastError(le);
     return r;
 }
 static struct hostent *WINAPI h_gethostbyname(const char *n)
 {
     char cs[96];
-    struct hostent *r = o_gethostbyname(n);
+    struct hostent *r = o_gethostbyname(n); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
     logf_("gethostbyname(%s) ret=%s from %s", n ? n : "(null)", r ? "ok" : "null", CALLER(cs));
+    SetLastError(le);
     return r;
 }
 static int WINAPI h_bind(SOCKET s, const struct sockaddr *n, int l)
 {
     char a[40];
-    int r = o_bind(s, n, l);
+    int r = o_bind(s, n, l); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
     addr_str(n, a, sizeof a);
     logf_("bind s=%u %s ret=%d", (unsigned)s, a, r);
+    SetLastError(le);
     return r;
 }
 static int WINAPI h_connect(SOCKET s, const struct sockaddr *n, int l)
 {
     char a[40], cs[96];
-    int r = o_connect(s, n, l);
+    int r = o_connect(s, n, l); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
     addr_str(n, a, sizeof a);
     logf_("connect s=%u %s ret=%d from %s", (unsigned)s, a, r, CALLER(cs));
+    SetLastError(le);
     return r;
 }
 static VOID WINAPI h_ExitProcess(UINT c)
@@ -166,14 +188,16 @@ static HANDLE (WINAPI *o_CreateFileA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTE
 static HANDLE (WINAPI *o_CreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 static HANDLE WINAPI h_CreateFileA(LPCSTR n, DWORD a, DWORD sh, LPSECURITY_ATTRIBUTES sa, DWORD cd, DWORD fl, HANDLE t)
 {
-    HANDLE h = o_CreateFileA(n, a, sh, sa, cd, fl, t);
+    HANDLE h = o_CreateFileA(n, a, sh, sa, cd, fl, t); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
     if (n && (strstr(n, "av") || strstr(n, "Saved") || strstr(n, "Documents") || strstr(n, "Profile"))) logf_("CreateFileA %s acc=%lx disp=%lu -> %s", n, a, cd, h == INVALID_HANDLE_VALUE ? "FAIL" : "ok");
+    SetLastError(le);
     return h;
 }
 static HANDLE WINAPI h_CreateFileW(LPCWSTR n, DWORD a, DWORD sh, LPSECURITY_ATTRIBUTES sa, DWORD cd, DWORD fl, HANDLE t)
 {
-    HANDLE h = o_CreateFileW(n, a, sh, sa, cd, fl, t);
+    HANDLE h = o_CreateFileW(n, a, sh, sa, cd, fl, t); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
     if (n && (wcsstr(n, L"av") || wcsstr(n, L"Saved") || wcsstr(n, L"Documents") || wcsstr(n, L"Profile"))) logf_("CreateFileW %ls acc=%lx disp=%lu -> %s", n, a, cd, h == INVALID_HANDLE_VALUE ? "FAIL" : "ok");
+    SetLastError(le);
     return h;
 }
 
@@ -206,11 +230,24 @@ static int patch_iat(HMODULE m)
     void *want[NT];
     size_t i;
     int patched = 0;
+    char flags[128] = "";
+    {
+        /* coop_flags.txt next to the probe: "nopeek" leaves PeekMessage alone, "nonet" the winsock functions,
+         * "nofile" CreateFile (for bisecting side effects such as broken text input in the MP menus) */
+        char fp[MAX_PATH], *s;
+        FILE *f;
+        GetModuleFileNameA(g_self, fp, MAX_PATH);
+        if ((s = strrchr(fp, '\\'))) strcpy(s + 1, "coop_flags.txt");
+        if ((f = fopen(fp, "rb"))) { size_t n = fread(flags, 1, sizeof flags - 1, f); flags[n] = 0; fclose(f); logf_("probe flags: %s", flags); }
+    }
     for (i = 0; i < NT; i++) {
         HMODULE h = GetModuleHandleA(g_targets[i].dll);
+        int skip = (strstr(flags, "nopeek") && strstr(g_targets[i].name, "PeekMessage")) ||
+                   (strstr(flags, "nonet") && !strcmp(g_targets[i].dll, "ws2_32.dll")) ||
+                   (strstr(flags, "nofile") && strstr(g_targets[i].name, "CreateFile"));
         if (!h) h = LoadLibraryA(g_targets[i].dll);
-        want[i] = h ? (void *)GetProcAddress(h, g_targets[i].name) : NULL;
-        *g_targets[i].orig = want[i];
+        want[i] = (h && !skip) ? (void *)GetProcAddress(h, g_targets[i].name) : NULL;
+        *g_targets[i].orig = h ? (void *)GetProcAddress(h, g_targets[i].name) : NULL;
     }
     for (; d->Name; d++) {
         void **t = (void **)(base + d->FirstThunk);
@@ -333,6 +370,83 @@ static BYTE *g_body, *g_bodymat;
 static BYTE **g_av_body_p;
 static int g_walk;
 static float g_walk_c[3], g_walk_r, g_walk_secs, g_walk_speed;
+/* avatar mode state, defined with the avatar code below (used by the `avmode` command) */
+static int g_av_np;
+static char g_av_arch[96];
+static float g_av_yawoff, g_av_off[2];
+static unsigned long long g_av_id;
+static int g_npc_role;            /* npcsync: 1 host, 2 join */
+static float g_npc_rad = 80.0f;
+static void av_remove(void);
+static void *np_slot(BYTE *obj, int slot, unsigned k0, unsigned k1, unsigned k2);
+static int g_ws_role;
+static BYTE *env_obj(void);
+static int g_mf_on;
+static void *g_xh_vt[64], *g_xh_orig, *g_xh_obj;
+static int g_xh_n;
+/* watchd: per-frame change log of an observed pawn's memento state and DesiredData flags */
+static unsigned long long g_wd_id;
+static unsigned g_wd_n;
+static BYTE *entity_obj(unsigned long long id, void **holder_out);
+static void watchd_tick(void)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    static unsigned last[8];
+    void *holder = NULL;
+    BYTE *obj, *pawn, *m = NULL;
+    unsigned cur[8];
+    int k;
+    if (!g_wd_id || g_wd_n > 400) return;
+    obj = entity_obj(g_wd_id, &holder);
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    if (!obj) return;
+    pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
+    {
+        void **cs = *(void ***)(obj + 0x9C);
+        int n = *(int *)(obj + 0xA0);
+        for (k = 0; cs && k < n && k < 64; k++)
+            if (cs[k] && !IsBadReadPtr(cs[k], 0x174) && *(DWORD *)cs[k] == (DWORD)(g_base + 0xE1AE00)) { m = *(BYTE **)((BYTE *)cs[k] + 0x170); break; }
+    }
+    if (!pawn) return;
+    cur[0] = *(unsigned *)(pawn + 0x144); cur[1] = pawn[0x140 + 0xA4];
+    cur[2] = m ? m[0x104] : 0xEE; cur[3] = m ? m[0x110] : 0xEE; cur[4] = m ? m[0x11C] : 0xEE;
+    cur[5] = m ? *(unsigned *)(m + 0x264) : 0; cur[6] = m ? *(unsigned *)(m + 0x1A0) : 0; cur[7] = pawn[0xD8 + 0x52];
+    if (memcmp(cur, last, sizeof cur)) {
+        g_wd_n++;
+        logf_("watchd %u: D+4..7 %08x D+A4 %u | mem 104=%u 110=%u 11C=%u 264=%08x 1A0=%08x | pawn+D8+52 %u", GetTickCount(), cur[0], cur[1],
+              cur[2], cur[3], cur[4], cur[5], cur[6], cur[7]);
+        memcpy(last, cur, sizeof cur);
+    }
+}
+
+/* evlog: event types seen by an observed pawn's base beautifier */
+static void *g_ev_vt[64], *g_ev_orig;
+static unsigned g_ev_ids[64], g_ev_cnt[64];
+static int g_ev_n;
+static unsigned __attribute__((thiscall)) ev_hook(void *self, int *ev)
+{
+    if (ev && !IsBadReadPtr(ev, 8)) {
+        typedef BYTE *(__attribute__((thiscall)) *type_t)(void *o);
+        BYTE *ty = ((type_t)(*(void ***)ev)[1])(ev);
+        if (ty && !IsBadReadPtr(ty, 0x20)) {
+            unsigned depth = *(unsigned *)(ty + 4), last = depth >= 1 && depth < 6 ? *(unsigned *)(ty + 4 + 4 * depth) : 0;
+            int i;
+            for (i = 0; i < g_ev_n && g_ev_ids[i] != last; i++) ;
+            if (i == g_ev_n && g_ev_n < 64) { g_ev_ids[g_ev_n] = last; g_ev_cnt[g_ev_n++] = 0;
+                logf_("evlog: new event type %08x (depth %u, ids %08x %08x %08x %08x %08x), event %p", last, depth, *(unsigned *)(ty + 8),
+                      *(unsigned *)(ty + 0xC), *(unsigned *)(ty + 0x10), *(unsigned *)(ty + 0x14), *(unsigned *)(ty + 0x18), ev); }
+            if (i < 64 && ++g_ev_cnt[i] % 50 == 0) logf_("evlog: type %08x seen %u times", last, g_ev_cnt[i]);
+        }
+    }
+    return ((unsigned (__attribute__((thiscall)) *)(void *, int *))g_ev_orig)(self, ev);
+}
+static void __attribute__((thiscall)) xshot_hook(void *self, void *pawn);
+static unsigned g_xh_calls;
+static float g_av_kp = 0.0f;           /* avatar position-error gain (avkp <k>), 0 = off (did not help, see notes) */
+static unsigned g_av_directfire = 2; /* 0 state (not working yet), 1 direct: weapon vf+0x80 + event, 2 event only */
+static int g_av_fake;
+static float g_av_fake_c[3], g_av_fake_r, g_av_fake_secs, g_av_fake_speed;
+static DWORD g_av_fake_t0, g_av_fake_last;
 static DWORD g_walk_t0;
 static int g_net_cfg;  /* 1 = start requested, 2 = running */
 static unsigned g_net_lport, g_net_pport;
@@ -438,10 +552,58 @@ static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, con
     logf_("findbody done: %d match(es) near entity %.3f %.3f %.3f, nearest dist %.3f", found, ex, ey, ez, *body_out ? best : -1.0f);
     return *body_out != NULL;
 }
+/* give the NetPlayer avatar a weapon the way the Lua AddWeapon handler (LAB_109f9310) does for the local player:
+ * spawn the weapon entity, CWeapon comp (key FE01F8), category = *(vf+0x8C()), inventory = FUN_1007e140(pawn comp),
+ * the old weapon of that category FUN_10129de0 -> FUN_1012e3e0(old, 0) and its entity removed, FUN_101289f0(weapon),
+ * then select it like SelectWeapon (FUN_1012ce80 -> FUN_1012b9b0: inventory weapon mode +0x78 = 1, current weapon) */
+static int av_give_weapon(const char *arch)
+{
+    typedef void *(__fastcall *inv_t)(void *pawn);
+    typedef unsigned (__attribute__((thiscall)) *slot_t)(void *weapon);
+    typedef void *(__attribute__((thiscall)) *inslot_t)(void *inv, unsigned slot);
+    typedef void (__attribute__((thiscall)) *drop_t)(void *inv, void *weapon, int f);
+    typedef void (__attribute__((thiscall)) *add_t)(void *inv, void *weapon);
+    typedef void *(__attribute__((thiscall)) *cur_t)(void *inv);
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    char code[256], out[64];
+    void *holder = NULL, *wholder = NULL, *pawn, *wc, *inv, *old;
+    BYTE *obj = g_av_id ? entity_obj(g_av_id, &holder) : NULL, *wobj;
+    unsigned long long wid;
+    unsigned slot;
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    if (!obj) { logf_("avweapon: no avatar"); return 0; }
+    snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('%s', %.3f, %.3f, %.3f, 0, 0, 0))", arch,
+             *(float *)(obj + 0x60), *(float *)(obj + 0x64), *(float *)(obj + 0x68) + 1.0f);
+    lua_eval(code, out, sizeof out);
+    wid = strtoull(out, NULL, 10);
+    wobj = (wid && wid != 0xFFFFFFFFFFFFFFFFull) ? entity_obj(wid, &wholder) : NULL;
+    if (wholder) (*(int *)((BYTE *)wholder + 8))--;
+    if (!wobj) { logf_("avweapon: spawn of %s failed (%s)", arch, out); return 0; }
+    pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
+    wc = ((gcomp_t)(g_base + 0x4E2CC0))(wobj, (void *)(g_base + 0xFE01F8));
+    if (!pawn || !wc) { logf_("avweapon: pawn %p weapon comp %p (weapon entity %llu)", pawn, wc, wid); return 0; }
+    slot = ((slot_t)(*(void ***)wc)[0x8C / 4])(wc);
+    inv = ((inv_t)(g_base + 0x7E140))(pawn);
+    if (!inv) { logf_("avweapon: avatar has no inventory"); return 0; }
+    old = ((inslot_t)(g_base + 0x129DE0))(inv, slot);
+    if (old) { void *oh = *(void **)((BYTE *)old + 8); ((drop_t)(g_base + 0x12E3E0))(inv, old, 0); if (oh) { snprintf(code, sizeof code, "RemoveEntity('%llu') __out = 'ok'", *(unsigned long long *)oh); lua_eval(code, out, sizeof out); } }
+    ((add_t)(g_base + 0x1289F0))(inv, wc);
+    /* select it like the Lua SelectWeapon (FUN_1012ce80 -> FUN_1012b9b0 with the weapon's category hash, the value
+     * at the vf+0x8C pointer): this switches the inventory to weapon mode (+0x78 = 1) and makes it current */
+    {
+        typedef void (__attribute__((thiscall)) *sel_t)(void *inv, unsigned *cat);
+        unsigned cat = IsBadReadPtr((void *)slot, 4) ? 0 : *(unsigned *)slot;
+        if (cat) ((sel_t)(g_base + 0x12CE80))(inv, &cat);
+        logf_("avweapon: %s entity %llu weapon %p category %08x -> inventory %p (old %p), current weapon now %p", arch, wid, wc,
+              cat, inv, old, ((cur_t)(g_base + 0x127DA0))(inv));
+    }
+    return 1;
+}
+
 static void native_cmd(const char *ln)
 {
     unsigned long long id;
-    unsigned long a, pv;
+    unsigned long a, pv, k0, k1;
     float fx, fy, fz;
     int n;
     if (sscanf(ln, "peek %lx %d", &a, &n) == 2) {
@@ -495,6 +657,407 @@ static void native_cmd(const char *ln)
         if (!g_av_body_p || !*g_av_body_p || IsBadWritePtr(*g_av_body_p + a, 12)) { logf_("avvel: no avatar body"); return; }
         *(float *)(*g_av_body_p + a) = fx; *(float *)(*g_av_body_p + a + 4) = fy; *(float *)(*g_av_body_p + a + 8) = fz;
         logf_("avvel: wrote %.2f %.2f %.2f at avatar body+0x%lx", fx, fy, fz, a);
+    } else if (sscanf(ln, "findvt %lx %lx", &a, &pv) == 2) {
+        /* findvt <vtable rva> <back offset> [match]: list objects whose first word is base+rva (chunked, fault-safe
+         * reads like findbody) and the 4 words at object-back (e.g. the owner struct around an embedded object);
+         * with match, only objects where one of those 4 words equals it */
+        static BYTE chunk[0x10000 + 0x40];
+        MEMORY_BASIC_INFORMATION mbi;
+        BYTE *p = NULL;
+        unsigned vt = (unsigned)(g_base + a);
+        unsigned long match = 0;
+        int found = 0, has_match = sscanf(ln, "findvt %*x %*x %lx", &match) == 1;
+        while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi && found < 64) {
+            if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (mbi.Protect & PAGE_READWRITE) && mbi.RegionSize < 0x20000000) {
+                BYTE *rb = (BYTE *)mbi.BaseAddress, *rend = rb + mbi.RegionSize, *c;
+                for (c = rb; c < rend && found < 64; c += 0x10000) {
+                    size_t n = (size_t)(rend - c), k;
+                    if (n > sizeof chunk) n = sizeof chunk;
+                    if (!safe_read(c, chunk, n)) continue;
+                    for (k = 0; k + 4 <= n && k < 0x10000 && found < 64; k += 4) {
+                        if (*(unsigned *)(chunk + k) == vt) {
+                            unsigned w[4] = { 0, 0, 0, 0 };
+                            safe_read(c + k - pv, w, sizeof w);
+                            if (has_match && w[0] != match && w[1] != match && w[2] != match && w[3] != match) continue;
+                            logf_("findvt: object %p, at -0x%lx: %08x %08x %08x %08x", c + k, pv, w[0], w[1], w[2], w[3]);
+                            found++;
+                        }
+                    }
+                }
+            }
+            p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+        }
+        logf_("findvt done: %d object(s) with vtable RVA %lx", found, a);
+    } else if (sscanf(ln, "addcomp %llu %lx", &id, &a) == 2) {
+        /* addcomp <entity id> <factory rva>: create a component with the engine factory (no args) and attach it
+         * with the engine's AddComponent (thiscall on the entity object, RVA 4E0D80: set owner, push, init, activate) */
+        typedef void *(*factory_t)(void);
+        typedef void (__attribute__((thiscall)) *addcomp_t)(void *ent, void *comp);
+        void **pm = (void **)(g_base + RVA_ENTMGR_PTR);
+        void *holder = NULL, *comp;
+        BYTE *obj;
+        if (IsBadReadPtr(pm, 4) || !*pm) { logf_("addcomp: entity manager null"); return; }
+        ((getent_t)(g_base + RVA_GETENTITY))(*pm, &holder, (unsigned)id, (unsigned)(id >> 32));
+        if (!holder || IsBadReadPtr(holder, 16) || !*(void **)((BYTE *)holder + 0xC)) { logf_("addcomp %llu: no entity", id); return; }
+        obj = *(BYTE **)((BYTE *)holder + 0xC);
+        logf_("addcomp %llu: entity %p, %u component(s) before", id, obj, *(unsigned *)(obj + 0xA0));
+        comp = ((factory_t)(g_base + a))();
+        if (!comp) { logf_("addcomp: factory %lx returned null", a); return; }
+        logf_("addcomp: factory %lx -> %p (vtable %08x)", a, comp, *(unsigned *)comp);
+        ((addcomp_t)(g_base + 0x4E0D80))(obj, comp);
+        logf_("addcomp: attached %p, %u component(s) after, comp+8 = %08x", comp, *(unsigned *)(obj + 0xA0), *(unsigned *)((BYTE *)comp + 8));
+    } else if (sscanf(ln, "netcompstart %lx %lx", &a, &pv) == 2) {
+        /* netcompstart <component address> <remote>: the engine's net component start (thiscall RVA 4EB820) that the
+         * net layer calls with 1 for objects announced by a remote station */
+        typedef void (__attribute__((thiscall)) *start_t)(void *comp, int remote);
+        BYTE *comp = (BYTE *)a;
+        if (IsBadReadPtr(comp, 0x190)) { logf_("netcompstart: %lx not readable", a); return; }
+        logf_("netcompstart %p: vtable %08x, started byte %u, calling start(%lu)", comp, *(unsigned *)comp, comp[0x44], pv);
+        ((start_t)(g_base + 0x4EB820))(comp, (int)pv);
+        logf_("netcompstart %p: +40 %08x, chans %08x %08x %08x, roles %u %u %u, mementos %08x %08x %08x %08x, helper %08x",
+              comp, *(unsigned *)(comp + 0x40), *(unsigned *)(comp + 0x150), *(unsigned *)(comp + 0x154), *(unsigned *)(comp + 0x158),
+              *(unsigned *)(comp + 0x15C), *(unsigned *)(comp + 0x160), *(unsigned *)(comp + 0x164),
+              *(unsigned *)(comp + 0x168), *(unsigned *)(comp + 0x16C), *(unsigned *)(comp + 0x170), *(unsigned *)(comp + 0x174),
+              *(unsigned *)(comp + 0x180));
+    } else if (sscanf(ln, "avfake %f %f %f %f %f %f %f", &g_av_fake_c[0], &g_av_fake_c[1], &g_av_fake_c[2], &g_av_fake_r, &g_av_fake_secs, &g_av_fake_speed, &fx) >= 6) {
+        /* avfake <cx> <cy> <cz> <radius> <secs> <speed>: replace the peer's data by a point walking a circle (needs netstart) */
+        g_av_fake_t0 = GetTickCount(); g_av_fake_last = 0; g_av_fake = 1;
+        logf_("avfake: circle r %.1f around %.2f %.2f %.2f for %.0f s at %.2f m/s", g_av_fake_r, g_av_fake_c[0], g_av_fake_c[1], g_av_fake_c[2], g_av_fake_secs, g_av_fake_speed);
+    } else if (strncmp(ln, "avweapon ", 9) == 0) {
+        /* avweapon <weapon archetype>: spawn the weapon entity and put it into the avatar's inventory the way the Lua
+         * AddWeapon handler (LAB_109f9310) does for the local player: CWeapon comp (key FE01F8), slot = vf+0x8C,
+         * inventory = FUN_1007e140(pawn comp), old weapon in that slot FUN_10129de0 -> FUN_1012e3e0(old, 0), then
+         * FUN_101289f0(weapon) */
+        char arch[96];
+        if (sscanf(ln + 9, "%95s", arch) == 1) av_give_weapon(arch);
+    } else if (strncmp(ln, "npcs", 4) == 0 && strncmp(ln, "npcsync", 7) != 0) {
+        /* npcs [radius] (read-only census): every AI pawn agent (CPawnAgent, vtable RVA EC5078; agent+4 = pawn entity
+         * holder) with entity id, position, distance to our player, health (counters +0x44 -> +0x10 / +0x14) and
+         * archetype name (Lua GetEntityName) for those within the radius (default 120 m) */
+        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+        static BYTE chunk[0x10000];
+        MEMORY_BASIC_INFORMATION mbi;
+        BYTE *p = NULL, *me;
+        void *mh = NULL;
+        unsigned vt = (unsigned)(g_base + 0xEC5078);
+        float rad = 120.0f, mp[3] = { 0, 0, 0 };
+        int found = 0, close = 0;
+        sscanf(ln + 4, "%f", &rad);
+        if (!g_net_id) { char o[32]; lua_eval("__out = tostring(GetLocalPlayerId())", o, sizeof o); g_net_id = strtoull(o, NULL, 10); }
+        me = entity_obj(g_net_id, &mh);
+        if (mh) (*(int *)((BYTE *)mh + 8))--;
+        if (me) memcpy(mp, me + 0x60, sizeof mp);
+        while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi && found < 400) {
+            if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (mbi.Protect & PAGE_READWRITE) && mbi.RegionSize < 0x20000000) {
+                BYTE *rb = (BYTE *)mbi.BaseAddress, *rend = rb + mbi.RegionSize, *c;
+                for (c = rb; c < rend && found < 400; c += sizeof chunk) {
+                    size_t n = (size_t)(rend - c), k;
+                    if (n > sizeof chunk) n = sizeof chunk;
+                    if (!safe_read(c, chunk, n)) continue;
+                    for (k = 0; k + 8 <= n && found < 400; k += 4) {
+                        BYTE *ag = c + k, *holder, *obj, *cc, *hc;
+                        float d, hp = -1, hpmax = -1;
+                        char code[96], name[80] = "";
+                        if (*(unsigned *)(chunk + k) != vt) continue;
+                        holder = *(BYTE **)(chunk + k + 4);
+                        if (!holder || IsBadReadPtr(holder, 16) || !(obj = *(BYTE **)(holder + 0xC)) || IsBadReadPtr(obj, 0x70)) continue;
+                        found++;
+                        d = sqrtf((*(float *)(obj + 0x60) - mp[0]) * (*(float *)(obj + 0x60) - mp[0]) +
+                                  (*(float *)(obj + 0x64) - mp[1]) * (*(float *)(obj + 0x64) - mp[1]));
+                        if (d > rad) continue;
+                        close++;
+                        cc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDF9A8));
+                        if (cc && !IsBadReadPtr(cc + 0x44, 4) && (hc = *(BYTE **)(cc + 0x44)) && !IsBadReadPtr(hc, 0x18)) { hp = *(float *)(hc + 0x10); hpmax = *(float *)(hc + 0x14); }
+                        snprintf(code, sizeof code, "__out = tostring(GetEntityName('%llu'))", *(unsigned long long *)holder);
+                        lua_eval(code, name, sizeof name);
+                        logf_("npc %llu: %s pos (%.1f %.1f %.1f) dist %.1f hp %.0f/%.0f agent %p", *(unsigned long long *)holder, name,
+                              *(float *)(obj + 0x60), *(float *)(obj + 0x64), *(float *)(obj + 0x68), d, hp, hpmax, ag);
+                    }
+                }
+            }
+            p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+        }
+        logf_("npcs done: %d agents, %d within %.0f m", found, close, rad);
+    } else if (strcmp(ln, "pawns") == 0) {
+        /* pawns (read-only): every pawn net component (vtable RVA E1AE00) with its entity id, position, role bytes,
+         * mementos, beautifier slots and current weapon - to compare a real MP remote player with our avatar */
+        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+        typedef void *(__fastcall *inv_t)(void *pawn);
+        typedef void *(__attribute__((thiscall)) *cur_t)(void *inv);
+        static BYTE chunk[0x10000];
+        MEMORY_BASIC_INFORMATION mbi;
+        BYTE *p = NULL;
+        unsigned vt = (unsigned)(g_base + 0xE1AE00);
+        int found = 0;
+        while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi && found < 32) {
+            if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (mbi.Protect & PAGE_READWRITE) && mbi.RegionSize < 0x20000000) {
+                BYTE *rb = (BYTE *)mbi.BaseAddress, *rend = rb + mbi.RegionSize, *c;
+                for (c = rb; c < rend && found < 32; c += sizeof chunk) {
+                    size_t n = (size_t)(rend - c), k;
+                    if (n > sizeof chunk) n = sizeof chunk;
+                    if (!safe_read(c, chunk, n)) continue;
+                    for (k = 0; k + 4 <= n && found < 32; k += 4) {
+                        BYTE *comp = c + k, *holder, *obj, *bc, *pawn, *inv, *wc;
+                        if (*(unsigned *)(chunk + k) != vt || IsBadReadPtr(comp, 0x190)) continue;
+                        holder = *(BYTE **)(comp + 8);
+                        if (!holder || IsBadReadPtr(holder, 16) || !(obj = *(BYTE **)(holder + 0xC)) || IsBadReadPtr(obj, 0xA4)) continue;
+                        found++;
+                        bc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4));
+                        pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
+                        inv = pawn ? ((inv_t)(g_base + 0x7E140))(pawn) : NULL;
+                        wc = inv ? ((cur_t)(g_base + 0x127DA0))(inv) : NULL;
+                        logf_("pawn %llu: comp %p pos (%.1f %.1f %.1f) +40 %u roles %u/%u/%u mementos %08x %08x %08x equip %08x wstate %08x | "
+                              "beautifier main vt %08x base vt %08x | weapon %p", *(unsigned long long *)holder, comp,
+                              *(float *)(obj + 0x60), *(float *)(obj + 0x64), *(float *)(obj + 0x68), *(unsigned *)(comp + 0x40),
+                              *(unsigned *)(comp + 0x15C), *(unsigned *)(comp + 0x160), *(unsigned *)(comp + 0x164),
+                              *(unsigned *)(comp + 0x168), *(unsigned *)(comp + 0x16C), *(unsigned *)(comp + 0x170),
+                              *(unsigned *)(comp + 0x178), *(unsigned *)(comp + 0x184),
+                              bc && *(void **)(bc + 0x28) ? **(unsigned **)(bc + 0x28) : 0, bc && *(void **)(bc + 0x2C) ? **(unsigned **)(bc + 0x2C) : 0, wc);
+                    }
+                }
+            }
+            p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+        }
+        logf_("pawns done: %d", found);
+    } else if (sscanf(ln, "watchd %llu", &id) == 1) {
+        /* watchd <entity id> (observation): every frame, log changes of that pawn's ThirdParty memento state bytes
+         * (+0x104 bit, +0x110 flag, +0x11C mode, +0x264 fire mode, +0x1A0) and of its DesiredData flags (pawn comp
+         * +0x140: +4..+7, +0xA4) - how a real remote player's fire / stance arrive */
+        g_wd_id = id; g_wd_n = 0;
+        logf_("watchd: watching %llu", id);
+    } else if (sscanf(ln, "evlog %llu", &id) == 1) {
+        /* evlog <entity id> (observation): a private vtable copy for that pawn's base beautifier whose event slot
+         * (vf+0x54) counts every event type it receives and logs each new type, then calls the original */
+        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+        void *holder = NULL;
+        BYTE *obj = entity_obj(id, &holder), *bc, *bt;
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        bc = obj ? ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4)) : NULL;
+        bt = bc ? *(BYTE **)(bc + 0x2C) : NULL;
+        if (!bt || IsBadReadPtr(*(void **)bt, sizeof g_ev_vt)) { logf_("evlog %llu: no base beautifier", id); return; }
+        if (*(void ***)bt != g_ev_vt) {
+            memcpy(g_ev_vt, *(void **)bt, sizeof g_ev_vt);
+            g_ev_orig = g_ev_vt[0x54 / 4]; g_ev_vt[0x54 / 4] = (void *)ev_hook;
+            *(void ***)bt = g_ev_vt;
+        }
+        logf_("evlog %llu: base beautifier %p hooked (fire-bullet type id %08x)", id, bt, *(unsigned *)(g_base + 0xFE15F8));
+    } else if (sscanf(ln, "avmpflag %d", &n) == 1) {
+        g_mf_on = n != 0;
+        logf_("avmpflag: avatar main beautifier updates %s the MP flag", g_mf_on ? "with" : "without");
+    } else if (strncmp(ln, "npcsync ", 8) == 0) {
+        float rad = 0;
+        g_npc_role = strstr(ln, "host") ? 1 : strstr(ln, "join") ? 2 : 0;
+        if (sscanf(ln + 8, "%*s %f", &rad) == 1 && rad > 0) g_npc_rad = rad;
+        logf_("npcsync: %s (radius %.0f m)", g_npc_role == 1 ? "host (sending the NPCs around us)" : g_npc_role == 2 ? "join (NPCs follow the host)" : "off", g_npc_rad);
+    } else if (strncmp(ln, "worldsync ", 10) == 0) {
+        g_ws_role = strstr(ln + 10, "host") ? 1 : strstr(ln + 10, "join") ? 2 : 0;
+        logf_("worldsync: %s", g_ws_role == 1 ? "host (sending time of day)" : g_ws_role == 2 ? "join (following the host's time)" : "off");
+        if (g_ws_role) env_obj();
+    } else if (sscanf(ln, "settod %f", &fx) == 1) {
+        BYTE *env = env_obj();
+        if (env) { *(float *)(env + 0x260) = fx; ((void (__attribute__((thiscall)) *)(void *))(g_base + 0x11AC10))(env);
+                   ((void (__attribute__((thiscall)) *)(void *))(g_base + 0x11D450))(env); logf_("settod: time set to %.4f", fx); }
+    } else if (sscanf(ln, "avkp %f", &fx) == 1) {
+        g_av_kp = fx;
+        logf_("avkp: avatar position-error gain %.2f%s", g_av_kp, g_av_kp > 0 ? "" : " (off: game velocity only)");
+    } else if (strncmp(ln, "avfiremode ", 11) == 0) {
+        g_av_directfire = strstr(ln + 11, "direct") ? 1 : strstr(ln + 11, "event") ? 2 : 0;
+        logf_("avfiremode: %s", g_av_directfire == 1 ? "direct (weapon vf+0x80 + event 0x121ADE93)" : g_av_directfire == 2 ? "event only (0x121ADE93)" :
+              "state (weapon graph from the replicated fire bit)");
+    } else if (strncmp(ln, "lanfwd ", 7) == 0) {
+        g_lanfwd = inet_addr(ln + 7);
+        if (g_lanfwd == INADDR_NONE) g_lanfwd = 0;
+        logf_("lanfwd: broadcasts also go to %s", g_lanfwd ? ln + 7 : "(off)");
+    } else if (strncmp(ln, "xhook", 5) == 0) {
+        /* xhook [avatar | <entity id>]: hook the shot method of the current weapon object X of our player (default), the
+         * avatar, or any pawn entity (e.g. a remote MP player) */
+        typedef void *(__fastcall *inv_t)(void *pawn);
+        typedef void *(__attribute__((thiscall)) *cur_t)(void *inv);
+        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+        void *holder = NULL, *pawn, *inv, *wc;
+        unsigned long long xid = strstr(ln, "avatar") ? g_av_id : strtoull(ln + 5, NULL, 10) ? strtoull(ln + 5, NULL, 10) : g_net_id;
+        BYTE *obj = entity_obj(xid, &holder), *x;
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        pawn = obj ? ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)) : NULL;
+        inv = pawn ? ((inv_t)(g_base + 0x7E140))(pawn) : NULL;
+        wc = inv ? ((cur_t)(g_base + 0x127DA0))(inv) : NULL;
+        x = wc ? *(BYTE **)(*(BYTE **)((BYTE *)wc + 0x24) + 0x54) : NULL;
+        if (!x || IsBadReadPtr(*(void **)x, sizeof g_xh_vt)) { logf_("xhook: no weapon object (weapon %p)", wc); return; }
+        if (*(void ***)x != g_xh_vt) {
+            memcpy(g_xh_vt, *(void **)x, sizeof g_xh_vt);
+            g_xh_orig = g_xh_vt[0x20 / 4];
+            g_xh_vt[0x20 / 4] = (void *)xshot_hook;
+            *(void ***)x = g_xh_vt; g_xh_obj = x; g_xh_n = 0;
+        }
+        logf_("xhook: weapon %p object %p, original shot slot %p", wc, x, g_xh_orig);
+    } else if (strcmp(ln, "avdraw") == 0) {
+        /* avdraw: draw the avatar's weapon like the Lua DrawWeapon handler (FUN_109f8460) does for the local player:
+         * inventory mode FUN_10125f40 == 1 and no current weapon -> FUN_10129d90 (pending?) or FUN_1012b310 (select),
+         * then event 0x2A47E3A3 to the pawn (vf+0x78 -> FUN_1029da10) */
+        typedef void *(__fastcall *inv_t)(void *pawn);
+        typedef int (__attribute__((thiscall)) *iget_t)(void *inv);
+        typedef char (__attribute__((thiscall)) *sel_t)(void *inv);
+        typedef void *(__attribute__((thiscall)) *tags_t)(void *pawn);
+        typedef void (__attribute__((thiscall)) *ev_t)(void *tags, unsigned ev);
+        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+        void *holder = NULL, *pawn, *inv, *tags;
+        BYTE *obj = g_av_id ? entity_obj(g_av_id, &holder) : NULL;
+        int mode, cur, pend = -1;
+        char ok = 0;
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        pawn = obj ? ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)) : NULL;
+        inv = pawn ? ((inv_t)(g_base + 0x7E140))(pawn) : NULL;
+        if (!inv) { logf_("avdraw: no avatar inventory"); return; }
+        mode = ((iget_t)(g_base + 0x125F40))(inv);
+        cur = ((iget_t)(g_base + 0x127DA0))(inv);
+        if (mode == 1 && !cur) {
+            pend = ((iget_t)(g_base + 0x129D90))(inv);
+            ok = pend ? 1 : ((sel_t)(g_base + 0x12B310))(inv);
+        }
+        if (ok) {
+            tags = ((tags_t)(*(void ***)pawn)[0x78 / 4])(pawn);
+            if (tags) ((ev_t)(g_base + 0x29DA10))(tags, 0x2A47E3A3u);
+        }
+        logf_("avdraw: inventory %p mode %d current %08x pending %08x select %d -> current now %08x", inv, mode, cur, pend, ok,
+              ((iget_t)(g_base + 0x127DA0))(inv));
+    } else if (sscanf(ln, "npslot %lx %lx %lx %lx", &a, &pv, &k0, &k1) == 4) {
+        /* npslot <slot +28|+2C> <k0> <profile> <pose> (hex, ffffffff = none): put that repository beautifier in a slot of
+         * the NetPlayer avatar */
+        void *holder = NULL;
+        BYTE *obj = g_av_id ? entity_obj(g_av_id, &holder) : NULL;
+        unsigned k2 = 0xFFFFFFFFu;
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        sscanf(ln, "npslot %*x %*x %*x %x", &k2);
+        if (!obj) logf_("npslot: no avatar");
+        else np_slot(obj, (int)a, (unsigned)pv, (unsigned)k0, k2);
+    } else if (strncmp(ln, "avmode", 6) == 0) {
+        /* avmode np [archetype] [yaw offset] [offset x] [offset y] | avmode body: how the network avatar is shown */
+        char arch[96] = "";
+        float yo = 0, ox = 0, oy = 0;
+        if (strncmp(ln + 6, " np", 3) == 0) {
+            if (sscanf(ln + 9, "%95s %f %f %f", arch, &yo, &ox, &oy) >= 1 && arch[0]) strcpy(g_av_arch, arch);
+            g_av_yawoff = yo; g_av_off[0] = ox; g_av_off[1] = oy;
+            g_av_np = 1;
+        } else g_av_np = 0;
+        if (g_av_id) av_remove();
+        logf_("avmode: %s (archetype %s, yaw offset %.1f, test offset %.2f %.2f)", g_av_np ? "netplayer" : "body", g_av_arch, g_av_yawoff, g_av_off[0], g_av_off[1]);
+    } else if (sscanf(ln, "getcomp %llu %lx", &id, &a) == 2) {
+        /* getcomp <entity id> <type key rva>: find a component by type (FUN_104e2cc0) and log its address, the object
+         * at +0x44 and the first 0x60 bytes of both (e.g. key FDF9A8 = CCountersComponentGO) */
+        typedef void *(__attribute__((thiscall)) *gc_t)(void *ent, void *key);
+        void *holder = NULL;
+        BYTE *obj = entity_obj(id, &holder), *c, *sub;
+        int k;
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        if (!obj) { logf_("getcomp %llu: no entity", id); return; }
+        c = ((gc_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + a));
+        logf_("getcomp %llu %lx: component %p", id, a, c);
+        if (!c || IsBadReadPtr(c, 0x60)) return;
+        for (k = 0; k < 0x60; k += 16) logf_("  comp+%02x: %08x %08x %08x %08x", k, *(unsigned *)(c + k), *(unsigned *)(c + k + 4), *(unsigned *)(c + k + 8), *(unsigned *)(c + k + 12));
+        sub = *(BYTE **)(c + 0x44);
+        if (!sub || IsBadReadPtr(sub, 0x60)) return;
+        for (k = 0; k < 0x60; k += 16) logf_("  sub+%02x: %08x %08x %08x %08x", k, *(unsigned *)(sub + k), *(unsigned *)(sub + k + 4), *(unsigned *)(sub + k + 8), *(unsigned *)(sub + k + 12));
+    } else if (sscanf(ln, "tpbuild %lx", &a) == 1) {
+        /* tpbuild <component address>: give a not-started pawn net component only the ThirdParty pieces that the
+         * NetPlayer beautifier reads (remote flag, started flag, +0x164 = 1, ThirdParty memento at +0x170) */
+        typedef void *(*factory_t)(void);
+        BYTE *comp = (BYTE *)a;
+        void *mem;
+        if (IsBadWritePtr(comp, 0x190) || *(unsigned *)comp != (unsigned)(g_base + 0xE1AE00)) { logf_("tpbuild: %lx is not a pawn net component", a); return; }
+        if (comp[0x44]) { logf_("tpbuild: %p already started", comp); return; }
+        mem = ((factory_t)(g_base + 0x40110))();
+        if (!mem) { logf_("tpbuild: memento factory returned null"); return; }
+        *(unsigned *)(comp + 0x40) = 1;
+        comp[0x44] = 1;
+        *(unsigned *)(comp + 0x164) = 1;
+        *(void **)(comp + 0x170) = mem;
+        logf_("tpbuild %p: memento %p (vtable %08x), +164 = 1, started", comp, mem, *(unsigned *)mem);
+    } else if (sscanf(ln, "tppos %lx %lx %f %f %f", &a, &pv, &fx, &fy, &fz) == 5) {
+        /* tppos <memento> <block offset> <x> <y> <z>: write a position into a ThirdParty memento in the quantized form
+         * FUN_100a5040 reads (per axis: cell*4 + frac*scale/(2^bits-1); frac at +14/+28/+3C, bits at +1C/+30/+44, cell at
+         * +50/+5C/+68 from the block), keeping the bit counts the memento constructor chose; marks the fields dirty */
+        static const unsigned fo[3] = { 0x14, 0x28, 0x3C }, bo[3] = { 0x1C, 0x30, 0x44 }, co[3] = { 0x50, 0x5C, 0x68 };
+        static const unsigned dirty[6] = { 0x10, 0x24, 0x38, 0x4C, 0x58, 0x64 };
+        BYTE *blk = (BYTE *)a + pv;
+        float v[3], scale = *(float *)(g_base + 0xE98754);
+        int k;
+        v[0] = fx; v[1] = fy; v[2] = fz;
+        if (IsBadWritePtr(blk, 0x70)) { logf_("tppos: %p not writable", blk); return; }
+        for (k = 0; k < 3; k++) {
+            unsigned bits = *(unsigned *)(blk + bo[k]), maxv;
+            int cell = (int)floorf(v[k] / 4.0f);
+            float rem = v[k] - cell * 4.0f;
+            if (bits == 0 || bits > 31) { logf_("tppos: axis %d has %u bits, not writing", k, bits); return; }
+            maxv = (1u << bits) - 1;
+            *(int *)(blk + co[k]) = cell;
+            *(int *)(blk + fo[k]) = (int)(rem / scale * maxv + 0.5f);
+        }
+        for (k = 0; k < 6; k++) blk[dirty[k]] = 1;
+        logf_("tppos %p+%lx: scale %.3f, bits %u %u %u, cells %d %d %d, fracs %d %d %d", (void *)a, pv, scale,
+              *(unsigned *)(blk + 0x1C), *(unsigned *)(blk + 0x30), *(unsigned *)(blk + 0x44),
+              *(int *)(blk + 0x50), *(int *)(blk + 0x5C), *(int *)(blk + 0x68),
+              *(int *)(blk + 0x14), *(int *)(blk + 0x28), *(int *)(blk + 0x3C));
+    } else if (strncmp(ln, "tpvec ", 6) == 0) {
+        /* tpvec <memento> <block offset> <scale rva> <n> <v0> [v1 [v2]]: write n quantized floats (frac at block+8+0x14*i,
+         * bits at block+0x10+0x14*i, dirty at block+4+0x14*i; value = frac*scale/(2^bits-1)) ??? velocity block 0x70 with
+         * scale RVA ED9D34, aim angles block 0xAC / 0xD4 with scale RVA E11D38 */
+        unsigned long mb, off, srva;
+        int n = 0, k;
+        float vv[3] = { 0, 0, 0 }, scale;
+        BYTE *blk;
+        if (sscanf(ln + 6, "%lx %lx %lx %d %f %f %f", &mb, &off, &srva, &n, &vv[0], &vv[1], &vv[2]) < 5 || n < 1 || n > 3) { logf_("tpvec: bad args"); return; }
+        blk = (BYTE *)mb + off;
+        scale = *(float *)(g_base + srva);
+        if (IsBadWritePtr(blk, 0x40) || scale == 0.0f) { logf_("tpvec: bad block %p or scale %f", blk, scale); return; }
+        for (k = 0; k < n; k++) {
+            BYTE *f = blk + 0x14 * k;
+            unsigned bits = *(unsigned *)(f + 0x10);
+            if (bits == 0 || bits > 31) { logf_("tpvec: field %d has %u bits, not writing", k, bits); return; }
+            *(int *)(f + 8) = (int)lrintf(vv[k] / scale * (float)((1u << bits) - 1));
+            f[4] = 1;
+        }
+        logf_("tpvec %p+%lx: scale %.4f, n %d, values %.3f %.3f %.3f -> %d %d %d", (void *)mb, off, scale, n, vv[0], vv[1], vv[2],
+              *(int *)(blk + 8), n > 1 ? *(int *)(blk + 0x1C) : 0, n > 2 ? *(int *)(blk + 0x30) : 0);
+    } else if (sscanf(ln, "beautnet %llu", &id) == 1) {
+        /* beautnet <entity id>: replace the pawn's BASE beautifier (CPawnBeautifierComponent +0x2C) with a clone of the
+         * repository prototype for {network, -, -} (CPawnBeautifierNetPlayer), the way FUN_100e9380 installs one */
+        typedef void *(__attribute__((thiscall)) *getcomp_t)(void *ent, void *key);
+        typedef void *(*getrepo_t)(void);
+        typedef void *(__attribute__((thiscall)) *find_t)(void *repo, unsigned *key);
+        typedef void (__attribute__((thiscall)) *vf0_t)(void *self);
+        typedef void (__attribute__((thiscall)) *vfdel_t)(void *self, int flags);
+        typedef void *(__attribute__((thiscall)) *vfclone_t)(void *self);
+        typedef void (__attribute__((thiscall)) *vfbind_t)(void *self, void *pawn, void *bcomp);
+        void **pm = (void **)(g_base + RVA_ENTMGR_PTR);
+        void *holder = NULL, *bc, *pawn, *repo, *proto, *old, *nb;
+        unsigned key[3];
+        BYTE *obj;
+        if (IsBadReadPtr(pm, 4) || !*pm) { logf_("beautnet: entity manager null"); return; }
+        ((getent_t)(g_base + RVA_GETENTITY))(*pm, &holder, (unsigned)id, (unsigned)(id >> 32));
+        if (!holder || IsBadReadPtr(holder, 16) || !*(void **)((BYTE *)holder + 0xC)) { logf_("beautnet %llu: no entity", id); return; }
+        obj = *(BYTE **)((BYTE *)holder + 0xC);
+        bc = ((getcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4));
+        pawn = ((getcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
+        repo = ((getrepo_t)(g_base + 0xD4710))();
+        if (!bc || !pawn || !repo) { logf_("beautnet: beautifier comp %p, pawn %p, repository %p", bc, pawn, repo); return; }
+        key[0] = 0x608487bc; key[1] = key[2] = *(unsigned *)(g_base + 0xE2C55C);
+        proto = ((find_t)(g_base + 0xD3DB0))(repo, key);
+        old = *(void **)((BYTE *)bc + 0x2C);
+        logf_("beautnet %llu: comp %p (main %p, base %p, key %08x %08x %08x), pawn %p, network proto %p",
+              id, bc, *(void **)((BYTE *)bc + 0x28), old, *(unsigned *)((BYTE *)bc + 0x1C), *(unsigned *)((BYTE *)bc + 0x20),
+              *(unsigned *)((BYTE *)bc + 0x24), pawn, proto);
+        if (!proto) return;
+        if (old) {
+            ((vf0_t)(*(void ***)old)[0x88 / 4])(old);
+            ((vfdel_t)(*(void ***)old)[0])(old, 1);
+        }
+        nb = ((vfclone_t)(*(void ***)proto)[0x78 / 4])(proto);
+        *(void **)((BYTE *)bc + 0x2C) = nb;
+        if (nb) {
+            ((vfbind_t)(*(void ***)nb)[0x8C / 4])(nb, pawn, bc);
+            ((vf0_t)(*(void ***)nb)[0x84 / 4])(nb);
+        }
+        logf_("beautnet %llu: base beautifier now %p (vtable %08x)", id, nb, nb ? *(unsigned *)nb : 0);
     } else if (sscanf(ln, "findbody %llu", &id) == 1) {
         find_body(id, &g_body, &g_bodymat, NULL);
     } else if (strncmp(ln, "posb", 4) == 0) {
@@ -620,6 +1183,17 @@ static void hold_tick(void)
 /* ---- own UDP transport: position exchange between two copies ---- */
 #pragma pack(push, 1)
 typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; } NetPkt;
+/* extended packet: NetPkt plus raw fields of the game's own ThirdParty memento for the sender's player, filled by the
+ * game's encoder FUN_100a6ec0 (velocity and aim angles as quantized ints, both sides use the same bit counts), and
+ * the stance bit (+0x104), move mode (+0x11C) and flag (+0x110). Old 28-byte packets are still accepted. */
+typedef struct { NetPkt b; int vel[3]; int aim[4]; unsigned char s104, s11c, s110, valid; } NetPktX;
+/* v2: plus the archetype name of the weapon in the sender's hands ("" = none / holstered); v3: plus the last bullet
+ * the sender fired (CWeaponEventFireBullet: sequence, point +0x40, target point +0x4C, mode +0x64) */
+typedef struct { NetPktX x; char weap[48]; } NetPktX2;
+typedef struct { NetPktX2 w; unsigned shot_seq; float shot_p[3], shot_t[3]; int shot_mode; } NetPktX3;
+/* v4: plus world state from the host (worldsync host): time of day (environment object +0x260, fraction of a day)
+ * and day counter (+0x4EC); world_valid = 1 when sent by a host */
+typedef struct { NetPktX3 s; float tod; int day; int world_valid; } NetPktX4;
 #pragma pack(pop)
 #define NET_MAGIC 0x43324346u
 static SOCKET g_ns = INVALID_SOCKET;
@@ -627,12 +1201,634 @@ static struct sockaddr_in g_peer;
 static DWORD g_net_lastsend, g_net_lastlog, g_net_lastfind, g_net_lastrx;
 static unsigned g_net_seq, g_net_tx, g_net_rx, g_net_drop;
 static NetPkt g_remote;
+static NetPktX g_rx_ext;          /* last extended fields from the peer (valid = 0 when the peer sends old packets) */
+static BYTE *g_tx_mem, g_tx_this[0x40], *g_av_comp;
+static void *g_tx_wcur;                     /* sender: weapon component last seen in our hands */
+static char g_tx_weap[48], g_rx_weap[48], g_av_weap[48];
+/* shots: our player's bullets seen by the hooked beautifier event slot, and the peer's last bullet */
+static unsigned g_shot_seq, g_rx_shot_seq, g_av_shot_seq;
+static float g_shot_p[3], g_shot_t[3], g_rx_shot_p[3], g_rx_shot_t[3];
+static int g_shot_mode, g_rx_shot_mode;
+static void *g_shot_bt, *g_shot_vt[64], *g_shot_orig;
+static DWORD g_av_weap_try;
+static void np_watch(void);
+static unsigned g_tx_ok, g_tx_lastlog;
+/* world sync: the host sends its time of day and day counter, the joiner follows (worldsync host | join | off) */
+static int g_ws_role, g_rx_world, g_rx_day;
+static float g_rx_tod;
+static BYTE *g_env;
+static BYTE *env_obj(void)
+{
+    /* the environment / time-of-day object (ctor FUN_10123d00, vtable RVA E1F190, second vtable E1F168) */
+    MEMORY_BASIC_INFORMATION mbi;
+    BYTE *p = NULL;
+    static BYTE chunk[0x10000];
+    unsigned v1 = (unsigned)(g_base + 0xE1F190), v2 = (unsigned)(g_base + 0xE1F168);
+    if (g_env && !IsBadReadPtr(g_env, 0x500) && *(unsigned *)g_env == v1) return g_env;
+    g_env = NULL;
+    while (!g_env && VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi) {
+        if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (mbi.Protect & PAGE_READWRITE) && mbi.RegionSize < 0x20000000) {
+            BYTE *rb = (BYTE *)mbi.BaseAddress, *rend = rb + mbi.RegionSize, *c;
+            for (c = rb; c < rend && !g_env; c += sizeof chunk) {
+                size_t n = (size_t)(rend - c), k;
+                if (n > sizeof chunk) n = sizeof chunk;
+                if (!safe_read(c, chunk, n)) continue;
+                for (k = 0; k + 8 <= n; k += 4)
+                    if (*(unsigned *)(chunk + k) == v1 && *(unsigned *)(chunk + k + 4) == v2) { g_env = c + k; break; }
+            }
+        }
+        p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+    }
+    if (g_env) logf_("worldsync: environment object %p (time %.4f, day %d)", g_env, *(float *)(g_env + 0x260), *(int *)(g_env + 0x4EC));
+    return g_env;
+}
+static void world_tick(DWORD now)
+{
+    /* joiner: follow the host's time when it differs by more than ~2 game minutes; FUN_1011ac10 / FUN_1011d450 are
+     * what the time setter FUN_1011da90 calls after writing +0x260 (sky / lighting refresh) */
+    static DWORD last;
+    BYTE *env;
+    float d;
+    if (g_ws_role != 2 || !g_rx_world || now - last < 1000) return;
+    last = now;
+    if (!(env = env_obj())) return;
+    d = *(float *)(env + 0x260) - g_rx_tod;
+    if (d < 0) d = -d;
+    if (d > 43200.0f) d = 86400.0f - d;  /* +0x260 is game seconds since midnight */
+    if (d > 60.0f || *(int *)(env + 0x4EC) != g_rx_day) {
+        logf_("worldsync: time %.4f day %d -> host %.4f day %d", *(float *)(env + 0x260), *(int *)(env + 0x4EC), g_rx_tod, g_rx_day);
+        *(float *)(env + 0x260) = g_rx_tod; *(int *)(env + 0x4EC) = g_rx_day;
+        ((void (__attribute__((thiscall)) *)(void *))(g_base + 0x11AC10))(env);
+        ((void (__attribute__((thiscall)) *)(void *))(g_base + 0x11D450))(env);
+    }
+}
+/* fire state: the encoder copies "state +4 bit 3" (on while the trigger fires) into ThirdParty +0x104, but it is sampled
+ * only at send time (20 Hz) and a shot sets it for a frame or two, so the sender latches it every frame; the receiver
+ * either lets the weapon graph fire from that state (default) or fires directly (`avfiremode direct`) */
+static BYTE *g_tx_pawn;
+static unsigned g_tx_latch, g_tx_latched, g_av_directfire;
+static void fire_latch_tick(void)
+{
+    if (g_tx_pawn && !IsBadReadPtr(g_tx_pawn + 0x2D0, 8) && (g_tx_pawn[0x2D0 + 4] & 8)) g_tx_latch = 1;
+}
 static unsigned long long g_av_id;
 static BYTE *g_av_body, *g_av_mat;
 static void av_init_ptr(void) { g_av_body_p = &g_av_body; }
 static float g_av_cur[3], g_av_dir[2];
 static int g_av_have;
 static DWORD g_av_lastspawn, g_av_lastfind;
+
+/* NetPlayer avatar mode (`avmode np [archetype] [yaw offset deg] [offset x] [offset y]`): the avatar is a buddy-archetype
+ * pawn with an added pawn net component in the ThirdParty role and the CPawnBeautifierNetPlayer base beautifier, and
+ * the probe writes the ThirdParty memento every tick the way the net layer would (see local notes for the layout) */
+static int g_av_np;
+static char g_av_arch[96] = "buddies.UFLL.UFLL_HQDoorman";
+static float g_av_yawoff, g_av_off[2];
+static BYTE *g_av_mem;
+static int g_av_npstate;
+static float g_av_lastpos[3], g_av_vel[3], g_av_logpos[3];
+static DWORD g_av_lastlog;
+static float g_av_hp;
+static unsigned g_av_hpmax;
+static int g_av_smhave;
+static unsigned g_av_lastseq;
+static DWORD g_av_lastt;
+
+typedef void *(*np_factory_t)(void);
+typedef void (__attribute__((thiscall)) *np_addcomp_t)(void *ent, void *comp);
+typedef void *(__attribute__((thiscall)) *np_getcomp_t)(void *ent, void *key);
+typedef void *(__attribute__((thiscall)) *np_find_t)(void *repo, unsigned *key);
+typedef void (__attribute__((thiscall)) *np_vf0_t)(void *self);
+typedef void (__attribute__((thiscall)) *np_vfdel_t)(void *self, int flags);
+typedef void *(__attribute__((thiscall)) *np_vfclone_t)(void *self);
+typedef void (__attribute__((thiscall)) *np_vfbind_t)(void *self, void *pawn, void *bcomp);
+
+/* quantized memento field {vtable, dirty byte +4, frac +8, ?, bits +0x10}: value = frac * scale / (2^bits - 1) */
+static void np_q(BYTE *f, float v, float scale)
+{
+    unsigned bits = *(unsigned *)(f + 0x10);
+    if (bits == 0 || bits > 31) return;
+    *(int *)(f + 8) = (int)lrintf(v / scale * (float)((1u << bits) - 1));
+    f[4] = 1;
+}
+
+/* position block (memento+4 or +0x1A4): per axis cell*4 + frac*4/(2^bits-1); frac fields at +0xC/+0x20/+0x34, cells
+ * {vtable, dirty +4, int +8} at +0x48/+0x54/+0x60 */
+static void np_pos(BYTE *b, const float *p)
+{
+    int k;
+    for (k = 0; k < 3; k++) {
+        int cell = (int)floorf(p[k] / 4.0f);
+        BYTE *c = b + 0x48 + 0xC * k;
+        *(int *)(c + 8) = cell; c[4] = 1;
+        np_q(b + 0xC + 0x14 * k, p[k] - cell * 4.0f, 4.0f);
+    }
+}
+
+static float np_dq(const BYTE *f, float scale)
+{
+    unsigned bits = *(const unsigned *)(f + 0x10);
+    if (bits == 0 || bits > 31) return 0;
+    return *(const int *)(f + 8) * scale / (float)((1u << bits) - 1);
+}
+
+/* sender: let the game's own ThirdParty encoder (FUN_100a6ec0, the NetPlayer writer) fill a private memento from our
+ * player and copy its velocity, aim angles, stance bit, move mode and flag into the packet. The encoder only reads
+ * this+0x10 (the pawn component, as the beautifier bind FUN_105545b0 stores it), so a small fake object will do. */
+/* our player's bullets: in MP the pawn's NetPlayer gets every CWeaponEventFireBullet in its event slot (vf+0x54,
+ * FUN_100a5830) and keeps point / target / mode for the ThirdParty fire block. Our player has the Player beautifier
+ * instead, so its base beautifier gets a private copy of its vtable with slot 0x54 pointing here: record the bullet,
+ * then call the original slot. */
+typedef unsigned (__attribute__((thiscall)) *bt_event_t)(void *self, int *ev);
+static int g_lx_inshot, g_lx_ntypes;
+static unsigned g_lx_types[8];
+static unsigned __attribute__((thiscall)) shot_hook(void *self, int *ev)
+{
+    if (g_lx_inshot && ev && !IsBadReadPtr(ev, 8) && g_lx_ntypes < 8) {
+        /* research: every event type the player's beautifier gets while our weapon is shooting */
+        typedef BYTE *(__attribute__((thiscall)) *type1_t)(void *o);
+        BYTE *ty = ((type1_t)(*(void ***)ev)[1])(ev);
+        if (ty && !IsBadReadPtr(ty, 0x20)) { unsigned d = *(unsigned *)(ty + 4); g_lx_types[g_lx_ntypes++] = d >= 1 && d < 6 ? *(unsigned *)(ty + 4 + 4 * d) : 0; }
+    }
+    if (ev && !IsBadReadPtr(ev, 0x68)) {
+        typedef void *(__attribute__((thiscall)) *type_t)(void *o);
+        BYTE *ty;
+        if (*(int *)(g_base + 0xFE15E4) == 0) ((void (*)(void))(g_base + 0xA4E80))();
+        ty = ((type_t)(*(void ***)ev)[1])(ev);
+        if (ty && *(unsigned *)(ty + 4) > 3 && *(unsigned *)(ty + 0x14) == *(unsigned *)(g_base + 0xFE15F8)) {
+            memcpy(g_shot_p, ev + 0x10, sizeof g_shot_p);
+            /* ev +0x4C is the muzzle (shooter side) point; FUN_100a5830 stores it relative to the pawn (scale 3) */
+            memcpy(g_shot_t, ev + 0x13, sizeof g_shot_t);
+            {
+                int i;
+                void *hd = NULL;
+                BYTE *me = g_bodymat ? NULL : entity_obj(g_net_id, &hd);
+                if (hd) (*(int *)((BYTE *)hd + 8))--;
+                for (i = 0; i < 3; i++) g_shot_t[i] -= g_bodymat ? *(float *)(g_bodymat + 0x30 + 4 * i) : me ? *(float *)(me + 0x60 + 4 * i) : 0;
+            }
+            g_shot_mode = ev[0x19];
+            g_shot_seq++;
+            if (g_shot_seq < 200)
+                logf_("shot %u: point (%.2f %.2f %.2f) muzzle offset (%.2f %.2f %.2f) mode %d", g_shot_seq, g_shot_p[0], g_shot_p[1], g_shot_p[2],
+                      g_shot_t[0], g_shot_t[1], g_shot_t[2], g_shot_mode);
+        }
+    }
+    return ((bt_event_t)g_shot_orig)(self, ev);
+}
+
+static void shot_hook_install(BYTE *obj)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    BYTE *bc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4));
+    void *bt = bc ? *(void **)(bc + 0x2C) : NULL;
+    if (!bt || (bt == g_shot_bt && *(void ***)bt == g_shot_vt) || IsBadReadPtr(*(void **)bt, sizeof g_shot_vt)) return;
+    memcpy(g_shot_vt, *(void **)bt, sizeof g_shot_vt);
+    g_shot_orig = g_shot_vt[0x54 / 4];
+    g_shot_vt[0x54 / 4] = (void *)shot_hook;
+    *(void ***)bt = g_shot_vt;
+    g_shot_bt = bt;
+    logf_("shot hook: player base beautifier %p (vtable copied, event slot was %p)", bt, g_shot_orig);
+}
+
+/* research: who calls the weapon's shot method (X = [[weapon+0x24]+0x54], vf+0x20 = FUN_10114330)? `xhook` gives our
+ * player's current weapon object X a private vtable copy whose slot 0x20 logs each distinct caller (RVA) and the
+ * call stack's next two return addresses, then runs the original. */
+static void *g_xh_vt[64], *g_xh_orig, *g_xh_obj;
+static unsigned g_xh_seen[16];
+static int g_xh_n;
+static void __attribute__((thiscall)) xshot_hook(void *self, void *pawn)
+{
+    unsigned ra = (unsigned)__builtin_return_address(0) - (unsigned)g_base;
+    g_xh_calls++;
+    int i;
+    for (i = 0; i < g_xh_n && g_xh_seen[i] != ra; i++) ;
+    if (i == g_xh_n && g_xh_n < 16) {
+        /* the game code has no frame pointers: list code addresses found on the stack instead (likely return addresses) */
+        unsigned *sp = (unsigned *)__builtin_frame_address(0), lo = (unsigned)g_base + 0x1000, hi = (unsigned)g_base + 0xE00000, got[8];
+        int k, n = 0;
+        g_xh_seen[g_xh_n++] = ra;
+        for (k = 0; k < 160 && n < 8 && !IsBadReadPtr(sp + k, 4); k++) if (sp[k] > lo && sp[k] < hi) got[n++] = sp[k] - (unsigned)g_base;
+        logf_("xhook: shot method called from RVA %X, pawn %p, stack code addresses: %X %X %X %X %X %X %X %X", ra, pawn,
+              n > 0 ? got[0] : 0, n > 1 ? got[1] : 0, n > 2 ? got[2] : 0, n > 3 ? got[3] : 0, n > 4 ? got[4] : 0, n > 5 ? got[5] : 0,
+              n > 6 ? got[6] : 0, n > 7 ? got[7] : 0);
+    }
+    ((void (__attribute__((thiscall)) *)(void *, void *))g_xh_orig)(self, pawn);
+}
+
+/* sender shot counter: bullet events miss shots (e.g. aimed at the ground close by), so the shot method of our own
+ * current weapon object X (vf+0x20, FUN_10114330) is hooked through a private vtable copy and counted */
+static void *g_lx_vt[64], *g_lx_orig;
+static BYTE *g_lx_obj;
+static unsigned g_lx_shots, g_lx_noevent, g_lx_aimed;
+static void __attribute__((thiscall)) lx_hook(void *self, void *pawn)
+{
+    unsigned before = g_shot_seq;
+    g_lx_inshot = 1; g_lx_ntypes = 0;
+    ((void (__attribute__((thiscall)) *)(void *, void *))g_lx_orig)(self, pawn);
+    g_lx_inshot = 0;
+    g_lx_shots++;
+    if (g_shot_seq == before) g_lx_noevent++;
+    if (g_lx_shots <= 300) {
+        /* research: per shot - aim angles (our own ThirdParty memento, decoded), bullet events and other event types */
+        BYTE *m = g_tx_mem;
+        logf_("shotlog %u: aim (%.3f %.3f) bullets %u%s last point (%.2f %.2f %.2f) | events during shot: %d [%08x %08x %08x %08x]", g_lx_shots,
+              m ? np_dq(m + 0xAC, 360) : 0.0f, m ? np_dq(m + 0xC0, 360) : 0.0f, g_shot_seq - before, g_shot_seq == before ? " (NONE)" : "",
+              g_shot_p[0], g_shot_p[1], g_shot_p[2], g_lx_ntypes, g_lx_types[0], g_lx_types[1], g_lx_types[2], g_lx_types[3]);
+    }
+}
+static void lx_hook_weapon(void *wc)
+{
+    BYTE *y = wc ? *(BYTE **)((BYTE *)wc + 0x24) : NULL, *x = y ? *(BYTE **)(y + 0x54) : NULL;
+    static void *seen_wc;
+    static DWORD seen_t;
+    if (!x || *(void ***)x == g_lx_vt || IsBadReadPtr(*(void **)x, sizeof g_lx_vt)) return;
+    /* only the weapon object class we know (vtable RVA E1EA18, shot method FUN_10114330), and only once the weapon
+     * has been in our hands for 2 s (hooking during the draw crashed once in FUN_10110470) */
+    if (*(unsigned *)x != (unsigned)(g_base + 0xE1EA18)) return;
+    if (wc != seen_wc) { seen_wc = wc; seen_t = GetTickCount(); return; }
+    if (GetTickCount() - seen_t < 2000) return;
+    memcpy(g_lx_vt, *(void **)x, sizeof g_lx_vt);
+    g_lx_orig = g_lx_vt[0x20 / 4]; g_lx_vt[0x20 / 4] = (void *)lx_hook;
+    *(void ***)x = g_lx_vt; g_lx_obj = x;
+    logf_("tx: counting shots of our weapon object %p", x);
+}
+
+typedef void (__attribute__((thiscall)) *np_encode_t)(void *self, void *memento);
+static void tx_encode(BYTE *obj, NetPktX *p, DWORD now)
+{
+    BYTE *m;
+    void *pawn = ((np_getcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
+    int k;
+    if (!pawn) return;
+    if (!g_tx_mem) {
+        g_tx_mem = ((np_factory_t)(g_base + 0x40110))();
+        logf_("tx: own ThirdParty memento %p", g_tx_mem);
+        if (!g_tx_mem) return;
+    }
+    m = g_tx_mem;
+    shot_hook_install(obj);
+    *(void **)(g_tx_this + 0x10) = pawn;
+    ((np_encode_t)(g_base + 0xA6EC0))(g_tx_this, m);
+    for (k = 0; k < 3; k++) p->vel[k] = *(int *)(m + 0x78 + 0x14 * k);
+    p->aim[0] = *(int *)(m + 0xB4); p->aim[1] = *(int *)(m + 0xC8);
+    p->aim[2] = *(int *)(m + 0xDC); p->aim[3] = *(int *)(m + 0xF0);
+    g_tx_pawn = (BYTE *)pawn;
+    p->s104 = m[0x104] | (BYTE)g_tx_latch; p->s11c = m[0x11C]; p->s110 = m[0x110]; p->valid = 1;
+    if (g_tx_latch && !m[0x104] && ++g_tx_latched <= 30) logf_("tx: fire bit latched between packets (%u)", g_tx_latched);
+    g_tx_latch = 0;
+    g_tx_ok++;
+    {
+        /* the weapon in our hands: inventory FUN_1007e140(pawn), mode FUN_10125f40 (1 = weapons), current FUN_10127da0;
+         * its archetype name is looked up (Lua GetEntityName) only when the current weapon changes */
+        typedef void *(__fastcall *inv_t)(void *pawn);
+        typedef int (__attribute__((thiscall)) *iget_t)(void *inv);
+        typedef void *(__attribute__((thiscall)) *cur_t)(void *inv);
+        void *inv = ((inv_t)(g_base + 0x7E140))(pawn), *cur = NULL;
+        if (inv && ((iget_t)(g_base + 0x125F40))(inv) == 1) cur = ((cur_t)(g_base + 0x127DA0))(inv);
+        if (cur) lx_hook_weapon(cur);
+        if (cur != g_tx_wcur) {
+            char code[96];
+            void *wh = cur ? *(void **)((BYTE *)cur + 8) : NULL;
+            g_tx_wcur = cur; g_tx_weap[0] = 0;
+            if (wh && !IsBadReadPtr(wh, 8)) {
+                snprintf(code, sizeof code, "__out = tostring(GetEntityName('%llu'))", *(unsigned long long *)wh);
+                lua_eval(code, g_tx_weap, sizeof g_tx_weap);
+                if (!strcmp(g_tx_weap, "nil")) g_tx_weap[0] = 0;
+            }
+            logf_("tx: weapon in hands now '%s' (%p)", g_tx_weap, cur);
+        }
+    }
+    if (now - g_tx_lastlog >= 1000) {
+        g_tx_lastlog = now;
+        logf_("tx: vel (%.2f %.2f %.2f) aim (%.1f %.1f | %.1f %.1f) stance %u mode %u flag %u",
+              np_dq(m + 0x70, 15), np_dq(m + 0x84, 15), np_dq(m + 0x98, 15),
+              np_dq(m + 0xAC, 360), np_dq(m + 0xC0, 360), np_dq(m + 0xD4, 360), np_dq(m + 0xE8, 360), m[0x104], m[0x11C], m[0x110]);
+    }
+}
+
+/* put a clone of the repository prototype for key {k0, profile, pose} into a beautifier slot of the entity
+ * (+0x2C base, +0x28 main); 0xFFFFFFFF in the key means "none" (the game's value at E2C55C). Returns the new one. */
+static void *np_slot(BYTE *obj, int slot, unsigned k0, unsigned k1, unsigned k2)
+{
+    void *bc, *pawn, *repo, *proto, *old, *nb;
+    unsigned key[3], none = *(unsigned *)(g_base + 0xE2C55C);
+    bc = ((np_getcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4));
+    pawn = ((np_getcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
+    repo = ((np_factory_t)(g_base + 0xD4710))();
+    if (!bc || !pawn || !repo) { logf_("avatar np: beautifier comp %p pawn %p repository %p", bc, pawn, repo); return NULL; }
+    key[0] = k0 == 0xFFFFFFFFu ? none : k0; key[1] = k1 == 0xFFFFFFFFu ? none : k1; key[2] = k2 == 0xFFFFFFFFu ? none : k2;
+    proto = ((np_find_t)(g_base + 0xD3DB0))(repo, key);
+    if (!proto) { logf_("avatar np: no beautifier prototype for %08x %08x %08x", key[0], key[1], key[2]); return NULL; }
+    old = *(void **)((BYTE *)bc + slot);
+    if (old) { ((np_vf0_t)(*(void ***)old)[0x88 / 4])(old); ((np_vfdel_t)(*(void ***)old)[0])(old, 1); }
+    nb = ((np_vfclone_t)(*(void ***)proto)[0x78 / 4])(proto);
+    *(void **)((BYTE *)bc + slot) = nb;
+    if (nb) { ((np_vfbind_t)(*(void ***)nb)[0x8C / 4])(nb, pawn, bc); ((np_vf0_t)(*(void ***)nb)[0x84 / 4])(nb); }
+    logf_("avatar np: slot +%02x <- prototype %p (vt %08x) for %08x %08x %08x, new %p (old %p)", slot, proto, *(unsigned *)proto,
+          key[0], key[1], key[2], nb, old);
+    return nb;
+}
+
+/* swap the avatar's base beautifier (slot +0x2C) for a clone of the {network} prototype; returns the new one */
+static void *np_beaut(BYTE *obj)
+{
+    return np_slot(obj, 0x2C, 0x608487bc, 0xFFFFFFFFu, 0xFFFFFFFFu);
+}
+
+/* attach the net component, give it the ThirdParty pieces and swap the base beautifier; returns the memento */
+static BYTE *np_setup(unsigned long long id)
+{
+    void *holder = NULL, *nb;
+    BYTE *obj = entity_obj(id, &holder), *comp, *mem;
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    if (!obj) return NULL;
+    /* network archetypes (PawnPlayerNetwork) already carry a CPawnNetworkComponent (vtable RVA E1AE00): reuse it */
+    comp = NULL;
+    {
+        void **cs = *(void ***)(obj + 0x9C);
+        int k, n = *(int *)(obj + 0xA0);
+        for (k = 0; cs && k < n && k < 64; k++)
+            if (cs[k] && !IsBadReadPtr(cs[k], 4) && *(DWORD *)cs[k] == (DWORD)(g_base + 0xE1AE00)) { comp = cs[k]; break; }
+    }
+    if (comp) logf_("avatar np: reusing the archetype's net component %p (memento %p)", comp, *(void **)(comp + 0x170));
+    else {
+        comp = ((np_factory_t)(g_base + 0x40840))();
+        if (!comp) return NULL;
+        ((np_addcomp_t)(g_base + 0x4E0D80))(obj, comp);
+    }
+    mem = *(BYTE **)(comp + 0x170);
+    if (!mem) mem = ((np_factory_t)(g_base + 0x40110))();
+    if (!mem) return NULL;
+    *(unsigned *)(comp + 0x40) = 1; comp[0x44] = 1; *(unsigned *)(comp + 0x164) = 1; *(BYTE **)(comp + 0x170) = mem;
+    /* NetPlayer sets the pawn's first counter (health, at CCountersComponentGO +0x44: value +0x10, max +0x14) from
+     * memento +0x13C / +0x14C every frame; the defaults (1 of 1) kill it, so start from the pawn's own values */
+    {
+        BYTE *cc = ((np_getcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDF9A8)), *hc;
+        g_av_hp = 100.0f; g_av_hpmax = 100;
+        if (cc && !IsBadReadPtr(cc + 0x44, 4) && (hc = *(BYTE **)(cc + 0x44)) && !IsBadReadPtr(hc, 0x18)) {
+            g_av_hp = *(float *)(hc + 0x10); g_av_hpmax = (unsigned)*(float *)(hc + 0x14);
+            if (g_av_hp < 1.0f || g_av_hpmax < 1) { g_av_hp = 100.0f; g_av_hpmax = 100; }
+        }
+        *(float *)(mem + 0x13C) = g_av_hp; mem[0x134] = 1;
+        *(unsigned *)(mem + 0x14C) = g_av_hpmax; mem[0x148] = 1;
+        logf_("avatar np: health %.0f of %u", g_av_hp, g_av_hpmax);
+    }
+    {
+        /* start at the peer's position (the avatar was spawned there); the stand-in peer has no real height, so then
+         * keep the pawn's own */
+        float sp[3];
+        sp[0] = g_remote.pos[0] + g_av_off[0]; sp[1] = g_remote.pos[1] + g_av_off[1];
+        sp[2] = g_av_fake ? *(float *)(obj + 0x68) : g_remote.pos[2];
+        np_pos(mem + 4, sp);
+        np_pos(mem + 0x1A4, sp);
+    }
+    g_av_comp = comp;
+    nb = np_beaut(obj);
+    logf_("avatar np: comp %p memento %p, base beautifier %p", comp, mem, nb);
+    return mem;
+}
+
+/* MP-flag window for the avatar's main beautifier. FUN_100abb40 (third-person update, vf+0x7C) copies the desired
+ * state into the actual one; with the global MP flag ([DAT_11645a74]+4) the actual velocity becomes the desired one,
+ * without it (single player) it is limited by the physics' current velocity, so a remote-driven pawn can never speed
+ * up past a walk. The avatar's main beautifier gets a private vtable copy whose update slots (vf+0x7C, vf+0x80) run
+ * with that flag set for the duration of the call only. */
+static void *g_mf_vt[64], *g_mf_orig7c, *g_mf_orig80, *g_mf_obj;
+static int g_mf_on = 1;
+static void __attribute__((thiscall)) mf_call(void *orig, void *self, float dt)
+{
+    BYTE *mp = *(BYTE **)(g_base + 0x1645A74);
+    BYTE old = 0;
+    if (mp && g_mf_on) { old = mp[4]; mp[4] = 1; }
+    ((void (__attribute__((thiscall)) *)(void *, float))orig)(self, dt);
+    if (mp && g_mf_on) mp[4] = old;
+}
+static void __attribute__((thiscall)) mf_hook7c(void *self, float dt) { mf_call(g_mf_orig7c, self, dt); }
+static void __attribute__((thiscall)) mf_hook80(void *self, float dt) { mf_call(g_mf_orig80, self, dt); }
+static void mf_install(BYTE *bc)
+{
+    void *mb = bc ? *(void **)(bc + 0x28) : NULL;
+    if (!mb || *(void ***)mb == g_mf_vt || IsBadReadPtr(*(void **)mb, sizeof g_mf_vt)) return;
+    if (*(unsigned *)mb != (unsigned)(g_base + 0xE172E8)) return; /* only CPawnBeautifierThird */
+    if (!g_mf_orig7c) {
+        /* one vtable copy for the class, shared by every remote-driven pawn (avatar, NPC puppets) */
+        memcpy(g_mf_vt, *(void **)mb, sizeof g_mf_vt);
+        g_mf_orig7c = g_mf_vt[0x7C / 4]; g_mf_orig80 = g_mf_vt[0x80 / 4];
+        g_mf_vt[0x7C / 4] = (void *)mf_hook7c; g_mf_vt[0x80 / 4] = (void *)mf_hook80;
+    }
+    *(void ***)mb = g_mf_vt; g_mf_obj = mb;
+    logf_("remote pawn: main beautifier %p updates now run with the MP flag (velocity follows the packet)", mb);
+}
+
+/* every 500 ms: check that the avatar still runs NetPlayer in the base slot (+0x2C) with the memento in the applier
+ * role; log the beautifier slots and role bytes when they change, and put NetPlayer back if something replaced it */
+static void np_watch(void)
+{
+    static unsigned last[6];
+    static DWORD lastfix;
+    void *holder = NULL;
+    BYTE *obj = entity_obj(g_av_id, &holder), *bc, *c = g_av_comp;
+    unsigned cur[6], npvt = (unsigned)(g_base + 0xE16E98);
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    if (!obj || !c) return;
+    bc = ((np_getcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4));
+    if (!bc) return;
+    mf_install(bc);
+    cur[0] = *(void **)(bc + 0x28) ? **(unsigned **)(bc + 0x28) : 0;
+    cur[1] = *(void **)(bc + 0x2C) ? **(unsigned **)(bc + 0x2C) : 0;
+    cur[2] = bc[0x14];
+    cur[3] = *(unsigned *)(c + 0x15C) | *(unsigned *)(c + 0x160) << 8 | *(unsigned *)(c + 0x164) << 16;
+    cur[4] = *(unsigned *)(c + 0x170);
+    cur[5] = *(unsigned *)(obj + 0x70);
+    if (memcmp(cur, last, sizeof cur)) {
+        logf_("npwatch: main slot vt %08x, base slot vt %08x%s, enabled %u, roles %06x, memento %08x (ours %p), entity flags %08x",
+              cur[0], cur[1], cur[1] == npvt ? " (NetPlayer)" : "", cur[2], cur[3], cur[4], g_av_mem, cur[5]);
+        memcpy(last, cur, sizeof cur);
+    }
+    if ((cur[1] != npvt || cur[4] != (unsigned)g_av_mem || *(unsigned *)(c + 0x164) != 1) && GetTickCount() - lastfix > 3000) {
+        lastfix = GetTickCount();
+        *(unsigned *)(c + 0x164) = 1; *(BYTE **)(c + 0x170) = g_av_mem;
+        if (cur[1] != npvt) logf_("npwatch: NetPlayer was replaced, reinstalled %p", np_beaut(obj));
+        else logf_("npwatch: restored the applier role and memento");
+    }
+}
+
+/* fire one shot of the avatar's current weapon the way the MP fire-message handler FUN_100ef8c0 does for a remote
+ * pawn: DesiredData (pawn comp +0x140) +6 |= 0x20 (remote fire), the fire request {part -1, -1, ids -1, point,
+ * muzzle offset} + mode into the weapon (FUN_1012f130), the weapon's fire method vf+0x80(pawn comp), then the pawn
+ * event 0x121ADE93 (vf+0x78 -> FUN_1029da10) */
+static void av_fire(const float *point, const float *off, int mode)
+{
+    typedef void *(__fastcall *inv_t)(void *pawn);
+    typedef void *(__attribute__((thiscall)) *cur_t)(void *inv);
+    typedef void (__attribute__((thiscall)) *req_t)(void *weapon, unsigned *req, int mode);
+    typedef void (__attribute__((thiscall)) *fire_t)(void *weapon, void *pawn);
+    typedef void *(__attribute__((thiscall)) *tags_t)(void *pawn);
+    typedef void (__attribute__((thiscall)) *ev_t)(void *tags, unsigned ev);
+    static unsigned fired;
+    void *holder = NULL, *pawn, *inv, *wc, *tags;
+    BYTE *obj = entity_obj(g_av_id, &holder);
+    unsigned req[10];
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    pawn = obj ? ((np_getcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)) : NULL;
+    inv = pawn ? ((inv_t)(g_base + 0x7E140))(pawn) : NULL;
+    wc = inv ? ((cur_t)(g_base + 0x127DA0))(inv) : NULL;
+    if (!wc) return;
+    {
+        /* research: keep the shot-method hook on the avatar's current weapon object X, and log its state fields */
+        BYTE *y = *(BYTE **)((BYTE *)wc + 0x24), *x = y ? *(BYTE **)(y + 0x54) : NULL;
+        if (x && *(void ***)x != g_xh_vt && !IsBadReadPtr(*(void **)x, sizeof g_xh_vt)) {
+            memcpy(g_xh_vt, *(void **)x, sizeof g_xh_vt);
+            g_xh_orig = g_xh_vt[0x20 / 4]; g_xh_vt[0x20 / 4] = (void *)xshot_hook;
+            *(void ***)x = g_xh_vt; g_xh_obj = x;
+        }
+        if (y && fired < 200) logf_("avfire state: y %p +18 %d +1c %d +20 %d +24 %d +28 %d +2c %d +5a %u, [y+4]+bc %d", y, *(int *)(y + 0x18),
+                                    *(int *)(y + 0x1C), *(int *)(y + 0x20), *(int *)(y + 0x24), *(int *)(y + 0x28), *(int *)(y + 0x2C), y[0x5A],
+                                    *(void **)(y + 4) ? *(int *)(*(BYTE **)(y + 4) + 0xBC) : -1);
+    }
+    ((BYTE *)pawn)[0x140 + 6] |= 0x20;
+    req[0] = req[1] = req[2] = req[3] = 0xFFFFFFFFu;
+    memcpy(&req[4], point, 12); memcpy(&req[7], off, 12);
+    ((req_t)(g_base + 0x12F130))(wc, req, mode);
+    {
+        unsigned before = g_xh_calls;
+        if (g_av_directfire == 1) ((fire_t)(*(void ***)wc)[0x80 / 4])(wc, pawn);
+        if (fired < 200 && g_av_directfire == 1) logf_("avfire: vf+0x80 made %u shot call(s)", g_xh_calls - before);
+    }
+    tags = ((tags_t)(*(void ***)pawn)[0x78 / 4])(pawn);
+    if (tags) ((ev_t)(g_base + 0x29DA10))(tags, 0x121ADE93u);
+    if (++fired <= 200) logf_("avfire %u: weapon %p, avatar shot-method calls so far %u", fired, wc, g_xh_calls);
+}
+
+/* per tick: position (with the test offset), velocity from consecutive packets, yaw for aim/body, fire origin/dir */
+static void np_tick(DWORD now)
+{
+    float p[3], yaw, dx = g_remote.dir[0], dy = g_remote.dir[1], n = sqrtf(dx * dx + dy * dy);
+    BYTE *m = g_av_mem;
+    int k, logged = 0;
+    p[0] = g_remote.pos[0] + g_av_off[0]; p[1] = g_remote.pos[1] + g_av_off[1]; p[2] = g_remote.pos[2];
+    if (g_av_fake) {
+        /* the stand-in peer has no real height: keep the avatar's own (terrain) height */
+        void *holder = NULL;
+        BYTE *obj = entity_obj(g_av_id, &holder);
+        if (obj) p[2] = *(float *)(obj + 0x68);
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+    }
+    /* packets come in bunches through the relay, so the velocity is timed by the sender's sequence numbers
+     * (20 per second) and low-passed. Every frame the memento gets the last packet's position extrapolated along
+     * that velocity (at most 0.25 s ahead), so NetPlayer sees a target moving continuously at the speed it is told;
+     * after 300 ms without news the velocity decays. */
+    if (g_remote.seq != g_av_lastseq) {
+        unsigned ds = g_remote.seq - g_av_lastseq;
+        if (g_rx_ext.valid && !g_av_fake) {
+            /* the peer's game reports its own physics velocity: use it as is (position-derived velocity overshoots
+             * when the relay delivers packets in bunches) */
+            for (k = 0; k < 3; k++) {
+                unsigned bits = *(unsigned *)(m + 0x80 + 0x14 * k);
+                g_av_vel[k] = (bits && bits < 32) ? g_rx_ext.vel[k] * 15.0f / (float)((1u << bits) - 1) : 0;
+            }
+        } else if (g_av_lastseq && ds > 0 && ds < 40) {
+            float dt = ds * 0.05f;
+            for (k = 0; k < 3; k++) {
+                float v = (p[k] - g_av_lastpos[k]) / dt;
+                v = v > 10.0f ? 10.0f : v < -10.0f ? -10.0f : v;
+                g_av_vel[k] += (v - g_av_vel[k]) * 0.5f;
+            }
+        } else g_av_vel[0] = g_av_vel[1] = g_av_vel[2] = 0;
+        memcpy(g_av_lastpos, p, sizeof p); g_av_lastseq = g_remote.seq; g_av_lastt = now;
+    } else if (now - g_av_lastt > 300)
+        for (k = 0; k < 3; k++) g_av_vel[k] *= 0.8f;
+    {
+        /* lead: 0.25 s for the position-derived velocity, 0.1 s with the game's own velocity */
+        float ahead = (now - g_av_lastt) / 1000.0f, maxa = g_rx_ext.valid && !g_av_fake ? 0.1f : 0.25f;
+        if (ahead > maxa) ahead = maxa;
+        for (k = 0; k < 3; k++) p[k] = g_av_lastpos[k] + g_av_vel[k] * ahead;
+    }
+    if (now - g_av_lastlog >= 500) {
+        /* measurements: how far the pawn is from the written target, and both speeds */
+        void *holder = NULL;
+        logged = 1;
+        np_watch();
+        BYTE *obj = entity_obj(g_av_id, &holder);
+        if (obj) {
+            float *ep = (float *)(obj + 0x60), d = sqrtf((ep[0] - p[0]) * (ep[0] - p[0]) + (ep[1] - p[1]) * (ep[1] - p[1]) + (ep[2] - p[2]) * (ep[2] - p[2]));
+            float sp = (g_av_lastt && now > g_av_lastlog) ? sqrtf((ep[0] - g_av_logpos[0]) * (ep[0] - g_av_logpos[0]) + (ep[1] - g_av_logpos[1]) * (ep[1] - g_av_logpos[1])) / ((now - g_av_lastlog) / 1000.0f) : 0;
+            logf_("avnp: dist %.2f m, packet speed %.2f, pawn speed %.2f, seq %u, age %lu ms", d,
+                  sqrtf(g_av_vel[0] * g_av_vel[0] + g_av_vel[1] * g_av_vel[1]), sp, g_remote.seq, (unsigned long)(now - g_av_lastt));
+            memcpy(g_av_logpos, ep, sizeof g_av_logpos);
+        }
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        g_av_lastlog = now;
+    }
+    np_pos(m + 4, p);
+    if (g_rx_ext.valid && !g_av_fake) {
+        /* the peer sent its game-encoded fields: copy them as the net layer would (same quantization on both sides) */
+        static const int aimf[4] = { 0xAC, 0xC0, 0xD4, 0xE8 };
+        if (g_av_kp > 0) {
+            /* velocity = the peer's game velocity + kp * (target - avatar) in the ground plane, every frame: NetPlayer only
+             * adds the position error once it exceeds 1.5 m, so the pawn lags behind and then jumps; clamp 9 m/s */
+            void *holder = NULL;
+            BYTE *obj = entity_obj(g_av_id, &holder);
+            float v[3], hv;
+            for (k = 0; k < 3; k++) v[k] = g_av_vel[k];
+            if (obj) { v[0] += g_av_kp * (p[0] - *(float *)(obj + 0x60)); v[1] += g_av_kp * (p[1] - *(float *)(obj + 0x64)); }
+            if (holder) (*(int *)((BYTE *)holder + 8))--;
+            hv = sqrtf(v[0] * v[0] + v[1] * v[1]);
+            if (hv > 9.0f) { v[0] *= 9.0f / hv; v[1] *= 9.0f / hv; }
+            for (k = 0; k < 3; k++) np_q(m + 0x70 + 0x14 * k, v[k] > 14.9f ? 14.9f : v[k] < -14.9f ? -14.9f : v[k], 15.0f);
+        } else
+            for (k = 0; k < 3; k++) { *(int *)(m + 0x78 + 0x14 * k) = g_rx_ext.vel[k]; m[0x74 + 0x14 * k] = 1; }
+        for (k = 0; k < 4; k++) { *(int *)(m + aimf[k] + 8) = g_rx_ext.aim[k]; m[aimf[k] + 4] = 1; }
+        m[0x104] = g_rx_ext.s104; m[0x100] = 1;
+        m[0x11C] = g_rx_ext.s11c; m[0x118] = 1;
+        m[0x110] = g_rx_ext.s110; m[0x10C] = 1;
+        {
+            /* fire block, as the NetPlayer writer fills it from CWeaponEventFireBullet: part +0x1A0 (-1), point
+             * (impact) +0x1A4, target id +0x218/+0x21C (-1: ids are not shared between PCs), muzzle offset +0x220
+             * (muzzle - pawn, scale 3), mode +0x264. The applier hands it to the current weapon every frame; on a new
+             * bullet we write it and keep it for 120 ms, then put back what the memento had before the first one. */
+            static int idle_saved, idle_part, idle_mode;
+            static DWORD shot_t;
+            if (g_rx_shot_seq != g_av_shot_seq) {
+                float d[3];
+                if (!idle_saved) { idle_saved = 1; idle_part = *(int *)(m + 0x1A0); idle_mode = *(int *)(m + 0x264);
+                    logf_("avshot: memento fire block before the first bullet: part %d mode %d ids %08x %08x", idle_part, idle_mode,
+                          *(unsigned *)(m + 0x218), *(unsigned *)(m + 0x21C)); }
+                g_av_shot_seq = g_rx_shot_seq; shot_t = now;
+                for (k = 0; k < 3; k++) d[k] = g_rx_shot_t[k] > 2.99f ? 2.99f : g_rx_shot_t[k] < -2.99f ? -2.99f : g_rx_shot_t[k];
+                *(int *)(m + 0x1A0) = -1; m[0x19C] = 1;
+                *(unsigned *)(m + 0x218) = 0xFFFFFFFFu; *(unsigned *)(m + 0x21C) = 0xFFFFFFFFu; m[0x214] = 1;
+                np_pos(m + 0x1A4, g_rx_shot_p);
+                for (k = 0; k < 3; k++) np_q(m + 0x220 + 0x14 * k, d[k], 3.0f);
+                *(int *)(m + 0x264) = g_rx_shot_mode; m[0x260] = 1;
+                if (g_av_directfire) av_fire(g_rx_shot_p, d, g_rx_shot_mode);
+                if (g_av_shot_seq < 200)
+                    logf_("avshot %u: point (%.2f %.2f %.2f) muzzle offset (%.2f %.2f %.2f) mode %d", g_av_shot_seq, g_rx_shot_p[0], g_rx_shot_p[1],
+                          g_rx_shot_p[2], d[0], d[1], d[2], g_rx_shot_mode);
+            } else if (shot_t && now - shot_t > 120) {
+                shot_t = 0;
+                *(int *)(m + 0x1A0) = idle_part; m[0x19C] = 1;
+                *(int *)(m + 0x264) = idle_mode; m[0x260] = 1;
+            }
+        }
+        if (logged) /* once per 500 ms metrics line */
+            logf_("avnp ext: vel (%.2f %.2f %.2f) aim (%.1f %.1f) stance %u mode %u flag %u", np_dq(m + 0x70, 15), np_dq(m + 0x84, 15),
+                  np_dq(m + 0x98, 15), np_dq(m + 0xAC, 360), np_dq(m + 0xC0, 360), m[0x104], m[0x11C], m[0x110]);
+    } else {
+    for (k = 0; k < 3; k++) np_q(m + 0x70 + 0x14 * k, g_av_vel[k], 15.0f);
+    if (n > 0.5f) {
+        dx /= n; dy /= n;
+        yaw = atan2f(dy, dx) * 57.29578f + g_av_yawoff;
+        while (yaw < 0) yaw += 360.0f;
+        while (yaw >= 360.0f) yaw -= 360.0f;
+        np_q(m + 0xAC, 0, 360.0f); np_q(m + 0xC0, yaw, 360.0f);
+        np_q(m + 0xD4, 0, 360.0f); np_q(m + 0xE8, yaw, 360.0f);
+        np_pos(m + 0x1A4, p);
+        np_q(m + 0x220, dx, 3.0f); np_q(m + 0x234, dy, 3.0f); np_q(m + 0x248, 0, 3.0f);
+    }
+    }
+    *(float *)(m + 0x13C) = g_av_hp; *(unsigned *)(m + 0x14C) = g_av_hpmax;
+}
 
 static int av_valid(void)
 {
@@ -648,6 +1844,190 @@ static void av_remove(void)
         logf_("avatar %llu removed: %s", g_av_id, out);
     }
     g_av_id = 0; g_av_body = g_av_mat = NULL; g_av_have = 0;
+    g_av_mem = NULL; g_av_comp = NULL; g_av_npstate = 0; g_av_weap[0] = 0; g_av_lastseq = 0; g_av_smhave = 0;
+}
+
+/* ---- NPC sync (npcsync host <radius> | join | off) ----
+ * host: every 100 ms the AI pawns within the radius (CPawnAgent scan, no players) are encoded by the game's own
+ * ThirdParty encoder (FUN_100a6ec0) into a private memento each and sent as one NPC packet.
+ * join: each NPC in the packet becomes a puppet once: its agent's AI is paused (agent vf+0x164(1), what the scripted AI
+ * mode does for all agents), and it gets the avatar treatment (pawn net component, ThirdParty memento in the applier
+ * role, NetPlayer base beautifier, MP-flag window on the third-person main beautifier); afterwards the host's
+ * fields are written into its memento every frame. Health travels too, so a kill on the host kills the puppet. */
+#define NPC_MAGIC 0x3143504Eu
+#define NPC_MAX 24
+#pragma pack(push, 1)
+typedef struct { unsigned long long id; float pos[3]; int vel[3], aim[4]; unsigned char s104, s11c, s110, pad; float hp, hpmax; } NpcEnt;
+typedef struct { unsigned magic, seq, count; NpcEnt e[NPC_MAX]; } NpcPkt;
+#pragma pack(pop)
+static struct { unsigned long long id; BYTE *mem; } g_nh[NPC_MAX];
+static int g_nh_n;
+static BYTE g_npc_this[0x40];
+static struct { unsigned long long id; BYTE *agent, *comp, *mem; int state; NpcEnt e; DWORD last; } g_np[NPC_MAX];
+static int g_np_n;
+
+/* scan all CPawnAgents (vtable RVA EC5078, agent+4 = pawn holder); calls back with id, entity, agent */
+static int npc_scan(void (*cb)(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx), void *ctx)
+{
+    static BYTE chunk[0x10000];
+    MEMORY_BASIC_INFORMATION mbi;
+    BYTE *p = NULL;
+    unsigned vt = (unsigned)(g_base + 0xEC5078);
+    int found = 0;
+    while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi && found < 600) {
+        if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (mbi.Protect & PAGE_READWRITE) && mbi.RegionSize < 0x20000000) {
+            BYTE *rb = (BYTE *)mbi.BaseAddress, *rend = rb + mbi.RegionSize, *c;
+            for (c = rb; c < rend && found < 600; c += sizeof chunk) {
+                size_t n = (size_t)(rend - c), k;
+                if (n > sizeof chunk) n = sizeof chunk;
+                if (!safe_read(c, chunk, n)) continue;
+                for (k = 0; k + 8 <= n; k += 4) {
+                    BYTE *holder, *obj;
+                    if (*(unsigned *)(chunk + k) != vt) continue;
+                    holder = *(BYTE **)(chunk + k + 4);
+                    if (!holder || IsBadReadPtr(holder, 16) || !(obj = *(BYTE **)(holder + 0xC)) || IsBadReadPtr(obj, 0xA4)) continue;
+                    found++;
+                    cb(*(unsigned long long *)holder, obj, c + k, ctx);
+                }
+            }
+        }
+        p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return found;
+}
+static int npc_has_netcomp(BYTE *obj)
+{
+    void **cs = *(void ***)(obj + 0x9C);
+    int k, n = *(int *)(obj + 0xA0);
+    for (k = 0; cs && k < n && k < 64; k++) if (cs[k] && !IsBadReadPtr(cs[k], 4) && *(DWORD *)cs[k] == (DWORD)(g_base + 0xE1AE00)) return 1;
+    return 0;
+}
+static void npc_host_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx)
+{
+    float *me = (float *)ctx, dx = *(float *)(obj + 0x60) - me[0], dy = *(float *)(obj + 0x64) - me[1];
+    int i;
+    (void)agent;
+    if (g_nh_n >= NPC_MAX || id == g_net_id || id == g_av_id || dx * dx + dy * dy > g_npc_rad * g_npc_rad || npc_has_netcomp(obj)) return;
+    for (i = 0; i < g_nh_n; i++) if (g_nh[i].id == id) return;
+    g_nh[g_nh_n].id = id; g_nh[g_nh_n].mem = NULL; g_nh_n++;
+}
+static float npc_hp(BYTE *obj, float *hpmax)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    BYTE *cc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDF9A8)), *hc;
+    if (cc && !IsBadReadPtr(cc + 0x44, 4) && (hc = *(BYTE **)(cc + 0x44)) && !IsBadReadPtr(hc, 0x18)) { *hpmax = *(float *)(hc + 0x14); return *(float *)(hc + 0x10); }
+    *hpmax = 0; return -1;
+}
+static void npc_host_tick(DWORD now)
+{
+    static DWORD last_scan, last_send;
+    static unsigned seq;
+    NpcPkt pk;
+    int i, n = 0;
+    if (g_npc_role != 1 || g_ns == INVALID_SOCKET || now - last_send < 100) return;
+    last_send = now;
+    if (!last_scan || now - last_scan > 30000) {
+        /* re-pick the NPCs around us every 30 s (a full memory scan, a visible hitch) (keeps the existing mementos of those still in range) */
+        struct { unsigned long long id; BYTE *mem; } old[NPC_MAX];
+        int on = g_nh_n, j;
+        void *hd = NULL;
+        BYTE *me = entity_obj(g_net_id, &hd);
+        float mp[3] = { 0, 0, 0 };
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        if (me) memcpy(mp, me + 0x60, sizeof mp);
+        memcpy(old, g_nh, sizeof old);
+        g_nh_n = 0; last_scan = now;
+        npc_scan(npc_host_cb, mp);
+        for (i = 0; i < g_nh_n; i++) for (j = 0; j < on; j++) if (old[j].id == g_nh[i].id) g_nh[i].mem = old[j].mem;
+        logf_("npcsync host: %d NPCs within %.0f m", g_nh_n, g_npc_rad);
+    }
+    memset(&pk, 0, sizeof pk);
+    for (i = 0; i < g_nh_n; i++) {
+        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+        void *hd = NULL, *pawn;
+        BYTE *obj = entity_obj(g_nh[i].id, &hd), *m;
+        NpcEnt *e = &pk.e[n];
+        int k;
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        if (!obj) continue;
+        pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
+        if (!pawn) continue;
+        if (!g_nh[i].mem) g_nh[i].mem = ((np_factory_t)(g_base + 0x40110))();
+        if (!(m = g_nh[i].mem)) continue;
+        *(void **)(g_npc_this + 0x10) = pawn;
+        ((np_encode_t)(g_base + 0xA6EC0))(g_npc_this, m);
+        e->id = g_nh[i].id;
+        memcpy(e->pos, obj + 0x60, sizeof e->pos);
+        for (k = 0; k < 3; k++) e->vel[k] = *(int *)(m + 0x78 + 0x14 * k);
+        e->aim[0] = *(int *)(m + 0xB4); e->aim[1] = *(int *)(m + 0xC8); e->aim[2] = *(int *)(m + 0xDC); e->aim[3] = *(int *)(m + 0xF0);
+        e->s104 = m[0x104]; e->s11c = m[0x11C]; e->s110 = m[0x110];
+        e->hp = npc_hp(obj, &e->hpmax);
+        n++;
+    }
+    pk.magic = NPC_MAGIC; pk.seq = ++seq; pk.count = n;
+    if (n) sendto(g_ns, (char *)&pk, 12 + n * sizeof(NpcEnt), 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+}
+static void npc_rx(const NpcPkt *pk, int len)
+{
+    unsigned i;
+    int j;
+    if (g_npc_role != 2 || len < 12 || pk->count > NPC_MAX || len < (int)(12 + pk->count * sizeof(NpcEnt))) return;
+    for (i = 0; i < pk->count; i++) {
+        for (j = 0; j < g_np_n && g_np[j].id != pk->e[i].id; j++) ;
+        if (j == g_np_n) { if (g_np_n >= NPC_MAX) continue; memset(&g_np[j], 0, sizeof g_np[j]); g_np[j].id = pk->e[i].id; g_np_n++; }
+        g_np[j].e = pk->e[i]; g_np[j].last = GetTickCount();
+    }
+}
+static void npc_join_find_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx)
+{
+    int j;
+    (void)obj; (void)ctx;
+    for (j = 0; j < g_np_n; j++) if (g_np[j].id == id && !g_np[j].agent) g_np[j].agent = agent;
+}
+static void npc_join_tick(DWORD now)
+{
+    static DWORD last_find;
+    int j, k, pending = 0;
+    if (g_npc_role != 2) return;
+    for (j = 0; j < g_np_n; j++) if (g_np[j].state == 0) pending++;
+    if (pending && now - last_find > 10000) { last_find = now; npc_scan(npc_join_find_cb, NULL); }
+    for (j = 0; j < g_np_n; j++) {
+        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+        void *hd = NULL;
+        BYTE *obj = entity_obj(g_np[j].id, &hd), *m;
+        NpcEnt *e = &g_np[j].e;
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        if (!obj) continue;
+        if (g_np[j].state == 0) {
+            BYTE *comp = NULL, *bc;
+            void **cs = *(void ***)(obj + 0x9C);
+            int n = *(int *)(obj + 0xA0);
+            if (!g_np[j].agent) continue;
+            ((void (__attribute__((thiscall)) *)(void *, char))(*(void ***)g_np[j].agent)[0x164 / 4])(g_np[j].agent, 1);
+            for (k = 0; cs && k < n && k < 64; k++) if (cs[k] && !IsBadReadPtr(cs[k], 4) && *(DWORD *)cs[k] == (DWORD)(g_base + 0xE1AE00)) { comp = cs[k]; break; }
+            if (!comp) { comp = ((np_factory_t)(g_base + 0x40840))(); if (!comp) continue; ((np_addcomp_t)(g_base + 0x4E0D80))(obj, comp); }
+            m = *(BYTE **)(comp + 0x170);
+            if (!m) m = ((np_factory_t)(g_base + 0x40110))();
+            if (!m) continue;
+            *(unsigned *)(comp + 0x40) = 1; comp[0x44] = 1; *(unsigned *)(comp + 0x164) = 1; *(BYTE **)(comp + 0x170) = m;
+            *(float *)(m + 0x13C) = e->hp > 0 ? e->hp : 0; m[0x134] = 1; *(unsigned *)(m + 0x14C) = (unsigned)e->hpmax; m[0x148] = 1;
+            np_pos(m + 4, e->pos); np_pos(m + 0x1A4, e->pos);
+            g_np[j].comp = comp; g_np[j].mem = m; g_np[j].state = 1;
+            np_slot(obj, 0x2C, 0x608487bc, 0xFFFFFFFFu, 0xFFFFFFFFu);
+            bc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4));
+            if (bc) mf_install(bc);
+            logf_("npcsync join: NPC %llu is a puppet now (agent %p paused, comp %p, memento %p, main vt %08x, hp %.0f/%.0f)", g_np[j].id, g_np[j].agent,
+                  comp, m, bc && *(void **)(bc + 0x28) ? **(unsigned **)(bc + 0x28) : 0, e->hp, e->hpmax);
+            continue;
+        }
+        m = g_np[j].mem;
+        if (!m) continue;
+        np_pos(m + 4, e->pos);
+        for (k = 0; k < 3; k++) { *(int *)(m + 0x78 + 0x14 * k) = e->vel[k]; m[0x74 + 0x14 * k] = 1; }
+        { static const int aimf[4] = { 0xAC, 0xC0, 0xD4, 0xE8 }; for (k = 0; k < 4; k++) { *(int *)(m + aimf[k] + 8) = e->aim[k]; m[aimf[k] + 4] = 1; } }
+        m[0x104] = e->s104; m[0x100] = 1; m[0x11C] = e->s11c; m[0x118] = 1; m[0x110] = e->s110; m[0x10C] = 1;
+        if (e->hp >= 0) { *(float *)(m + 0x13C) = e->hp; m[0x134] = 1; }
+    }
 }
 
 static void av_tick(DWORD now)
@@ -659,8 +2039,12 @@ static void av_tick(DWORD now)
         unsigned long long id;
         if (now - g_av_lastspawn < 3000) return;
         g_av_lastspawn = now;
-        snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype(GetEntityName(GetLocalPlayerId()), %.3f, %.3f, %.3f, 0, 0, 0))",
-                 g_remote.pos[0], g_remote.pos[1], g_remote.pos[2]);
+        if (g_av_np)
+            snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('%s', %.3f, %.3f, %.3f, 0, 0, 0))",
+                     g_av_arch, g_remote.pos[0] + g_av_off[0], g_remote.pos[1] + g_av_off[1], g_remote.pos[2] + 1.0f);
+        else
+            snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype(GetEntityName(GetLocalPlayerId()), %.3f, %.3f, %.3f, 0, 0, 0))",
+                     g_remote.pos[0], g_remote.pos[1], g_remote.pos[2]);
         lua_eval(code, out, sizeof out);
         id = strtoull(out, NULL, 10);
         if (id == 0 || id == 0xFFFFFFFFFFFFFFFFull) { logf_("avatar spawn failed: %s", out); return; }
@@ -669,6 +2053,24 @@ static void av_tick(DWORD now)
         snprintf(code, sizeof code, "CDominoManager_GetInstance():SendRegisteredEventToEntity('%llu', 'CFCXCountersComponent_SetInvincible') __out = 'ok'", id);
         lua_eval(code, out, sizeof out);
         logf_("avatar set invincible: status %s", out);
+        return;
+    }
+    if (g_av_np) {
+        /* give the new entity a moment to finish spawning, then set it up once */
+        if (!g_av_mem) {
+            if (now - g_av_lastspawn < 4000 || g_av_npstate) return;
+            g_av_npstate = 1;
+            g_av_mem = np_setup(g_av_id);
+            if (!g_av_mem) logf_("avatar np: setup failed");
+            return;
+        }
+        np_tick(now);
+        /* the peer changed the weapon in its hands: give the avatar the same one (retry at most every 2 s) */
+        if (strcmp(g_rx_weap, g_av_weap) && now - g_av_weap_try > 2000) {
+            g_av_weap_try = now;
+            if (!g_rx_weap[0]) { logf_("avweapon: peer holds no weapon (keeping '%s')", g_av_weap); strcpy(g_av_weap, g_rx_weap); }
+            else if (av_give_weapon(g_rx_weap)) strcpy(g_av_weap, g_rx_weap);
+        }
         return;
     }
     if (!av_valid()) {
@@ -737,7 +2139,7 @@ static void net_tick(void)
         if (bind(g_ns, (struct sockaddr *)&a, sizeof a) != 0) { logf_("net: bind %u failed (%d)", g_net_lport, WSAGetLastError()); closesocket(g_ns); g_ns = INVALID_SOCKET; g_net_cfg = 0; return; }
         ioctlsocket(g_ns, FIONBIO, &nb);
         g_net_seq = g_net_tx = g_net_rx = g_net_drop = 0; g_net_lastsend = g_net_lastlog = now; g_net_lastrx = 0;
-        memset(&g_remote, 0, sizeof g_remote);
+        memset(&g_remote, 0, sizeof g_remote); g_rx_ext.valid = 0;
         g_net_cfg = 2;
         logf_("net: socket up, local %s:%u -> peer %s:%u", a.sin_addr.s_addr == htonl(INADDR_LOOPBACK) ? "127.0.0.1" : "0.0.0.0", g_net_lport, g_net_pip, g_net_pport);
     }
@@ -753,35 +2155,103 @@ static void net_tick(void)
     }
     /* make sure we know our own body */
     if (!g_bodymat || IsBadReadPtr(g_body, 4) || *(unsigned *)g_body != (unsigned)(g_base + RVA_BODY_VTABLE)) {
-        if (now - g_net_lastfind > 3000) {
+        /* the body search scans all memory (a visible hitch): retry every 3 s at first, then back off to 60 s */
+        static unsigned tries;
+        if (now - g_net_lastfind > (tries < 5 ? 3000u : 60000u)) {
             char c[64];
-            g_net_lastfind = now;
+            g_net_lastfind = now; tries++;
             snprintf(c, sizeof c, "findbody %llu", g_net_id);
             native_cmd(c);
         }
     }
     /* receive everything pending; only packets from the peer's address count (the port may differ behind NAT) */
     for (;;) {
-        NetPkt p;
+        NetPktX4 q4;
+        NetPktX3 q;
+        NetPktX2 p;
         struct sockaddr_in from;
         int fl = sizeof from;
-        int r = recvfrom(g_ns, (char *)&p, sizeof p, 0, (struct sockaddr *)&from, &fl);
+        static NpcPkt rb;
+        int r = recvfrom(g_ns, (char *)&rb, sizeof rb, 0, (struct sockaddr *)&from, &fl);
         if (r == SOCKET_ERROR) { if (WSAGetLastError() == WSAEMSGSIZE) { g_net_drop++; continue; } break; }
-        if (r != (int)sizeof p || p.magic != NET_MAGIC || from.sin_addr.s_addr != g_peer.sin_addr.s_addr) { g_net_drop++; continue; }
-        g_remote = p; g_net_rx++; g_net_lastrx = now;
+        if (r >= 12 && rb.magic == NPC_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_rx(&rb, r); continue; }
+        if (r > (int)sizeof q4) { g_net_drop++; continue; }
+        memcpy(&q4, &rb, r);
+        q = q4.s;
+        if (r == (int)sizeof q4) {
+            if (q4.world_valid && from.sin_addr.s_addr == g_peer.sin_addr.s_addr) { g_rx_tod = q4.tod; g_rx_day = q4.day; g_rx_world = 1; }
+            r = sizeof q;
+        }
+        p = q.w;
+        if (r == (int)sizeof q) {
+            g_rx_shot_seq = q.shot_seq; g_rx_shot_mode = q.shot_mode;
+            memcpy(g_rx_shot_p, q.shot_p, sizeof g_rx_shot_p); memcpy(g_rx_shot_t, q.shot_t, sizeof g_rx_shot_t);
+            r = sizeof p;
+        }
+        if ((r != (int)sizeof p.x.b && r != (int)sizeof p.x && r != (int)sizeof p) || p.x.b.magic != NET_MAGIC ||
+            from.sin_addr.s_addr != g_peer.sin_addr.s_addr) { g_net_drop++; continue; }
+        if (g_av_fake) continue;
+        g_remote = p.x.b; g_net_rx++; g_net_lastrx = now;
+        if (r >= (int)sizeof p.x) g_rx_ext = p.x; else g_rx_ext.valid = 0;
+        if (r == (int)sizeof p) { p.weap[sizeof p.weap - 1] = 0; strcpy(g_rx_weap, p.weap); }
+    }
+    /* test stand-in for a peer: a point walking a circle (avfake), 20 updates per second like the real sender */
+    if (g_av_fake && now - g_av_fake_last >= 50) {
+        float t = (now - g_av_fake_t0) / 1000.0f, ang;
+        g_av_fake_last = now;
+        if (t > g_av_fake_secs) { g_av_fake = 0; logf_("avfake finished"); }
+        else {
+            ang = g_av_fake_speed * t / g_av_fake_r;
+            g_remote.magic = NET_MAGIC; g_remote.seq++;
+            g_remote.pos[0] = g_av_fake_c[0] + g_av_fake_r * cosf(ang);
+            g_remote.pos[1] = g_av_fake_c[1] + g_av_fake_r * sinf(ang);
+            g_remote.pos[2] = g_av_fake_c[2];
+            g_remote.dir[0] = -sinf(ang); g_remote.dir[1] = cosf(ang);
+            g_net_rx++; g_net_lastrx = now;
+        }
     }
     av_tick(now);
+    world_tick(now);
+    npc_host_tick(now);
+    npc_join_tick(now);
     /* send at 20 Hz */
-    if (g_bodymat && now - g_net_lastsend >= 50) {
-        NetPkt p;
+    if ((g_bodymat || g_net_id) && now - g_net_lastsend >= 50) {
+        NetPktX4 q4;
+        NetPktX3 q;
+        NetPktX2 p;
         void *holder = NULL;
         BYTE *obj = entity_obj(g_net_id, &holder);
         g_net_lastsend = now;
-        p.magic = NET_MAGIC; p.seq = ++g_net_seq;
-        memcpy(p.pos, g_bodymat + 0x30, sizeof p.pos);
-        p.dir[0] = obj ? *(float *)(obj + 0x30) : 0; p.dir[1] = obj ? *(float *)(obj + 0x34) : 0;
+        memset(&p, 0, sizeof p);
+        p.x.b.magic = NET_MAGIC; p.x.b.seq = ++g_net_seq;
+        if (g_bodymat) memcpy(p.x.b.pos, g_bodymat + 0x30, sizeof p.x.b.pos);
+        else if (obj) memcpy(p.x.b.pos, obj + 0x60, sizeof p.x.b.pos);
+        p.x.b.dir[0] = obj ? *(float *)(obj + 0x30) : 0; p.x.b.dir[1] = obj ? *(float *)(obj + 0x34) : 0;
+        if (obj) tx_encode(obj, &p.x, now);
+        strcpy(p.weap, g_tx_weap);
+        {
+            /* a shot with no bullet event since the last packet (e.g. into the ground close by - the game sends none):
+             * aim the point along our view instead, 25 m from the muzzle; aim angles (radians) are pitch and yaw from our
+             * own ThirdParty memento, forward = (-sin yaw, cos yaw) */
+            static unsigned last_shots, last_bullets;
+            if (g_lx_obj && g_lx_shots != last_shots && g_shot_seq == last_bullets && g_tx_mem) {
+                float pitch = np_dq(g_tx_mem + 0xAC, 360), yaw = np_dq(g_tx_mem + 0xC0, 360), mz[3], d[3];
+                int i;
+                if (g_shot_t[0] == 0 && g_shot_t[1] == 0 && g_shot_t[2] == 0) g_shot_t[2] = 1.67f;
+                for (i = 0; i < 3; i++) mz[i] = p.x.b.pos[i] + g_shot_t[i];
+                d[0] = -sinf(yaw) * cosf(pitch); d[1] = cosf(yaw) * cosf(pitch); d[2] = sinf(pitch);
+                for (i = 0; i < 3; i++) g_shot_p[i] = mz[i] + 25.0f * d[i];
+                if (++g_lx_aimed <= 30) logf_("tx: shot %u without a bullet: point from aim (pitch %.2f yaw %.2f) -> (%.2f %.2f %.2f)", g_lx_shots,
+                                              pitch, yaw, g_shot_p[0], g_shot_p[1], g_shot_p[2]);
+            }
+            last_shots = g_lx_shots; last_bullets = g_shot_seq;
+        }
+        q.w = p; q.shot_seq = g_lx_obj ? g_lx_shots : g_shot_seq; q.shot_mode = g_shot_mode;
+        memcpy(q.shot_p, g_shot_p, sizeof q.shot_p); memcpy(q.shot_t, g_shot_t, sizeof q.shot_t);
         if (holder) (*(int *)((BYTE *)holder + 8))--;
-        sendto(g_ns, (char *)&p, sizeof p, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+        memset(&q4, 0, sizeof q4); q4.s = q;
+        if (g_ws_role == 1) { BYTE *env = env_obj(); if (env) { q4.tod = *(float *)(env + 0x260); q4.day = *(int *)(env + 0x4EC); q4.world_valid = 1; } }
+        sendto(g_ns, (char *)&q4, sizeof q4, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
         g_net_tx++;
     }
     if (now - g_net_lastlog >= 1000) {
@@ -807,8 +2277,8 @@ static void pump_main(void)
     run_cmd(g_states[0].L);
     g_busy = 0;
 }
-static BOOL WINAPI h_PeekMessageA(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); pump_main(); return o_PeekMessageA(m, h, a, b, c); }
-static BOOL WINAPI h_PeekMessageW(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); pump_main(); return o_PeekMessageW(m, h, a, b, c); }
+static BOOL WINAPI h_PeekMessageA(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); watchd_tick(); fire_latch_tick(); pump_main(); return o_PeekMessageA(m, h, a, b, c); }
+static BOOL WINAPI h_PeekMessageW(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); watchd_tick(); fire_latch_tick(); pump_main(); return o_PeekMessageW(m, h, a, b, c); }
 
 static int __cdecl h_gettop(void *L)
 {

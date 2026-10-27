@@ -125,6 +125,7 @@ try {
     $t0 = Get-Date
     while ($true) {
         Start-Sleep 3; Guard
+        if ($game.HasExited) { throw 'the game exited while waiting for the relay' }
         $rl = Get-Content (Join-Path $runDir 'relay.log') -ErrorAction SilentlyContinue
         if ($rl | Select-String 'peer is talking|LOBBY \d+ created|entered lobby') { break }
         if ($relay.HasExited) {
