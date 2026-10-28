@@ -2244,7 +2244,7 @@ static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; B
 static int g_nh_n;
 static BYTE g_npc_this[0x40];
 /* lid: the local entity id when the NPC had to be spawned here (the host's id is unknown to this world) */
-static struct { unsigned long long id, lid; BYTE *agent, *comp, *mem, *obj; int state, nospawn, gone; NpcEnt e; DWORD last, req; unsigned shots, fires, supp, av[0x70]; int avok; BYTE *mb; void *wcur; int wmode; char wname[64], hw[64]; unsigned wcat, hcat, lastact; int hset, wtries; DWORD wfix; } g_np[NPC_MAX];
+static struct { unsigned long long id, lid; BYTE *agent, *comp, *mem, *obj; int state, nospawn, gone; NpcEnt e; DWORD last, req; unsigned shots, fires, supp, av[0x70]; int avok; BYTE *mb; void *wcur; int wmode; char wname[64], hw[64]; unsigned wcat, hcat, lastact; int hset, wtries, ownact, respawn; DWORD wfix; } g_np[NPC_MAX];
 static int g_np_n;
 
 /* scan for CPawnAgents (vtable RVA EC5078, agent+4 = pawn holder), calling back with id, entity, agent; spread over many
@@ -2525,9 +2525,32 @@ static void npc_req_rx(const NpcArcPkt *q)
     sendto(g_ns, (char *)&a, sizeof a, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
     logf_("npcsync host: the joiner lacks NPC %llu -> sent its name '%s'", q->id, a.name);
 }
+/* spawn an NPC from a host name: the name itself (reinforcements are named enemy_archetypes.<faction>.<class>), else
+ * for a save NPC's instance name (Red_Faction.Assault_Caucasian_38) "enemy_archetypes." + the name without its number */
+static unsigned long long npc_spawn_named(const char *name, const float *pos, char *used, size_t un)
+{
+    char code[240], out[40], alt[120];
+    unsigned long long lid;
+    int k;
+    for (k = 0; k < 2; k++) {
+        const char *nm = name;
+        if (k == 1) {
+            char *u;
+            snprintf(alt, sizeof alt, "enemy_archetypes.%s", name);
+            u = strrchr(alt, '_');
+            if (!u || !u[1] || strspn(u + 1, "0123456789") != strlen(u + 1)) return 0;
+            *u = 0; nm = alt;
+        }
+        snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('%s', %.3f, %.3f, %.3f, 0, 0, 0))", nm, pos[0], pos[1], pos[2]);
+        lua_eval(code, out, sizeof out);
+        lid = strtoull(out, NULL, 10);
+        if (lid && out[0] != '-' && lid != ~0ULL) { snprintf(used, un, "%s", nm); return lid; }
+    }
+    return 0;
+}
 static void npc_arc_rx(const NpcArcPkt *a)
 {
-    char code[200], out[40], name[96];
+    char name[96], used[120];
     int j;
     unsigned long long lid;
     if (g_npc_role != 2) return;
@@ -2535,12 +2558,19 @@ static void npc_arc_rx(const NpcArcPkt *a)
     if (j == g_np_n || g_np[j].lid || g_np[j].nospawn) return;
     memcpy(name, a->name, sizeof name); name[sizeof name - 1] = 0;
     if (!name[0] || strchr(name, '\'') || !strcmp(name, "nil") || !strncmp(name, "buddies.", 8)) { g_np[j].nospawn = 1; logf_("npcsync join: no name for NPC %llu ('%s')", a->id, name); return; }
-    snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('%s', %.3f, %.3f, %.3f, 0, 0, 0))", name, g_np[j].e.pos[0], g_np[j].e.pos[1], g_np[j].e.pos[2]);
-    lua_eval(code, out, sizeof out);
-    lid = strtoull(out, NULL, 10);
-    if (!lid || out[0] == '-' || lid == ~0ULL) { g_np[j].nospawn = 1; logf_("npcsync join: spawning '%s' for host NPC %llu failed (%s)", name, a->id, out); return; }
+    lid = npc_spawn_named(name, g_np[j].e.pos, used, sizeof used);
+    if (!lid) { g_np[j].nospawn = 1; logf_("npcsync join: spawning '%s' for host NPC %llu failed%s", name, a->id, g_np[j].respawn ? ", the puppet stays as it is" : ""); return; }
+    if (g_np[j].respawn == 1) {
+        /* the fresh NPC exists: now the old one goes, and the puppet is rebuilt on the new entity */
+        char rm[96], o2[16];
+        snprintf(rm, sizeof rm, "RemoveEntity('%llu') __out = 'ok'", g_np[j].id);
+        lua_eval(rm, o2, sizeof o2);
+        g_np[j].respawn = 2; g_np[j].state = 0; g_np[j].agent = NULL; g_np[j].obj = NULL; g_np[j].mb = NULL; g_np[j].comp = NULL; g_np[j].mem = NULL;
+        g_np[j].wcur = NULL; g_np[j].wmode = 0; g_np[j].wname[0] = 0; g_np[j].wtries = 0;
+    }
     g_np[j].lid = lid;
-    logf_("npcsync join: spawned '%s' as %llu for host NPC %llu at (%.1f %.1f %.1f)", name, lid, a->id, g_np[j].e.pos[0], g_np[j].e.pos[1], g_np[j].e.pos[2]);
+    logf_("npcsync join: spawned '%s' as %llu for host NPC %llu at (%.1f %.1f %.1f)%s", used, lid, a->id, g_np[j].e.pos[0], g_np[j].e.pos[1],
+          g_np[j].e.pos[2], g_np[j].respawn == 2 ? ", replacing our own copy" : "");
 }
 /* NSHT on the joiner: a host NPC hit our avatar there, so our player takes it here from that NPC's puppet */
 static void npc_shot_apply(const NpcHitPkt *nk)
@@ -2575,6 +2605,7 @@ static void npc_anim_apply(BYTE *mb)
     for (j = 0; j < g_np_n; j++)
         if (g_np[j].mb == mb) {
             if (g_np[j].avok && (v = npc_animvars(g_np[j].obj))) {
+                if (!g_np[j].lastact && !g_np[j].lid && (v[0x58] != g_np[j].av[0x58] || v[0x42] != g_np[j].av[0x42])) g_np[j].ownact = 1;
                 if (g_np[j].av[0x58] != g_np[j].lastact) {
                     logf_("npcact puppet %llu: host action %d -> %d, puppet graph had %d (v42 %u -> %u)", g_np[j].id, (int)g_np[j].lastact,
                           (int)g_np[j].av[0x58], (int)v[0x58], v[0x42], g_np[j].av[0x42]);
@@ -2724,6 +2755,15 @@ static void npc_join_tick(DWORD now)
                   ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFE4090)) ? "yes" : "NO", g_np[j].agent,
                   comp, m, bc && *(void **)(bc + 0x28) ? **(unsigned **)(bc + 0x28) : 0, e->hp, e->hpmax);
             continue;
+        }
+        if (g_np[j].ownact && !g_np[j].respawn && !g_np[j].lid && g_ns != INVALID_SOCKET) {
+            /* its graph runs an action of its own (started before the session connected) that the host's inputs do not
+             * stop: replace the NPC by a fresh one of the same archetype (NREQ/NARC as for the host's spawns) */
+            NpcArcPkt q;
+            memset(&q, 0, sizeof q); q.magic = NREQ_MAGIC; q.id = g_np[j].id;
+            sendto(g_ns, (char *)&q, sizeof q, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+            g_np[j].respawn = 1; g_np[j].req = now;
+            logf_("npcsync join: puppet %llu runs an action of its own, asking for its archetype to respawn it", g_np[j].id);
         }
         m = g_np[j].mem;
         if (!m) continue;
