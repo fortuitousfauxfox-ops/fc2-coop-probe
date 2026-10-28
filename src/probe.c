@@ -441,6 +441,7 @@ static int g_npc_role;            /* npcsync: 1 host, 2 join */
 static float g_npc_rad = 80.0f;
 static void stim_install(unsigned long long id, int slot);
 static void npc_stat(void);
+static int player_ready(unsigned long long me);
 static void npc_join_tick(DWORD now);
 static int g_hitsync = 1, g_st_verbose, g_npcev_left;
 static int g_npcanim = 1;           /* npcanim: puppets take the host NPCs' animation graph inputs */
@@ -2372,7 +2373,7 @@ static void npc_host_tick(DWORD now)
     int i, n = 0;
     static IncScan hs;
     static float mp[4];
-    if (g_npc_role != 1 || g_ns == INVALID_SOCKET) return;
+    if (g_npc_role != 1 || g_ns == INVALID_SOCKET || !player_ready(g_net_id)) return;
     /* re-pick the NPCs near us or the avatar: a pass every 15 s, 16 MB of memory per frame (a full pass at once was a
      * ~280 ms hitch); the finished list keeps the mementos and counters of the NPCs that stay */
     if (!hs.busy && (!last_scan || now - last_scan > 15000)) {
@@ -2906,6 +2907,25 @@ static void dumpd_tick(DWORD now)
     memcpy(prev, cur, sizeof prev);
 }
 
+/* the player is really in the world: entity and pawn exist at a real position (both exist at 0,0,0 while the load
+ * screen is up) and have for 12 s. Encoding the own player earlier crashed in the ThirdParty encoder (Dunia+0x493bb0,
+ * null +0x2C) - after netstart from coop_auto.txt 3 s in, and from start-coop.ps1 1 s after the player id answered. */
+static int player_ready(unsigned long long me)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    static DWORD since;
+    static unsigned long long who;
+    void *hd = NULL;
+    BYTE *obj;
+    if (!me) return 0;
+    if (me != who) { who = me; since = 0; }
+    obj = entity_obj(me, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!obj || !((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)) ||
+        (*(float *)(obj + 0x60) == 0.0f && *(float *)(obj + 0x64) == 0.0f)) { since = 0; return 0; }
+    if (!since) since = GetTickCount() | 1;
+    return GetTickCount() - since >= 12000;
+}
 static void net_tick(void)
 {
     DWORD now;
@@ -3021,7 +3041,7 @@ static void net_tick(void)
     dumpd_tick(now);
     npc_join_tick(now);
     /* send at 20 Hz */
-    if ((g_bodymat || g_net_id) && now - g_net_lastsend >= 50) {
+    if ((g_bodymat || g_net_id) && now - g_net_lastsend >= 50 && player_ready(g_net_id)) {
         NetPktX4 q4;
         NetPktX3 q;
         NetPktX2 p;
@@ -3071,6 +3091,7 @@ static void net_tick(void)
 /* coop_auto.txt next to the probe: native commands (separated by ';' or lines) run once, 3 s after the game opened a
  * save and as soon as GetLocalPlayerId gives an id; "$ME" is replaced by that id. A session then starts as soon as
  * each copy is in its world (worldsync, avatar, netstart), with nobody typing commands. */
+static int player_ready(unsigned long long me);
 static void auto_start(void)
 {
     static int done;
@@ -3085,20 +3106,7 @@ static void auto_start(void)
     lua_eval("__out = tostring(GetLocalPlayerId())", out, sizeof out);
     me = strtoull(out, NULL, 10);
     if (!me || me == ~0ULL) return;   /* not in the world yet: try again next poll */
-    {
-        /* the id exists early in the load; wait until the player's entity and pawn exist, then 12 s more */
-        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
-        static DWORD ready;
-        void *hd = NULL;
-        BYTE *obj = entity_obj(me, &hd);
-        if (hd) (*(int *)((BYTE *)hd + 8))--;
-        /* the entity and pawn exist while the load screen is still up, at position (0, 0, 0); netstart then crashed
-         * in the encoder: wait for a real position */
-        if (!obj || !((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)) ||
-            (*(float *)(obj + 0x60) == 0.0f && *(float *)(obj + 0x64) == 0.0f)) { ready = 0; return; }
-        if (!ready) { ready = GetTickCount() | 1; return; }
-        if (GetTickCount() - ready < 12000) return;   /* 3 s still crashed in the encoder (Dunia+0x493bb0) */
-    }
+    if (!player_ready(me)) return;
     done = 1;
     logf_("autostart: player %llu, running %s", me, path);
     for (s = buf; *s; s = e) {
