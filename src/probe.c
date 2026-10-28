@@ -194,11 +194,24 @@ static HANDLE WINAPI h_CreateFileA(LPCSTR n, DWORD a, DWORD sh, LPSECURITY_ATTRI
     return h;
 }
 static DWORD g_sav_tick;   /* when the game first opened a save (coop_auto.txt runs a few seconds later) */
+static BYTE *g_base;
+static int safe_read(const void *addr, void *buf, size_t n);
 static HANDLE WINAPI h_CreateFileW(LPCWSTR n, DWORD a, DWORD sh, LPSECURITY_ATTRIBUTES sa, DWORD cd, DWORD fl, HANDLE t)
 {
     HANDLE h = o_CreateFileW(n, a, sh, sa, cd, fl, t); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
     if (n && (wcsstr(n, L"av") || wcsstr(n, L"Saved") || wcsstr(n, L"Documents") || wcsstr(n, L"Profile"))) logf_("CreateFileW %ls acc=%lx disp=%lu -> %s", n, a, cd, h == INVALID_HANDLE_VALUE ? "FAIL" : "ok");
     if (n && !g_sav_tick && wcsstr(n, L".sav") && h != INVALID_HANDLE_VALUE) g_sav_tick = GetTickCount() | 1;
+    if (n && g_base && wcsstr(n, L".sav")) {
+        /* who reads or writes a save: return addresses into Dunia.dll on the stack (to find the engine's save/load) */
+        DWORD *sp = (DWORD *)__builtin_frame_address(0), v;
+        char line[1000];
+        int k, c = 0, o = snprintf(line, sizeof line, "  .sav %s stack (thread %lu):", (a & (GENERIC_WRITE | FILE_WRITE_DATA)) ? "write" : "read", GetCurrentThreadId());
+        for (k = 0; k < 8192 && c < 64 && o < (int)sizeof line - 16; k++) {
+            if (!safe_read(sp + k, &v, 4)) break;
+            if (v >= (DWORD)(ULONG_PTR)g_base + 0x1000 && v < (DWORD)(ULONG_PTR)g_base + 0x1000000) { o += snprintf(line + o, sizeof line - o, " D+%lx", v - (DWORD)(ULONG_PTR)g_base); c++; }
+        }
+        logf_("%s", line);
+    }
     SetLastError(le);
     return h;
 }
