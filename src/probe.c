@@ -201,6 +201,47 @@ static HANDLE WINAPI h_CreateFileW(LPCWSTR n, DWORD a, DWORD sh, LPSECURITY_ATTR
     return h;
 }
 
+/* the game's startup HeapCreate (128 MB committed, sound init FUN_10d16530) failed in a second copy: log failures */
+static HANDLE (WINAPI *o_HeapCreate)(DWORD, SIZE_T, SIZE_T);
+static HANDLE WINAPI h_HeapCreate(DWORD o, SIZE_T i, SIZE_T m)
+{
+    HANDLE h = o_HeapCreate(o, i, m); DWORD le = GetLastError();
+    if (!h) {
+        MEMORY_BASIC_INFORMATION mbi;
+        BYTE *p = NULL;
+        SIZE_T best = 0, fr = 0;
+        while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi) {
+            if (mbi.State == MEM_FREE) { fr += mbi.RegionSize; if (mbi.RegionSize > best) best = mbi.RegionSize; }
+            p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+            if ((ULONG_PTR)p < (ULONG_PTR)mbi.BaseAddress) break;
+        }
+        logf_("HeapCreate(%lx, %lu MB, %lu MB) FAILED, error %lu; free address space %lu MB, largest free block %lu MB", o, (unsigned long)(i >> 20),
+              (unsigned long)(m >> 20), le, (unsigned long)(fr >> 20), (unsigned long)(best >> 20));
+        /* what holds the address space: allocations of 8 MB and more, by type and owner */
+        p = NULL;
+        while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi) {
+            BYTE *ab = (BYTE *)mbi.AllocationBase, *q = ab;
+            SIZE_T tot = 0;
+            MEMORY_BASIC_INFORMATION m2;
+            if (mbi.State != MEM_FREE && ab == mbi.BaseAddress) {
+                while (VirtualQuery(q, &m2, sizeof m2) == sizeof m2 && m2.AllocationBase == ab) { tot += m2.RegionSize; q = (BYTE *)m2.BaseAddress + m2.RegionSize; }
+                if (tot >= (8u << 20)) {
+                    char fn[MAX_PATH] = "";
+                    HMODULE hm = NULL;
+                    if (mbi.Type == MEM_IMAGE && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ab, &hm))
+                        GetModuleFileNameA(hm, fn, sizeof fn);
+                    logf_("  %p %4lu MB %s%s %s", ab, (unsigned long)(tot >> 20), mbi.Type == MEM_IMAGE ? "image" : mbi.Type == MEM_MAPPED ? "mapped" : "private",
+                          mbi.State == MEM_RESERVE ? " (reserved)" : "", fn);
+                }
+            }
+            p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+            if ((ULONG_PTR)p < (ULONG_PTR)mbi.BaseAddress) break;
+        }
+    }
+    SetLastError(le);
+    return h;
+}
+
 typedef struct { const char *dll, *name; void **orig; void *hook; } Target;
 static Target g_targets[] = {
     { "ws2_32.dll", "sendto", (void **)&o_sendto, h_sendto },
@@ -217,6 +258,7 @@ static Target g_targets[] = {
     { "kernel32.dll", "CreateFileW", (void **)&o_CreateFileW, h_CreateFileW },
     { "kernel32.dll", "ExitProcess", (void **)&o_ExitProcess, h_ExitProcess },
     { "user32.dll", "PostQuitMessage", (void **)&o_PostQuitMessage, h_PostQuitMessage },
+    { "kernel32.dll", "HeapCreate", (void **)&o_HeapCreate, h_HeapCreate },
 };
 #define NT (sizeof g_targets / sizeof g_targets[0])
 
@@ -378,6 +420,7 @@ static unsigned long long g_av_id;
 static int g_npc_role;            /* npcsync: 1 host, 2 join */
 static float g_npc_rad = 80.0f;
 static void stim_install(unsigned long long id, int slot);
+static void npc_stat(void);
 static int g_hitsync = 1, g_st_verbose;  /* hit sync on by default; stimlog turns on event logging */
 static void av_remove(void);
 static void *np_slot(BYTE *obj, int slot, unsigned k0, unsigned k1, unsigned k2);
@@ -501,6 +544,23 @@ static LONG WINAPI veh_filter(EXCEPTION_POINTERS *ep)
         caller_str(ep->ExceptionRecord->ExceptionAddress, mod, sizeof mod);
         logf_("ACCESS VIOLATION #%d at %s, %s address %p", n, mod, ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
               (void *)ep->ExceptionRecord->ExceptionInformation[1]);
+        if (n <= 3) {
+            /* stack: values on the stack that point into Dunia.dll or the probe are likely return addresses */
+            DWORD *sp = (DWORD *)ep->ContextRecord->Esp, v, me;
+            char line[600];
+            MEMORY_BASIC_INFORMATION mi;
+            VirtualQuery((void *)&veh_filter, &mi, sizeof mi);
+            me = (DWORD)(ULONG_PTR)mi.AllocationBase;
+            int k, c = 0, o = snprintf(line, sizeof line, "  regs eax %08lx ebx %08lx ecx %08lx edx %08lx esi %08lx edi %08lx esp %08lx ebp %08lx; stack:",
+                                       ep->ContextRecord->Eax, ep->ContextRecord->Ebx, ep->ContextRecord->Ecx, ep->ContextRecord->Edx,
+                                       ep->ContextRecord->Esi, ep->ContextRecord->Edi, ep->ContextRecord->Esp, ep->ContextRecord->Ebp);
+            for (k = 0; k < 1024 && c < 24 && o < (int)sizeof line - 24; k++) {
+                if (!safe_read(sp + k, &v, 4)) break;
+                if (v >= (DWORD)(ULONG_PTR)g_base + 0x1000 && v < (DWORD)(ULONG_PTR)g_base + 0x1000000) { o += snprintf(line + o, sizeof line - o, " D+%lx", v - (DWORD)(ULONG_PTR)g_base); c++; }
+                else if (v - me < 0x80000u) { o += snprintf(line + o, sizeof line - o, " P+%lx", v - me); c++; }
+            }
+            logf_("%s", line);
+        }
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -732,7 +792,7 @@ static void native_cmd(const char *ln)
          * FUN_101289f0(weapon) */
         char arch[96];
         if (sscanf(ln + 9, "%95s", arch) == 1) av_give_weapon(arch);
-    } else if (strncmp(ln, "npcs", 4) == 0 && strncmp(ln, "npcsync", 7) != 0) {
+    } else if (strncmp(ln, "npcs", 4) == 0 && (ln[4] == 0 || ln[4] == ' ')) {
         /* npcs [radius] (read-only census): every AI pawn agent (CPawnAgent, vtable RVA EC5078; agent+4 = pawn entity
          * holder) with entity id, position, distance to our player, health (counters +0x44 -> +0x10 / +0x14) and
          * archetype name (Lua GetEntityName) for those within the radius (default 120 m) */
@@ -846,6 +906,8 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "avmpflag %d", &n) == 1) {
         g_mf_on = n != 0;
         logf_("avmpflag: avatar main beautifier updates %s the MP flag", g_mf_on ? "with" : "without");
+    } else if (strcmp(ln, "npcstat") == 0) {
+        npc_stat();
     } else if (strncmp(ln, "npcsync ", 8) == 0) {
         float rad = 0;
         g_npc_role = strstr(ln, "host") ? 1 : strstr(ln, "join") ? 2 : 0;
@@ -1880,12 +1942,18 @@ typedef struct { unsigned magic, seq; int type, amount; unsigned flags, part, w6
 #pragma pack(push, 1)
 typedef struct { HitPkt h; unsigned long long npc; } NpcHitPkt;
 #pragma pack(pop)
-static unsigned g_hit_tx, g_hit_rx, g_hit_blocked, g_nhit_tx, g_nhit_rx, g_nhit_blocked;
+static unsigned g_hit_tx, g_hit_rx, g_hit_blocked, g_nhit_tx, g_nhit_rx, g_nhit_blocked, g_nsht_tx, g_nsht_rx, g_nsht_blocked;
 static void *g_st_vt[3][257], *g_st_orig[3];
 static BYTE *g_st_obj[2];
 static unsigned long long g_st_id[2];
 static unsigned g_st_n[3], g_st_other[3];
 static unsigned long long npc_id_of(BYTE *obj);
+static int npc_is_synced(unsigned long long id);
+static int npc_shot_ok(BYTE *obj, int pull);
+/* NPC shots at players are decided on the host as well: a stim on the avatar whose source is a synced NPC goes to the
+ * joiner as NSHT (hit + the host's NPC id) and lands on the joiner's player with the puppet as source; the puppets'
+ * own replayed shots at the joiner's player are dropped there. */
+#define NSHT_MAGIC 0x5448534Eu
 static unsigned long long st_hid(BYTE *h) { return h && !IsBadReadPtr(h, 8) ? *(unsigned long long *)h : 0; }
 /* an event's name: MSVC std::string at +0xC (inline buffer up to 15 chars, size +0x1C, capacity +0x20) */
 static const char *st_name(BYTE *ev)
@@ -1909,6 +1977,7 @@ static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
     unsigned evt = ev && !IsBadReadPtr(ev, 0x24) ? *(unsigned *)ev : 0;
     const char *nm = evt ? st_name(ev) : "";
     if (!strcmp(nm, "IsUsable")) evt = 0;
+    if (s == 2 && (!strcmp(nm, "PullTrigger") || !strcmp(nm, "start_shoot") || !strcmp(nm, "WeaponFireBullet")) && !npc_shot_ok(self, nm[0] == 'P')) return 0;
     if (!strcmp(nm, "Stims") && !IsBadReadPtr(ev, 0x94)) {
         unsigned long long src = st_hid(*(BYTE **)(ev + 0x3C));
         if (g_hitsync && s == 0 && src == g_net_id && *(int *)(ev + 0x58) && g_ns != INVALID_SOCKET) {
@@ -1930,6 +1999,19 @@ static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
             if (++g_nhit_blocked <= 50) logf_("npc hit: dropped the avatar's replayed stim on NPC %llu (amount %d) - the joiner's window decides", npc_id_of(self), *(int *)(ev + 0x58));
             return 0;
         }
+        /* type 4 stims are perception ("seen/heard", amount 0-1): they stay local; the rest is damage */
+        int dmg = *(int *)(ev + 0x48) != 4 && *(int *)(ev + 0x58);
+        if (g_hitsync && s == 0 && g_npc_role == 1 && dmg && src && src != g_net_id && npc_is_synced(src) && g_ns != INVALID_SOCKET) {
+            NpcHitPkt nk;
+            st_pack(&nk.h, ev, evt);
+            nk.h.magic = NSHT_MAGIC; nk.h.seq = ++g_nsht_tx; nk.npc = src;
+            sendto(g_ns, (char *)&nk, sizeof nk, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+            if (g_nsht_tx <= 50) logf_("npc shot %u: NPC %llu hit the avatar (type %d, amount %d, part %08x) -> sent to the joiner", g_nsht_tx, src, nk.h.type, nk.h.amount, nk.h.part);
+        }
+        if (g_hitsync && s == 1 && g_npc_role == 2 && dmg && src && npc_is_synced(src)) {
+            if (++g_nsht_blocked <= 50) logf_("npc shot: dropped puppet %llu's own stim on us (amount %d) - the host decides", src, *(int *)(ev + 0x58));
+            return 0;
+        }
         if (g_hitsync && s == 1 && src && src == g_av_id) {
             if (++g_hit_blocked <= 50) logf_("hit: dropped the avatar's own stim on us (type %d, amount %d) - the shooter's window decides", *(int *)(ev + 0x48), *(int *)(ev + 0x58));
             return 0;
@@ -1943,6 +2025,19 @@ static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
                   *(float *)(ev + 0x90), *(unsigned *)(ev + 0x60), *(unsigned *)(ev + 0x64), *(unsigned *)(ev + 0x68), *(unsigned *)(ev + 0x6C), *(unsigned *)(ev + 0x44));
     } else if (evt && g_st_verbose && ++g_st_other[s] <= 40)
         logf_("event -> %s: %s (vt rva %x)", s == 2 ? "npc" : s ? "me" : "avatar", nm, evt - (unsigned)g_base);
+    if (evt == (unsigned)(g_base + 0xE9376C)) {
+        /* AI area query (FUN_107ac420): an entity that does not mark the reply (+0x31) must have component FE4090, the
+         * game reads its +0x14 unchecked. NPCs spawned here from enemy_archetypes.* can lack it: mark them as skipped. */
+        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+        static unsigned logged;
+        int r = ((int (__attribute__((thiscall)) *)(void *, void *))g_st_orig[s])(self, ev);
+        if (!ev[0x31] && !((gcomp_t)(g_base + 0x4E2CC0))(self, (void *)(g_base + 0xFE4090))) {
+            ev[0x31] = 1;
+            if (logged++ < 10) logf_("area query '%s' on %s %llu without component FE4090: marked as skipped (the game would crash)", nm,
+                                     s == 2 ? "npc" : s ? "me" : "avatar", s == 2 ? npc_id_of(self) : g_st_id[s]);
+        }
+        return r;
+    }
     return ((int (__attribute__((thiscall)) *)(void *, void *))g_st_orig[s])(self, ev);
 }
 static void stim_install(unsigned long long id, int slot)
@@ -1983,8 +2078,9 @@ static void st_hook_npc(BYTE *obj)
     *(void ***)obj = &g_st_vt[2][1];
 }
 
-/* build a stim from a hit packet and hand it to the target's original event method, with the avatar as source */
-static void st_deliver(const HitPkt *hp, BYTE *target, void *orig)
+/* build a stim from a hit packet and hand it to the target's original event method, with srcid (the avatar, or a
+ * puppet for NPC shots) as source and instigator */
+static void st_deliver(const HitPkt *hp, BYTE *target, void *orig, unsigned long long srcid)
 {
     typedef void *(__fastcall *ctor_t)(void *ev);
     BYTE ev[0xC0], *nh;
@@ -1999,7 +2095,7 @@ static void st_deliver(const HitPkt *hp, BYTE *target, void *orig)
     *(int *)(ev + 0x48) = hp->type; *(int *)(ev + 0x58) = hp->amount; *(unsigned *)(ev + 0x5C) = hp->flags;
     *(unsigned *)(ev + 0x44) = hp->part; *(unsigned *)(ev + 0x60) = hp->w60; memcpy(ev + 0x64, hp->pos, sizeof hp->pos);
     /* source and instigator = the avatar (one reference each, released by the destructor like the null handles) */
-    if (g_av_id && entity_obj(g_av_id, &ah) && ah) {
+    if (srcid && entity_obj(srcid, &ah) && ah) {
         nh = *(BYTE **)(ev + 0x3C); (*(int *)(nh + 8))--;
         nh = *(BYTE **)(ev + 0x40); (*(int *)(nh + 8))--;
         (*(int *)((BYTE *)ah + 8))++;
@@ -2018,7 +2114,7 @@ static void npc_hit_apply(const NpcHitPkt *nk)
     obj = entity_obj(nk->npc, &hd);
     if (hd) (*(int *)((BYTE *)hd + 8))--;
     if (!obj) return;
-    st_deliver(&nk->h, obj, *(void ***)obj == &g_st_vt[2][1] ? g_st_orig[2] : (*(void ***)obj)[0x20 / 4]);
+    st_deliver(&nk->h, obj, *(void ***)obj == &g_st_vt[2][1] ? g_st_orig[2] : (*(void ***)obj)[0x20 / 4], g_av_id);
     if (++g_nhit_rx <= 50) logf_("npc hit %u: the joiner hit NPC %llu (type %d, amount %d, part %08x) -> applied", nk->h.seq, nk->npc, nk->h.type, nk->h.amount, nk->h.part);
 }
 
@@ -2033,7 +2129,7 @@ static void hit_apply(const HitPkt *hp)
     me = entity_obj(g_net_id, &hd);
     if (hd) (*(int *)((BYTE *)hd + 8))--;
     if (!me || *(void ***)me != &g_st_vt[1][1]) return;
-    st_deliver(hp, me, g_st_orig[1]);
+    st_deliver(hp, me, g_st_orig[1], g_av_id);
     if (++g_hit_rx <= 50) logf_("hit %u: the peer hit us (type %d, amount %d, flags %x, part %08x, sub rva %x) -> applied", hp->seq, hp->type, hp->amount, hp->flags, hp->part, hp->subvt);
 }
 
@@ -2061,43 +2157,54 @@ static void hit_tick(DWORD now)
 #define NPC_MAGIC 0x3143504Eu
 #define NPC_MAX 24
 #pragma pack(push, 1)
-typedef struct { unsigned long long id; float pos[3]; int vel[3], aim[4]; unsigned char s104, s11c, s110, pad; float hp, hpmax; } NpcEnt;
+typedef struct { unsigned long long id; float pos[3]; int vel[3], aim[4]; unsigned char s104, s11c, s110, pad; float hp, hpmax; unsigned pulls; } NpcEnt;
 typedef struct { unsigned magic, seq, count; NpcEnt e[NPC_MAX]; } NpcPkt;
 #pragma pack(pop)
-static struct { unsigned long long id; BYTE *mem, *obj; } g_nh[NPC_MAX];
+static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; } g_nh[NPC_MAX];
 static int g_nh_n;
 static BYTE g_npc_this[0x40];
-static struct { unsigned long long id; BYTE *agent, *comp, *mem, *obj; int state; NpcEnt e; DWORD last; } g_np[NPC_MAX];
+/* lid: the local entity id when the NPC had to be spawned here (the host's id is unknown to this world) */
+static struct { unsigned long long id, lid; BYTE *agent, *comp, *mem, *obj; int state, nospawn, gone; NpcEnt e; DWORD last, req; unsigned shots, fires, supp; } g_np[NPC_MAX];
 static int g_np_n;
 
-/* scan all CPawnAgents (vtable RVA EC5078, agent+4 = pawn holder); calls back with id, entity, agent */
-static int npc_scan(void (*cb)(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx), void *ctx)
+/* scan for CPawnAgents (vtable RVA EC5078, agent+4 = pawn holder), calling back with id, entity, agent; spread over many
+ * calls: each reads at most `budget` bytes of committed read-write memory and continues where the last one stopped (a
+ * full pass at once took ~280 ms, a visible hitch); returns 1 when a pass has just been completed. The AI manager's
+ * array (*(DAT_11607408 + 0xC) +0x68/+0x6C, what EnableScriptedAIMode walks) holds other objects (vtable EC40D0, no
+ * agent pointers in their first 0x300 bytes), so this stays a memory scan. */
+typedef struct { BYTE *p, *c; int busy; } IncScan;
+static int npc_scan_step(IncScan *s, size_t budget, void (*cb)(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx), void *ctx)
 {
     static BYTE chunk[0x10000];
     MEMORY_BASIC_INFORMATION mbi;
-    BYTE *p = NULL;
     unsigned vt = (unsigned)(g_base + 0xEC5078);
-    int found = 0;
-    while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi && found < 600) {
+    size_t done = 0;
+    if (!s->busy) { s->busy = 1; s->p = NULL; s->c = NULL; }
+    while (done < budget) {
+        BYTE *rb, *rend;
+        if (VirtualQuery(s->p, &mbi, sizeof mbi) != sizeof mbi) { s->busy = 0; return 1; }
+        rb = (BYTE *)mbi.BaseAddress; rend = rb + mbi.RegionSize;
         if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (mbi.Protect & PAGE_READWRITE) && mbi.RegionSize < 0x20000000) {
-            BYTE *rb = (BYTE *)mbi.BaseAddress, *rend = rb + mbi.RegionSize, *c;
-            for (c = rb; c < rend && found < 600; c += sizeof chunk) {
-                size_t n = (size_t)(rend - c), k;
+            if (!s->c || s->c < rb || s->c >= rend) s->c = rb;
+            while (s->c < rend && done < budget) {
+                size_t n = (size_t)(rend - s->c), k;
                 if (n > sizeof chunk) n = sizeof chunk;
-                if (!safe_read(c, chunk, n)) continue;
-                for (k = 0; k + 8 <= n; k += 4) {
-                    BYTE *holder, *obj;
-                    if (*(unsigned *)(chunk + k) != vt) continue;
-                    holder = *(BYTE **)(chunk + k + 4);
-                    if (!holder || IsBadReadPtr(holder, 16) || !(obj = *(BYTE **)(holder + 0xC)) || IsBadReadPtr(obj, 0xA4)) continue;
-                    found++;
-                    cb(*(unsigned long long *)holder, obj, c + k, ctx);
-                }
+                if (safe_read(s->c, chunk, n))
+                    for (k = 0; k + 8 <= n; k += 4) {
+                        BYTE *holder, *obj;
+                        if (*(unsigned *)(chunk + k) != vt) continue;
+                        holder = *(BYTE **)(chunk + k + 4);
+                        if (!holder || IsBadReadPtr(holder, 16) || !(obj = *(BYTE **)(holder + 0xC)) || IsBadReadPtr(obj, 0xA4)) continue;
+                        cb(*(unsigned long long *)holder, obj, s->c + k, ctx);
+                    }
+                s->c += n; done += n;
             }
+            if (s->c < rend) return 0;
         }
-        p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+        s->p = rend; s->c = NULL;
+        if ((ULONG_PTR)rend <= (ULONG_PTR)rb) { s->busy = 0; return 1; }
     }
-    return found;
+    return 0;
 }
 static int npc_has_netcomp(BYTE *obj)
 {
@@ -2106,14 +2213,30 @@ static int npc_has_netcomp(BYTE *obj)
     for (k = 0; cs && k < n && k < 64; k++) if (cs[k] && !IsBadReadPtr(cs[k], 4) && *(DWORD *)cs[k] == (DWORD)(g_base + 0xE1AE00)) return 1;
     return 0;
 }
+static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; } g_nb[NPC_MAX];  /* list being built */
+static int g_nb_n;
+static unsigned long long g_nx[64];  /* ids never synced (buddies) */
+static int g_nx_n;
 static void npc_host_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx)
 {
-    float *me = (float *)ctx, dx = *(float *)(obj + 0x60) - me[0], dy = *(float *)(obj + 0x64) - me[1];
+    /* ctx: our player's and the avatar's ground positions; an NPC near either of them is synced */
+    float *me = (float *)ctx, r2 = g_npc_rad * g_npc_rad;
+    float ax = *(float *)(obj + 0x60) - me[0], ay = *(float *)(obj + 0x64) - me[1];
+    float bx = *(float *)(obj + 0x60) - me[2], by = *(float *)(obj + 0x64) - me[3];
     int i;
     (void)agent;
-    if (g_nh_n >= NPC_MAX || id == g_net_id || id == g_av_id || dx * dx + dy * dy > g_npc_rad * g_npc_rad || npc_has_netcomp(obj)) return;
-    for (i = 0; i < g_nh_n; i++) if (g_nh[i].id == id) return;
-    g_nh[g_nh_n].id = id; g_nh[g_nh_n].mem = NULL; g_nh[g_nh_n].obj = obj; g_nh_n++;
+    if (g_nb_n >= NPC_MAX || id == g_net_id || id == g_av_id || (ax * ax + ay * ay > r2 && bx * bx + by * by > r2) || npc_has_netcomp(obj)) return;
+    for (i = 0; i < g_nb_n; i++) if (g_nb[i].id == id) return;
+    for (i = 0; i < g_nx_n; i++) if (g_nx[i] == id) return;
+    {
+        /* each player keeps their own buddies (rescue): buddies are not synced */
+        char code[96], name[96];
+        snprintf(code, sizeof code, "__out = tostring(GetEntityName('%llu'))", id);
+        lua_eval(code, name, sizeof name);
+        if (!strncmp(name, "buddies.", 8)) { if (g_nx_n < 64) g_nx[g_nx_n++] = id; logf_("npcsync host: %llu is a buddy (%s), not synced", id, name); return; }
+    }
+    memset(&g_nb[g_nb_n], 0, sizeof g_nb[0]);
+    g_nb[g_nb_n].id = id; g_nb[g_nb_n].obj = obj; g_nb_n++;
 }
 static float npc_hp(BYTE *obj, float *hpmax)
 {
@@ -2128,23 +2251,35 @@ static void npc_host_tick(DWORD now)
     static unsigned seq;
     NpcPkt pk;
     int i, n = 0;
-    if (g_npc_role != 1 || g_ns == INVALID_SOCKET || now - last_send < 100) return;
-    last_send = now;
-    if (!last_scan || now - last_scan > 30000) {
-        /* re-pick the NPCs around us every 30 s (a full memory scan, a visible hitch) (keeps the existing mementos of those still in range) */
-        struct { unsigned long long id; BYTE *mem, *obj; } old[NPC_MAX];
-        int on = g_nh_n, j;
+    static IncScan hs;
+    static float mp[4];
+    if (g_npc_role != 1 || g_ns == INVALID_SOCKET) return;
+    /* re-pick the NPCs near us or the avatar: a pass every 15 s, 16 MB of memory per frame (a full pass at once was a
+     * ~280 ms hitch); the finished list keeps the mementos and counters of the NPCs that stay */
+    if (!hs.busy && (!last_scan || now - last_scan > 15000)) {
         void *hd = NULL;
-        BYTE *me = entity_obj(g_net_id, &hd);
-        float mp[3] = { 0, 0, 0 };
+        BYTE *me = entity_obj(g_net_id, &hd), *av;
+        if (hd) { (*(int *)((BYTE *)hd + 8))--; hd = NULL; }
+        memset(mp, 0, sizeof mp);
+        if (me) memcpy(mp, me + 0x60, 2 * sizeof(float));
+        av = g_av_id ? entity_obj(g_av_id, &hd) : NULL;
         if (hd) (*(int *)((BYTE *)hd + 8))--;
-        if (me) memcpy(mp, me + 0x60, sizeof mp);
-        memcpy(old, g_nh, sizeof old);
-        g_nh_n = 0; last_scan = now;
-        npc_scan(npc_host_cb, mp);
-        for (i = 0; i < g_nh_n; i++) for (j = 0; j < on; j++) if (old[j].id == g_nh[i].id) g_nh[i].mem = old[j].mem;
-        logf_("npcsync host: %d NPCs within %.0f m", g_nh_n, g_npc_rad);
+        if (av) memcpy(mp + 2, av + 0x60, 2 * sizeof(float)); else { mp[2] = mp[0]; mp[3] = mp[1]; }
+        g_nb_n = 0; last_scan = now; hs.busy = 0;
+        npc_scan_step(&hs, 0, npc_host_cb, mp);
     }
+    if (hs.busy && npc_scan_step(&hs, 16u << 20, npc_host_cb, mp)) {
+        int j, changed = g_nb_n != g_nh_n;
+        for (i = 0; i < g_nb_n; i++) {
+            for (j = 0; j < g_nh_n && g_nh[j].id != g_nb[i].id; j++) ;
+            if (j < g_nh_n) { g_nb[i].mem = g_nh[j].mem; g_nb[i].shots = g_nh[j].shots; g_nb[i].fires = g_nh[j].fires; g_nb[i].lastfire = g_nh[j].lastfire; }
+            else changed = 1;
+        }
+        memcpy(g_nh, g_nb, sizeof g_nh); g_nh_n = g_nb_n;
+        if (changed) logf_("npcsync host: %d NPCs within %.0f m of us or the avatar (pass %lu ms)", g_nh_n, g_npc_rad, GetTickCount() - last_scan);
+    }
+    if (now - last_send < 100) return;
+    last_send = now;
     memset(&pk, 0, sizeof pk);
     for (i = 0; i < g_nh_n; i++) {
         typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
@@ -2167,7 +2302,10 @@ static void npc_host_tick(DWORD now)
         for (k = 0; k < 3; k++) e->vel[k] = *(int *)(m + 0x78 + 0x14 * k);
         e->aim[0] = *(int *)(m + 0xB4); e->aim[1] = *(int *)(m + 0xC8); e->aim[2] = *(int *)(m + 0xDC); e->aim[3] = *(int *)(m + 0xF0);
         e->s104 = m[0x104]; e->s11c = m[0x11C]; e->s110 = m[0x110];
+        if (e->s104 && !g_nh[i].lastfire) g_nh[i].fires++;
+        g_nh[i].lastfire = e->s104;
         e->hp = npc_hp(obj, &e->hpmax);
+        e->pulls = g_nh[i].shots;
         n++;
     }
     pk.magic = NPC_MAGIC; pk.seq = ++seq; pk.count = n;
@@ -2191,26 +2329,155 @@ static unsigned long long npc_id_of(BYTE *obj)
     for (i = 0; i < g_nh_n; i++) if (g_nh[i].obj == obj) return g_nh[i].id;
     return 0;
 }
+static int npc_is_synced(unsigned long long id)
+{
+    int i;
+    for (i = 0; i < g_np_n; i++) if (g_np[i].id == id || (g_np[i].lid && g_np[i].lid == id)) return 1;
+    for (i = 0; i < g_nh_n; i++) if (g_nh[i].id == id) return 1;
+    return 0;
+}
+/* NPC trigger pulls: the host counts them per NPC and sends the count; a puppet may only pull its trigger as often as
+ * its host NPC did (its own paused AI still fired back at the joiner's gunfire); the rest of a refused shot (start_shoot,
+ * WeaponFireBullet) is refused too */
+static int npc_shot_ok(BYTE *obj, int pull)
+{
+    int i;
+    for (i = 0; i < g_nh_n; i++) if (g_nh[i].obj == obj) { if (pull) g_nh[i].shots++; return 1; }
+    for (i = 0; i < g_np_n; i++) if (g_np[i].obj == obj) {
+        if (pull) {
+            if (g_np[i].shots < g_np[i].e.pulls) { g_np[i].shots++; g_np[i].fires = 1; return 1; }
+            g_np[i].supp++; g_np[i].fires = 0; return 0;
+        }
+        return g_np[i].fires != 0;
+    }
+    return 1;
+}
+
+/* spawn requests: the joiner asks for the archetype of an NPC id its world lacks (NREQ), the host answers with
+ * GetEntityName (NARC), the joiner spawns it there and drives it like any other puppet */
+#define NREQ_MAGIC 0x5145524Eu
+#define NARC_MAGIC 0x4352414Eu
+#pragma pack(push, 1)
+typedef struct { unsigned magic; unsigned long long id; char name[96]; } NpcArcPkt;
+#pragma pack(pop)
+static void npc_req_rx(const NpcArcPkt *q)
+{
+    NpcArcPkt a;
+    char code[96];
+    if (g_npc_role != 1 || g_ns == INVALID_SOCKET) return;
+    memset(&a, 0, sizeof a);
+    a.magic = NARC_MAGIC; a.id = q->id;
+    snprintf(code, sizeof code, "__out = tostring(GetEntityName('%llu'))", q->id);
+    lua_eval(code, a.name, sizeof a.name);
+    sendto(g_ns, (char *)&a, sizeof a, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+    logf_("npcsync host: the joiner lacks NPC %llu -> sent its name '%s'", q->id, a.name);
+}
+static void npc_arc_rx(const NpcArcPkt *a)
+{
+    char code[200], out[40], name[96];
+    int j;
+    unsigned long long lid;
+    if (g_npc_role != 2) return;
+    for (j = 0; j < g_np_n && g_np[j].id != a->id; j++) ;
+    if (j == g_np_n || g_np[j].lid || g_np[j].nospawn) return;
+    memcpy(name, a->name, sizeof name); name[sizeof name - 1] = 0;
+    if (!name[0] || strchr(name, '\'') || !strcmp(name, "nil") || !strncmp(name, "buddies.", 8)) { g_np[j].nospawn = 1; logf_("npcsync join: no name for NPC %llu ('%s')", a->id, name); return; }
+    snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('%s', %.3f, %.3f, %.3f, 0, 0, 0))", name, g_np[j].e.pos[0], g_np[j].e.pos[1], g_np[j].e.pos[2]);
+    lua_eval(code, out, sizeof out);
+    lid = strtoull(out, NULL, 10);
+    if (!lid || out[0] == '-' || lid == ~0ULL) { g_np[j].nospawn = 1; logf_("npcsync join: spawning '%s' for host NPC %llu failed (%s)", name, a->id, out); return; }
+    g_np[j].lid = lid;
+    logf_("npcsync join: spawned '%s' as %llu for host NPC %llu at (%.1f %.1f %.1f)", name, lid, a->id, g_np[j].e.pos[0], g_np[j].e.pos[1], g_np[j].e.pos[2]);
+}
+/* NSHT on the joiner: a host NPC hit our avatar there, so our player takes it here from that NPC's puppet */
+static void npc_shot_apply(const NpcHitPkt *nk)
+{
+    void *hd = NULL;
+    BYTE *me;
+    int j;
+    unsigned long long src = nk->npc;
+    if (!g_hitsync || g_npc_role != 2 || !g_st_orig[1]) return;
+    for (j = 0; j < g_np_n; j++) if (g_np[j].id == nk->npc) { if (g_np[j].lid) src = g_np[j].lid; break; }
+    me = entity_obj(g_net_id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!me || *(void ***)me != &g_st_vt[1][1]) return;
+    st_deliver(&nk->h, me, g_st_orig[1], src);
+    if (++g_nsht_rx <= 50) logf_("npc shot %u: host NPC %llu hit us (type %d, amount %d, part %08x) -> applied", nk->h.seq, nk->npc, nk->h.type, nk->h.amount, nk->h.part);
+}
 static void npc_join_find_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx)
 {
     int j;
     (void)obj; (void)ctx;
-    for (j = 0; j < g_np_n; j++) if (g_np[j].id == id && !g_np[j].agent) g_np[j].agent = agent;
+    for (j = 0; j < g_np_n; j++) if ((g_np[j].id == id || (g_np[j].lid && g_np[j].lid == id)) && !g_np[j].agent) g_np[j].agent = agent;
+}
+/* per synced NPC: shots seen (start_shoot events), health; host and joiner lines compare by id */
+static void npc_stat(void)
+{
+    int i;
+    for (i = 0; i < g_nh_n; i++) {
+        float mx; void *hd = NULL; BYTE *o = entity_obj(g_nh[i].id, &hd);
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        logf_("npcstat %llu: trigger pulls %u (fire-bit bursts %u) hp %.0f", g_nh[i].id, g_nh[i].shots, g_nh[i].fires, o ? npc_hp(o, &mx) : -2.0f);
+    }
+    for (i = 0; i < g_np_n; i++)
+        logf_("npcstat %llu: host pulls %u, puppet pulls %u, refused %u, hp %.0f state %d%s%s", g_np[i].id, g_np[i].e.pulls, g_np[i].shots, g_np[i].supp, g_np[i].e.hp, g_np[i].state,
+              g_np[i].lid ? " spawned here" : "", g_np[i].gone ? " GONE" : "");
+    logf_("npcstat done: npc shots at players sent %u applied %u dropped %u, npc hits sent %u applied %u dropped %u", g_nsht_tx, g_nsht_rx, g_nsht_blocked,
+          g_nhit_tx, g_nhit_rx, g_nhit_blocked);
+}
+
+/* the joiner's own world must not run NPCs of its own: NPCs it spawns at runtime (alarm reinforcements, patrols; their ids
+ * have the high bit set, save NPCs do not) fought and killed the joiner's player. They are removed (RemoveEntity); the
+ * host's versions come as puppets. Kept: our puppets, players, the avatar, buddies. */
+static unsigned long long g_nr[32];
+static int g_nr_n;
+static unsigned long long g_nkeep[32];
+static int g_nkeep_n;
+static void npc_join_local_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx)
+{
+    int j;
+    (void)obj; (void)agent; (void)ctx;
+    npc_join_find_cb(id, obj, agent, ctx);
+    if (!(id >> 63) || id == g_net_id || id == g_av_id || g_nr_n >= 32) return;
+    for (j = 0; j < g_np_n; j++) if (g_np[j].lid == id || g_np[j].id == id) return;
+    for (j = 0; j < g_nkeep_n; j++) if (g_nkeep[j] == id) return;
+    g_nr[g_nr_n++] = id;
 }
 static void npc_join_tick(DWORD now)
 {
     static DWORD last_find;
-    int j, k, pending = 0;
+    int j, k;
     if (g_npc_role != 2) return;
-    for (j = 0; j < g_np_n; j++) if (g_np[j].state == 0) pending++;
-    if (pending && now - last_find > 10000) { last_find = now; npc_scan(npc_join_find_cb, NULL); }
+    static IncScan js;
+    if (!js.busy && now - last_find > 3000) { g_nr_n = 0; last_find = now; npc_scan_step(&js, 0, npc_join_local_cb, NULL); }
+    if (js.busy && npc_scan_step(&js, 16u << 20, npc_join_local_cb, NULL)) {
+        last_find = now;
+        for (k = 0; k < g_nr_n; k++) {
+            char code[120], name[96];
+            snprintf(code, sizeof code, "__out = tostring(GetEntityName('%llu'))", g_nr[k]);
+            lua_eval(code, name, sizeof name);
+            if (!strncmp(name, "buddies.", 8) || !strncmp(name, "player.", 7)) { if (g_nkeep_n < 32) g_nkeep[g_nkeep_n++] = g_nr[k]; continue; }
+            snprintf(code, sizeof code, "RemoveEntity('%llu')", g_nr[k]);
+            lua_eval(code, name, sizeof name);
+            logf_("npcsync join: removed our own NPC %llu (%s) - the host runs NPCs", g_nr[k], name);
+        }
+    }
     for (j = 0; j < g_np_n; j++) {
         typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
         void *hd = NULL;
-        BYTE *obj = entity_obj(g_np[j].id, &hd), *m;
+        BYTE *obj = entity_obj(g_np[j].lid ? g_np[j].lid : g_np[j].id, &hd), *m;
         NpcEnt *e = &g_np[j].e;
         if (hd) (*(int *)((BYTE *)hd + 8))--;
-        if (!obj) continue;
+        if (!obj) {
+            /* not in this world (spawned on the host after the save): ask for its archetype, at most every 3 s */
+            if (g_np[j].state == 1 && !g_np[j].gone) { g_np[j].gone = 1; logf_("npcsync join: puppet %llu is gone from this world", g_np[j].id); }
+            if (g_np[j].state == 0 && !g_np[j].lid && !g_np[j].nospawn && e->hp > 0 && now - g_np[j].req > 3000 && g_ns != INVALID_SOCKET) {
+                NpcArcPkt q;
+                memset(&q, 0, sizeof q); q.magic = NREQ_MAGIC; q.id = g_np[j].id; g_np[j].req = now;
+                sendto(g_ns, (char *)&q, sizeof q, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+            }
+            continue;
+        }
         if (g_np[j].state == 0) {
             BYTE *comp = NULL, *bc;
             void **cs = *(void ***)(obj + 0x9C);
@@ -2230,7 +2497,8 @@ static void npc_join_tick(DWORD now)
             np_slot(obj, 0x2C, 0x608487bc, 0xFFFFFFFFu, 0xFFFFFFFFu);
             bc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4));
             if (bc) mf_install(bc);
-            logf_("npcsync join: NPC %llu is a puppet now (agent %p paused, comp %p, memento %p, main vt %08x, hp %.0f/%.0f)", g_np[j].id, g_np[j].agent,
+            logf_("npcsync join: NPC %llu%s is a puppet now (FE4090 %s, agent %p paused, comp %p, memento %p, main vt %08x, hp %.0f/%.0f)", g_np[j].id, g_np[j].lid ? " (spawned here)" : "",
+                  ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFE4090)) ? "yes" : "NO", g_np[j].agent,
                   comp, m, bc && *(void **)(bc + 0x28) ? **(unsigned **)(bc + 0x28) : 0, e->hp, e->hpmax);
             continue;
         }
@@ -2388,6 +2656,11 @@ static void net_tick(void)
         static NpcPkt rb;
         int r = recvfrom(g_ns, (char *)&rb, sizeof rb, 0, (struct sockaddr *)&from, &fl);
         if (r == SOCKET_ERROR) { if (WSAGetLastError() == WSAEMSGSIZE) { g_net_drop++; continue; } break; }
+        if (r == (int)sizeof(NpcArcPkt) && (rb.magic == NREQ_MAGIC || rb.magic == NARC_MAGIC)) {
+            if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) { if (rb.magic == NREQ_MAGIC) npc_req_rx((const NpcArcPkt *)&rb); else npc_arc_rx((const NpcArcPkt *)&rb); }
+            continue;
+        }
+        if (r == (int)sizeof(NpcHitPkt) && rb.magic == NSHT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_shot_apply((const NpcHitPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NHIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_hit_apply((const NpcHitPkt *)&rb); continue; }
         if (r == (int)sizeof(HitPkt) && rb.magic == HIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) hit_apply((const HitPkt *)&rb); continue; }
         if (r >= 12 && rb.magic == NPC_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_rx(&rb, r); continue; }
