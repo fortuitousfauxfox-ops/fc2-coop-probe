@@ -431,6 +431,8 @@ static void npc_stat(void);
 static void npc_join_tick(DWORD now);
 static int g_hitsync = 1, g_st_verbose, g_npcev_left;
 static int g_npcanim = 1;           /* npcanim: puppets take the host NPCs' animation graph inputs */
+static int g_npcrespawn;            /* npcrespawn 1: replace puppets that run an action of their own (off: replacements are
+                                     * spawned from the generic archetype and look different, and actions still differed) */
 static void npc_anim_apply(BYTE *mb);
 static unsigned long long g_dd_id;   /* dumpd: NPC whose desired-state block is logged */
 static DWORD g_dd_until;  /* hit sync on by default; stimlog turns on event logging */
@@ -958,6 +960,9 @@ static void native_cmd(const char *ln)
         { const char *sp = strchr(ln + 6, ' '); if (sp) secs = atoi(sp + 1); }
         g_dd_until = GetTickCount() + secs * 1000u;
         logf_("dumpd: NPC %llu for %d s", g_dd_id, secs);
+    } else if (strncmp(ln, "npcrespawn ", 11) == 0) {
+        g_npcrespawn = atoi(ln + 11) != 0;
+        logf_("npcrespawn: %s", g_npcrespawn ? "on" : "off");
     } else if (strncmp(ln, "npcanim ", 8) == 0) {
         g_npcanim = atoi(ln + 8) != 0;
         logf_("npcanim: NPC animation graph inputs %s", g_npcanim ? "follow the host" : "are the puppets' own");
@@ -2288,12 +2293,15 @@ static float npc_hp(BYTE *obj, float *hpmax)
  * (setters FUN_1051f460/480/4a0, FUN_10520a20). v58 is the current action (-1 none, 6, 10 seen on the host), v42 is
  * set while it runs, v43/v44/v46 move with it; a puppet sat at v58 = 9 instead. The host sends v00..v6F of each NPC
  * (NANM, 5 times a second); the joiner writes them into its puppet's graph right after the puppet's third-person
- * beautifier update, except the 23 variables that update sets itself from the synced movement (FUN_100ac190). */
+ * beautifier update, except the 23 variables that update sets itself from the synced movement (g_anim_own). */
 #define NANM_MAGIC 0x4D4E414Eu
 #define NANM_VARS 0x70
 #pragma pack(push, 1)
 typedef struct { unsigned magic; unsigned long long id; unsigned v[NANM_VARS]; } NpcAnimPkt;
 #pragma pack(pop)
+/* the 23 variables FUN_100ac190 sets from the synced movement stay the puppet's own. Tried: keeping only the 8 that
+ * change every frame (v00 v01 v02 v0b v1d v34 v38 v5f) and taking the rest from the host - idle actions still did not
+ * play (a host NPC drank, its puppet stood): the variables mirror the action, they do not start it */
 static const unsigned char g_anim_own[] = { 0x00, 0x01, 0x02, 0x07, 0x08, 0x0b, 0x14, 0x1d, 0x1f, 0x20, 0x25, 0x26, 0x33, 0x34, 0x38, 0x40,
                                             0x5c, 0x5d, 0x5e, 0x5f, 0x62, 0x65, 0x66 };
 static unsigned *npc_animvars(BYTE *obj)
@@ -2587,6 +2595,8 @@ static void npc_weap_rx(const NpcWeapPkt *w)
         if (g_np[j].id == w->id) {
             if (strncmp(g_np[j].hw, w->name, 64) || !g_np[j].hset) g_np[j].wtries = 0;
             memcpy(g_np[j].hw, w->name, 64); g_np[j].hw[63] = 0; g_np[j].hcat = w->cat; g_np[j].hset = 1;
+            /* a host NPC at a stationary gun reports it as its weapon; given to a puppet it hung at its side: holster */
+            if (!strncmp(g_np[j].hw, "weapons.MountedWeapons.", 23)) { g_np[j].hw[0] = 0; g_np[j].hcat = 0; }
             return;
         }
 }
@@ -2718,7 +2728,7 @@ static void npc_join_tick(DWORD now)
                   comp, m, bc && *(void **)(bc + 0x28) ? **(unsigned **)(bc + 0x28) : 0, e->hp, e->hpmax);
             continue;
         }
-        if (g_np[j].ownact && !g_np[j].respawn && !g_np[j].lid && g_ns != INVALID_SOCKET) {
+        if (g_npcrespawn && g_np[j].ownact && !g_np[j].respawn && !g_np[j].lid && g_ns != INVALID_SOCKET) {
             /* its graph runs an action of its own (started before the session connected) that the host's inputs do not
              * stop: replace the NPC by a fresh one of the same archetype (NREQ/NARC as for the host's spawns) */
             NpcArcPkt q;
