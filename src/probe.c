@@ -421,7 +421,11 @@ static int g_npc_role;            /* npcsync: 1 host, 2 join */
 static float g_npc_rad = 80.0f;
 static void stim_install(unsigned long long id, int slot);
 static void npc_stat(void);
-static int g_hitsync = 1, g_st_verbose;  /* hit sync on by default; stimlog turns on event logging */
+static int g_hitsync = 1, g_st_verbose, g_npcev_left;
+static int g_npcanim = 1;           /* npcanim: puppets take the host NPCs' animation graph inputs */
+static void npc_anim_apply(BYTE *mb);
+static unsigned long long g_dd_id;   /* dumpd: NPC whose desired-state block is logged */
+static DWORD g_dd_until;  /* hit sync on by default; stimlog turns on event logging */
 static void av_remove(void);
 static void *np_slot(BYTE *obj, int slot, unsigned k0, unsigned k1, unsigned k2);
 static int g_ws_role;
@@ -618,7 +622,17 @@ static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, con
  * spawn the weapon entity, CWeapon comp (key FE01F8), category = *(vf+0x8C()), inventory = FUN_1007e140(pawn comp),
  * the old weapon of that category FUN_10129de0 -> FUN_1012e3e0(old, 0) and its entity removed, FUN_101289f0(weapon),
  * then select it like SelectWeapon (FUN_1012ce80 -> FUN_1012b9b0: inventory weapon mode +0x78 = 1, current weapon) */
+static int pawn_give_weapon(BYTE *obj, const char *arch, const char *who);
 static int av_give_weapon(const char *arch)
+{
+    void *holder = NULL;
+    BYTE *obj = g_av_id ? entity_obj(g_av_id, &holder) : NULL;
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    if (!obj) { logf_("avweapon: no avatar"); return 0; }
+    return pawn_give_weapon(obj, arch, "avweapon");
+}
+/* the same for any pawn entity (the avatar, NPC puppets); who prefixes the log lines */
+static int pawn_give_weapon(BYTE *obj, const char *arch, const char *who)
 {
     typedef void *(__fastcall *inv_t)(void *pawn);
     typedef unsigned (__attribute__((thiscall)) *slot_t)(void *weapon);
@@ -628,25 +642,23 @@ static int av_give_weapon(const char *arch)
     typedef void *(__attribute__((thiscall)) *cur_t)(void *inv);
     typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
     char code[256], out[64];
-    void *holder = NULL, *wholder = NULL, *pawn, *wc, *inv, *old;
-    BYTE *obj = g_av_id ? entity_obj(g_av_id, &holder) : NULL, *wobj;
+    void *wholder = NULL, *pawn, *wc, *inv, *old;
+    BYTE *wobj;
     unsigned long long wid;
     unsigned slot;
-    if (holder) (*(int *)((BYTE *)holder + 8))--;
-    if (!obj) { logf_("avweapon: no avatar"); return 0; }
     snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('%s', %.3f, %.3f, %.3f, 0, 0, 0))", arch,
              *(float *)(obj + 0x60), *(float *)(obj + 0x64), *(float *)(obj + 0x68) + 1.0f);
     lua_eval(code, out, sizeof out);
     wid = strtoull(out, NULL, 10);
     wobj = (wid && wid != 0xFFFFFFFFFFFFFFFFull) ? entity_obj(wid, &wholder) : NULL;
     if (wholder) (*(int *)((BYTE *)wholder + 8))--;
-    if (!wobj) { logf_("avweapon: spawn of %s failed (%s)", arch, out); return 0; }
+    if (!wobj) { logf_("%s: spawn of %s failed (%s)", who, arch, out); return 0; }
     pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
     wc = ((gcomp_t)(g_base + 0x4E2CC0))(wobj, (void *)(g_base + 0xFE01F8));
-    if (!pawn || !wc) { logf_("avweapon: pawn %p weapon comp %p (weapon entity %llu)", pawn, wc, wid); return 0; }
+    if (!pawn || !wc) { logf_("%s: pawn %p weapon comp %p (weapon entity %llu)", who, pawn, wc, wid); return 0; }
     slot = ((slot_t)(*(void ***)wc)[0x8C / 4])(wc);
     inv = ((inv_t)(g_base + 0x7E140))(pawn);
-    if (!inv) { logf_("avweapon: avatar has no inventory"); return 0; }
+    if (!inv) { logf_("%s: pawn has no inventory", who); return 0; }
     old = ((inslot_t)(g_base + 0x129DE0))(inv, slot);
     if (old) { void *oh = *(void **)((BYTE *)old + 8); ((drop_t)(g_base + 0x12E3E0))(inv, old, 0); if (oh) { snprintf(code, sizeof code, "RemoveEntity('%llu') __out = 'ok'", *(unsigned long long *)oh); lua_eval(code, out, sizeof out); } }
     ((add_t)(g_base + 0x1289F0))(inv, wc);
@@ -656,7 +668,7 @@ static int av_give_weapon(const char *arch)
         typedef void (__attribute__((thiscall)) *sel_t)(void *inv, unsigned *cat);
         unsigned cat = IsBadReadPtr((void *)slot, 4) ? 0 : *(unsigned *)slot;
         if (cat) ((sel_t)(g_base + 0x12CE80))(inv, &cat);
-        logf_("avweapon: %s entity %llu weapon %p category %08x -> inventory %p (old %p), current weapon now %p", arch, wid, wc,
+        logf_("%s: %s entity %llu weapon %p category %08x -> inventory %p (old %p), current weapon now %p", who, arch, wid, wc,
               cat, inv, old, ((cur_t)(g_base + 0x127DA0))(inv));
     }
     return 1;
@@ -932,6 +944,18 @@ static void native_cmd(const char *ln)
         g_lanfwd = inet_addr(ln + 7);
         if (g_lanfwd == INADDR_NONE) g_lanfwd = 0;
         logf_("lanfwd: broadcasts also go to %s", g_lanfwd ? ln + 7 : "(off)");
+    } else if (strncmp(ln, "dumpd ", 6) == 0) {
+        int secs = 60;
+        g_dd_id = strtoull(ln + 6, NULL, 10);
+        { const char *sp = strchr(ln + 6, ' '); if (sp) secs = atoi(sp + 1); }
+        g_dd_until = GetTickCount() + secs * 1000u;
+        logf_("dumpd: NPC %llu for %d s", g_dd_id, secs);
+    } else if (strncmp(ln, "npcanim ", 8) == 0) {
+        g_npcanim = atoi(ln + 8) != 0;
+        logf_("npcanim: NPC animation graph inputs %s", g_npcanim ? "follow the host" : "are the puppets' own");
+    } else if (strncmp(ln, "npcev ", 6) == 0) {
+        g_npcev_left = atoi(ln + 6);
+        logf_("npcev: logging the next %d events on synced NPCs", g_npcev_left);
     } else if (strncmp(ln, "hitsync ", 8) == 0) {
         g_hitsync = atoi(ln + 8) != 0;
         logf_("hitsync: %s", g_hitsync ? "on (the shooter's window decides hits between players)" : "off (the avatar's replayed shots hurt us)");
@@ -1675,6 +1699,7 @@ static void __attribute__((thiscall)) mf_call(void *orig, void *self, float dt)
     if (mp && g_mf_on) { old = mp[4]; mp[4] = 1; }
     ((void (__attribute__((thiscall)) *)(void *, float))orig)(self, dt);
     if (mp && g_mf_on) mp[4] = old;
+    npc_anim_apply(self);
 }
 static void __attribute__((thiscall)) mf_hook7c(void *self, float dt) { mf_call(g_mf_orig7c, self, dt); }
 static void __attribute__((thiscall)) mf_hook80(void *self, float dt) { mf_call(g_mf_orig80, self, dt); }
@@ -1977,6 +2002,11 @@ static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
     unsigned evt = ev && !IsBadReadPtr(ev, 0x24) ? *(unsigned *)ev : 0;
     const char *nm = evt ? st_name(ev) : "";
     if (!strcmp(nm, "IsUsable")) evt = 0;
+    if (s == 2 && evt && g_npcev_left > 0) {
+        /* npcev: what the NPCs get, to find what starts their idle actions (flask, smoke) on the host */
+        g_npcev_left--;
+        logf_("npcev %llu: %s (vt rva %x)", npc_id_of(self), nm, evt - (unsigned)g_base);
+    }
     if (s == 2 && (!strcmp(nm, "PullTrigger") || !strcmp(nm, "start_shoot") || !strcmp(nm, "WeaponFireBullet")) && !npc_shot_ok(self, nm[0] == 'P')) return 0;
     if (!strcmp(nm, "Stims") && !IsBadReadPtr(ev, 0x94)) {
         unsigned long long src = st_hid(*(BYTE **)(ev + 0x3C));
@@ -2134,6 +2164,48 @@ static void hit_apply(const HitPkt *hp)
 }
 
 /* keep the event hooks on the avatar and on our player (both get new objects after a respawn) */
+/* dumpd: an NPC's animation graph variables, to see which of them carry the idle actions (flask, food, holstered
+ * weapon). The setters (FUN_1051f460 bool, FUN_1051f480 / FUN_1051f4a0 float / int, FUN_10520a20 wrapped angle) all
+ * write *(anim component (key FDF190) + 0x1C) + 0x10 + index * 4; FUN_100ac190 sets indices up to 0x66. The block is
+ * logged once (with its 16-byte header), then the variables that changed, twice a second. The pawn's desired-state
+ * block (pawn +0x140) of an AI NPC did not change at all in 90 s, and its base beautifier (vtable E0F010) has empty
+ * update methods: idle actions do not come through the beautifiers. */
+#define DD_N 160
+static void dumpd_tick(DWORD now)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    static DWORD last;
+    static unsigned prev[DD_N + 4];
+    static unsigned long long previd;
+    void *hd = NULL;
+    BYTE *obj, *ac, *vb;
+    unsigned cur[DD_N + 4];
+    int k, n = 0;
+    char line[900];
+    if (!g_dd_id || (int)(now - g_dd_until) > 0 || now - last < 500) return;
+    last = now;
+    obj = entity_obj(g_dd_id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!obj || !(ac = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDF190))) || IsBadReadPtr(ac + 0x1C, 4)) return;
+    vb = *(BYTE **)(ac + 0x1C);
+    if (!vb || !safe_read(vb, cur, sizeof cur)) return;
+    if (previd != g_dd_id) {
+        logf_("dumpd %llu: anim component %p, variables at %p, header %08x %08x %08x %08x", g_dd_id, ac, vb, cur[0], cur[1], cur[2], cur[3]);
+        for (k = 0; k < DD_N; k += 10) {
+            int o = snprintf(line, sizeof line, "dumpd v%02x:", k), j;
+            for (j = 0; j < 10 && k + j < DD_N; j++) o += snprintf(line + o, sizeof line - o, " %08x", cur[4 + k + j]);
+            logf_("%s", line);
+        }
+        previd = g_dd_id;
+    } else {
+        int o = snprintf(line, sizeof line, "dumpd %lu:", now);
+        for (k = 0; k < DD_N && o < (int)sizeof line - 24; k++)
+            if (cur[4 + k] != prev[4 + k]) { o += snprintf(line + o, sizeof line - o, " v%02x=%08x", k, cur[4 + k]); n++; }
+        if (n) logf_("%s", line);
+    }
+    memcpy(prev, cur, sizeof prev);
+}
+
 static void hit_tick(DWORD now)
 {
     static DWORD last;
@@ -2160,11 +2232,11 @@ static void hit_tick(DWORD now)
 typedef struct { unsigned long long id; float pos[3]; int vel[3], aim[4]; unsigned char s104, s11c, s110, pad; float hp, hpmax; unsigned pulls; } NpcEnt;
 typedef struct { unsigned magic, seq, count; NpcEnt e[NPC_MAX]; } NpcPkt;
 #pragma pack(pop)
-static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; } g_nh[NPC_MAX];
+static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; void *wcur; int wmode; char wname[64]; unsigned wcat; DWORD wsent; } g_nh[NPC_MAX];
 static int g_nh_n;
 static BYTE g_npc_this[0x40];
 /* lid: the local entity id when the NPC had to be spawned here (the host's id is unknown to this world) */
-static struct { unsigned long long id, lid; BYTE *agent, *comp, *mem, *obj; int state, nospawn, gone; NpcEnt e; DWORD last, req; unsigned shots, fires, supp; } g_np[NPC_MAX];
+static struct { unsigned long long id, lid; BYTE *agent, *comp, *mem, *obj; int state, nospawn, gone; NpcEnt e; DWORD last, req; unsigned shots, fires, supp, av[0x70]; int avok; BYTE *mb; void *wcur; int wmode; char wname[64], hw[64]; unsigned wcat, hcat; int hset, wtries; DWORD wfix; } g_np[NPC_MAX];
 static int g_np_n;
 
 /* scan for CPawnAgents (vtable RVA EC5078, agent+4 = pawn holder), calling back with id, entity, agent; spread over many
@@ -2213,7 +2285,7 @@ static int npc_has_netcomp(BYTE *obj)
     for (k = 0; cs && k < n && k < 64; k++) if (cs[k] && !IsBadReadPtr(cs[k], 4) && *(DWORD *)cs[k] == (DWORD)(g_base + 0xE1AE00)) return 1;
     return 0;
 }
-static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; } g_nb[NPC_MAX];  /* list being built */
+static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; void *wcur; int wmode; char wname[64]; unsigned wcat; DWORD wsent; } g_nb[NPC_MAX];  /* list being built */
 static int g_nb_n;
 static unsigned long long g_nx[64];  /* ids never synced (buddies) */
 static int g_nx_n;
@@ -2245,6 +2317,58 @@ static float npc_hp(BYTE *obj, float *hpmax)
     if (cc && !IsBadReadPtr(cc + 0x44, 4) && (hc = *(BYTE **)(cc + 0x44)) && !IsBadReadPtr(hc, 0x18)) { *hpmax = *(float *)(hc + 0x14); return *(float *)(hc + 0x10); }
     *hpmax = 0; return -1;
 }
+/* animation graph inputs. Idle actions (flask, food, smoke, holstered weapon) are chosen by the AI and reach the
+ * animation graph as variables, not through the beautifiers: *(anim component (key FDF190) + 0x1C) + 0x10 + index * 4
+ * (setters FUN_1051f460/480/4a0, FUN_10520a20). v58 is the current action (-1 none, 6, 10 seen on the host), v42 is
+ * set while it runs, v43/v44/v46 move with it; a puppet sat at v58 = 9 instead. The host sends v00..v6F of each NPC
+ * (NANM, 5 times a second); the joiner writes them into its puppet's graph right after the puppet's third-person
+ * beautifier update, except the 23 variables that update sets itself from the synced movement (FUN_100ac190). */
+#define NANM_MAGIC 0x4D4E414Eu
+#define NANM_VARS 0x70
+#pragma pack(push, 1)
+typedef struct { unsigned magic; unsigned long long id; unsigned v[NANM_VARS]; } NpcAnimPkt;
+#pragma pack(pop)
+static const unsigned char g_anim_own[] = { 0x00, 0x01, 0x02, 0x07, 0x08, 0x0b, 0x14, 0x1d, 0x1f, 0x20, 0x25, 0x26, 0x33, 0x34, 0x38, 0x40,
+                                            0x5c, 0x5d, 0x5e, 0x5f, 0x62, 0x65, 0x66 };
+static unsigned *npc_animvars(BYTE *obj)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    BYTE *ac = obj ? ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDF190)) : NULL, *vb;
+    if (!ac || IsBadReadPtr(ac + 0x1C, 4) || !(vb = *(BYTE **)(ac + 0x1C)) || IsBadWritePtr(vb + 0x10, NANM_VARS * 4)) return NULL;
+    return (unsigned *)(vb + 0x10);
+}
+/* npcweap: log what an NPC holds whenever it changes (inventory FUN_1007e140(pawn), mode FUN_10125f40, current
+ * FUN_10127da0, name by GetEntityName): do idle actions (flask, food) switch to inventory items? */
+#define NWPN_MAGIC 0x4E50574Eu
+#pragma pack(push, 1)
+typedef struct { unsigned magic; unsigned long long id; unsigned cat; char name[64]; } NpcWeapPkt;
+#pragma pack(pop)
+static int npc_weap_watch(const char *who, unsigned long long id, BYTE *obj, void **wcur, int *wmode, char *wname, unsigned *wcat)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    typedef void *(__fastcall *inv_t)(void *pawn);
+    typedef int (__attribute__((thiscall)) *iget_t)(void *inv);
+    typedef void *(__attribute__((thiscall)) *cur_t)(void *inv);
+    void *pawn = obj ? ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)) : NULL, *inv, *cur = NULL;
+    int mode = -1;
+    char code[96], name[96] = "";
+    if (!pawn || !(inv = ((inv_t)(g_base + 0x7E140))(pawn))) return 0;
+    mode = ((iget_t)(g_base + 0x125F40))(inv);
+    cur = mode == 1 ? ((cur_t)(g_base + 0x127DA0))(inv) : NULL;
+    if (cur == *wcur && mode == *wmode) return 0;
+    *wcur = cur; *wmode = mode; *wcat = 0;
+    if (cur) {
+        typedef unsigned (__attribute__((thiscall)) *slot_t)(void *weapon);
+        void *wh = *(void **)((BYTE *)cur + 8);
+        unsigned slot = ((slot_t)(*(void ***)cur)[0x8C / 4])(cur);
+        if (slot && !IsBadReadPtr((void *)slot, 4)) *wcat = *(unsigned *)slot;
+        if (wh && !IsBadReadPtr(wh, 8)) { snprintf(code, sizeof code, "__out = tostring(GetEntityName('%llu'))", *(unsigned long long *)wh); lua_eval(code, name, sizeof name); }
+        if (!strcmp(name, "nil")) name[0] = 0;
+    }
+    memcpy(wname, name, 64); wname[63] = 0;
+    logf_("npcweap %s %llu: mode %d, current %p '%s' category %08x", who, id, mode, cur, wname, *wcat);
+    return 1;
+}
 static void npc_host_tick(DWORD now)
 {
     static DWORD last_scan, last_send;
@@ -2272,7 +2396,7 @@ static void npc_host_tick(DWORD now)
         int j, changed = g_nb_n != g_nh_n;
         for (i = 0; i < g_nb_n; i++) {
             for (j = 0; j < g_nh_n && g_nh[j].id != g_nb[i].id; j++) ;
-            if (j < g_nh_n) { g_nb[i].mem = g_nh[j].mem; g_nb[i].shots = g_nh[j].shots; g_nb[i].fires = g_nh[j].fires; g_nb[i].lastfire = g_nh[j].lastfire; }
+            if (j < g_nh_n) { g_nb[i].mem = g_nh[j].mem; g_nb[i].shots = g_nh[j].shots; g_nb[i].fires = g_nh[j].fires; g_nb[i].lastfire = g_nh[j].lastfire; g_nb[i].wcur = g_nh[j].wcur; g_nb[i].wmode = g_nh[j].wmode; memcpy(g_nb[i].wname, g_nh[j].wname, 64); g_nb[i].wcat = g_nh[j].wcat; }
             else changed = 1;
         }
         memcpy(g_nh, g_nb, sizeof g_nh); g_nh_n = g_nb_n;
@@ -2294,6 +2418,14 @@ static void npc_host_tick(DWORD now)
         if (!g_nh[i].mem) g_nh[i].mem = ((np_factory_t)(g_base + 0x40110))();
         g_nh[i].obj = obj;
         if (g_hitsync) st_hook_npc(obj);
+        /* the NPC's weapon (or none, holstered) goes to the joiner on every change and every 4 s */
+        if (npc_weap_watch("host", g_nh[i].id, obj, &g_nh[i].wcur, &g_nh[i].wmode, g_nh[i].wname, &g_nh[i].wcat) || now - g_nh[i].wsent > 4000) {
+            NpcWeapPkt w;
+            memset(&w, 0, sizeof w);
+            w.magic = NWPN_MAGIC; w.id = g_nh[i].id; w.cat = g_nh[i].wcat; memcpy(w.name, g_nh[i].wname, sizeof w.name);
+            sendto(g_ns, (char *)&w, sizeof w, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+            g_nh[i].wsent = now;
+        }
         if (!(m = g_nh[i].mem)) continue;
         *(void **)(g_npc_this + 0x10) = pawn;
         ((np_encode_t)(g_base + 0xA6EC0))(g_npc_this, m);
@@ -2308,6 +2440,14 @@ static void npc_host_tick(DWORD now)
         e->pulls = g_nh[i].shots;
         n++;
     }
+    if (g_npcanim && seq % 2 == 0)
+        for (i = 0; i < g_nh_n; i++) {
+            NpcAnimPkt a;
+            unsigned *v = g_nh[i].obj ? npc_animvars(g_nh[i].obj) : NULL;
+            if (!v || !safe_read(v, a.v, sizeof a.v)) continue;
+            a.magic = NANM_MAGIC; a.id = g_nh[i].id;
+            sendto(g_ns, (char *)&a, sizeof a, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+        }
     pk.magic = NPC_MAGIC; pk.seq = ++seq; pk.count = n;
     if (n) sendto(g_ns, (char *)&pk, 12 + n * sizeof(NpcEnt), 0, (struct sockaddr *)&g_peer, sizeof g_peer);
 }
@@ -2404,6 +2544,59 @@ static void npc_shot_apply(const NpcHitPkt *nk)
     st_deliver(&nk->h, me, g_st_orig[1], src);
     if (++g_nsht_rx <= 50) logf_("npc shot %u: host NPC %llu hit us (type %d, amount %d, part %08x) -> applied", nk->h.seq, nk->npc, nk->h.type, nk->h.amount, nk->h.part);
 }
+static void npc_anim_rx(const NpcAnimPkt *a)
+{
+    int j;
+    if (g_npc_role != 2) return;
+    for (j = 0; j < g_np_n; j++) if (g_np[j].id == a->id) { memcpy(g_np[j].av, a->v, sizeof g_np[j].av); g_np[j].avok = 1; return; }
+}
+/* called after a remote-driven main beautifier's update (mf_call) */
+static void npc_anim_apply(BYTE *mb)
+{
+    static unsigned char own[NANM_VARS];
+    static int init;
+    unsigned *v;
+    int j, k;
+    if (g_npc_role != 2 || !g_npcanim) return;
+    if (!init) { for (k = 0; k < (int)sizeof g_anim_own; k++) own[g_anim_own[k]] = 1; init = 1; }
+    for (j = 0; j < g_np_n; j++)
+        if (g_np[j].mb == mb) {
+            if (g_np[j].avok && (v = npc_animvars(g_np[j].obj)))
+                for (k = 0; k < NANM_VARS; k++) if (!own[k]) v[k] = g_np[j].av[k];
+            return;
+        }
+}
+/* NWPN on the joiner: what the host NPC holds; the puppet is made to hold the same (see npc_weap_fix) */
+static void npc_weap_rx(const NpcWeapPkt *w)
+{
+    int j;
+    if (g_npc_role != 2) return;
+    for (j = 0; j < g_np_n; j++)
+        if (g_np[j].id == w->id) {
+            if (strncmp(g_np[j].hw, w->name, 64) || !g_np[j].hset) g_np[j].wtries = 0;
+            memcpy(g_np[j].hw, w->name, 64); g_np[j].hw[63] = 0; g_np[j].hcat = w->cat; g_np[j].hset = 1;
+            return;
+        }
+}
+/* a puppet that holds something else than its host NPC (its paused AI still switches weapons; idle actions holster
+ * them): holster (FUN_1012b340, what HolsterWeapon does), select by category (FUN_1012ce80), and when the puppet does
+ * not have that weapon after a select, give it one (pawn_give_weapon); at most every 1.5 s, 4 tries per change */
+static void npc_weap_fix(int j, BYTE *obj, DWORD now)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    typedef void *(__fastcall *inv_t)(void *pawn);
+    typedef void (__attribute__((thiscall)) *inv0_t)(void *inv);
+    typedef void (__attribute__((thiscall)) *sel_t)(void *inv, unsigned *cat);
+    void *pawn, *inv;
+    if (!g_np[j].hset || !strcmp(g_np[j].wname, g_np[j].hw) || now - g_np[j].wfix < 1500 || g_np[j].wtries >= 4) return;
+    g_np[j].wfix = now; g_np[j].wtries++;
+    if (!(pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C))) || !(inv = ((inv_t)(g_base + 0x7E140))(pawn))) return;
+    if (!g_np[j].hw[0]) ((inv0_t)(g_base + 0x12B340))(inv);
+    else if (g_np[j].wtries <= 2 && g_np[j].hcat) { unsigned cat = g_np[j].hcat; ((sel_t)(g_base + 0x12CE80))(inv, &cat); }
+    else pawn_give_weapon(obj, g_np[j].hw, "npcweap give");
+    logf_("npcweap fix %llu: holds '%s', host holds '%s' -> %s (try %d)", g_np[j].id, g_np[j].wname, g_np[j].hw,
+          !g_np[j].hw[0] ? "holster" : g_np[j].wtries <= 2 ? "select" : "give", g_np[j].wtries);
+}
 static void npc_join_find_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx)
 {
     int j;
@@ -2496,7 +2689,7 @@ static void npc_join_tick(DWORD now)
             if (g_hitsync) st_hook_npc(obj);
             np_slot(obj, 0x2C, 0x608487bc, 0xFFFFFFFFu, 0xFFFFFFFFu);
             bc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4));
-            if (bc) mf_install(bc);
+            if (bc) { mf_install(bc); g_np[j].mb = *(BYTE **)(bc + 0x28); }
             logf_("npcsync join: NPC %llu%s is a puppet now (FE4090 %s, agent %p paused, comp %p, memento %p, main vt %08x, hp %.0f/%.0f)", g_np[j].id, g_np[j].lid ? " (spawned here)" : "",
                   ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFE4090)) ? "yes" : "NO", g_np[j].agent,
                   comp, m, bc && *(void **)(bc + 0x28) ? **(unsigned **)(bc + 0x28) : 0, e->hp, e->hpmax);
@@ -2504,6 +2697,8 @@ static void npc_join_tick(DWORD now)
         }
         m = g_np[j].mem;
         if (!m) continue;
+        npc_weap_watch("puppet", g_np[j].id, obj, &g_np[j].wcur, &g_np[j].wmode, g_np[j].wname, &g_np[j].wcat);
+        npc_weap_fix(j, obj, now);
         np_pos(m + 4, e->pos);
         for (k = 0; k < 3; k++) { *(int *)(m + 0x78 + 0x14 * k) = e->vel[k]; m[0x74 + 0x14 * k] = 1; }
         { static const int aimf[4] = { 0xAC, 0xC0, 0xD4, 0xE8 }; for (k = 0; k < 4; k++) { *(int *)(m + aimf[k] + 8) = e->aim[k]; m[aimf[k] + 4] = 1; } }
@@ -2660,6 +2855,8 @@ static void net_tick(void)
             if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) { if (rb.magic == NREQ_MAGIC) npc_req_rx((const NpcArcPkt *)&rb); else npc_arc_rx((const NpcArcPkt *)&rb); }
             continue;
         }
+        if (r == (int)sizeof(NpcWeapPkt) && rb.magic == NWPN_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_weap_rx((const NpcWeapPkt *)&rb); continue; }
+        if (r == (int)sizeof(NpcAnimPkt) && rb.magic == NANM_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_anim_rx((const NpcAnimPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NSHT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_shot_apply((const NpcHitPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NHIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_hit_apply((const NpcHitPkt *)&rb); continue; }
         if (r == (int)sizeof(HitPkt) && rb.magic == HIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) hit_apply((const HitPkt *)&rb); continue; }
@@ -2703,6 +2900,7 @@ static void net_tick(void)
     world_tick(now);
     npc_host_tick(now);
     hit_tick(now);
+    dumpd_tick(now);
     npc_join_tick(now);
     /* send at 20 Hz */
     if ((g_bodymat || g_net_id) && now - g_net_lastsend >= 50) {
