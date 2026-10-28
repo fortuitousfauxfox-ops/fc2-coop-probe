@@ -193,10 +193,12 @@ static HANDLE WINAPI h_CreateFileA(LPCSTR n, DWORD a, DWORD sh, LPSECURITY_ATTRI
     SetLastError(le);
     return h;
 }
+static DWORD g_sav_tick;   /* when the game first opened a save (coop_auto.txt runs a few seconds later) */
 static HANDLE WINAPI h_CreateFileW(LPCWSTR n, DWORD a, DWORD sh, LPSECURITY_ATTRIBUTES sa, DWORD cd, DWORD fl, HANDLE t)
 {
     HANDLE h = o_CreateFileW(n, a, sh, sa, cd, fl, t); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
     if (n && (wcsstr(n, L"av") || wcsstr(n, L"Saved") || wcsstr(n, L"Documents") || wcsstr(n, L"Profile"))) logf_("CreateFileW %ls acc=%lx disp=%lu -> %s", n, a, cd, h == INVALID_HANDLE_VALUE ? "FAIL" : "ok");
+    if (n && !g_sav_tick && wcsstr(n, L".sav") && h != INVALID_HANDLE_VALUE) g_sav_tick = GetTickCount() | 1;
     SetLastError(le);
     return h;
 }
@@ -2980,12 +2982,58 @@ static void net_tick(void)
     }
 }
 
+/* coop_auto.txt next to the probe: native commands (separated by ';' or lines) run once, 3 s after the game opened a
+ * save and as soon as GetLocalPlayerId gives an id; "$ME" is replaced by that id. A session then starts as soon as
+ * each copy is in its world (worldsync, avatar, netstart), with nobody typing commands. */
+static void auto_start(void)
+{
+    static int done;
+    char path[MAX_PATH], buf[1024], out[32], line[1100], *s, *e;
+    FILE *f;
+    size_t n;
+    unsigned long long me;
+    if (done || !g_sav_tick || GetTickCount() - g_sav_tick < 3000) return;
+    strcpy(path, g_natpath); strcpy(strrchr(path, '\\') + 1, "coop_auto.txt");
+    if (!(f = fopen(path, "rb"))) { done = 1; return; }
+    n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
+    lua_eval("__out = tostring(GetLocalPlayerId())", out, sizeof out);
+    me = strtoull(out, NULL, 10);
+    if (!me || me == ~0ULL) return;   /* not in the world yet: try again next poll */
+    {
+        /* the id exists early in the load; wait until the player's entity and pawn exist, then 12 s more */
+        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+        static DWORD ready;
+        void *hd = NULL;
+        BYTE *obj = entity_obj(me, &hd);
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        /* the entity and pawn exist while the load screen is still up, at position (0, 0, 0); netstart then crashed
+         * in the encoder: wait for a real position */
+        if (!obj || !((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)) ||
+            (*(float *)(obj + 0x60) == 0.0f && *(float *)(obj + 0x64) == 0.0f)) { ready = 0; return; }
+        if (!ready) { ready = GetTickCount() | 1; return; }
+        if (GetTickCount() - ready < 12000) return;   /* 3 s still crashed in the encoder (Dunia+0x493bb0) */
+    }
+    done = 1;
+    logf_("autostart: player %llu, running %s", me, path);
+    for (s = buf; *s; s = e) {
+        char *d = line, *q;
+        for (e = s; *e && *e != ';' && *e != '\n' && *e != '\r'; e++) ;
+        for (q = s; q < e && d < line + sizeof line - 24; q++) {
+            if (q + 3 <= e && !strncmp(q, "$ME", 3)) { d += snprintf(d, line + sizeof line - d, "%llu", me); q += 2; }
+            else *d++ = *q;
+        }
+        *d = 0;
+        while (*e == ';' || *e == '\n' || *e == '\r') e++;
+        if (line[0]) { logf_("autostart: %s", line); native_cmd(line); }
+    }
+}
 static void pump_main(void)
 {
     FILE *f;
     if (g_nstates == 0 || g_busy || GetCurrentThreadId() != g_states[0].thread) return;
     if (GetTickCount() - g_lastpoll < 250) return;
     g_lastpoll = GetTickCount();
+    g_busy = 1; auto_start(); g_busy = 0;
     f = fopen(g_natpath, "rb");
     if (f) { fclose(f); g_busy = 1; run_native(); g_busy = 0; return; }
     f = fopen(g_cmdpath, "rb");
