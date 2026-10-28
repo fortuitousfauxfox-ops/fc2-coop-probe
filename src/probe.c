@@ -2172,48 +2172,6 @@ static void hit_apply(const HitPkt *hp)
 }
 
 /* keep the event hooks on the avatar and on our player (both get new objects after a respawn) */
-/* dumpd: an NPC's animation graph variables, to see which of them carry the idle actions (flask, food, holstered
- * weapon). The setters (FUN_1051f460 bool, FUN_1051f480 / FUN_1051f4a0 float / int, FUN_10520a20 wrapped angle) all
- * write *(anim component (key FDF190) + 0x1C) + 0x10 + index * 4; FUN_100ac190 sets indices up to 0x66. The block is
- * logged once (with its 16-byte header), then the variables that changed, twice a second. The pawn's desired-state
- * block (pawn +0x140) of an AI NPC did not change at all in 90 s, and its base beautifier (vtable E0F010) has empty
- * update methods: idle actions do not come through the beautifiers. */
-#define DD_N 160
-static void dumpd_tick(DWORD now)
-{
-    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
-    static DWORD last;
-    static unsigned prev[DD_N + 4];
-    static unsigned long long previd;
-    void *hd = NULL;
-    BYTE *obj, *ac, *vb;
-    unsigned cur[DD_N + 4];
-    int k, n = 0;
-    char line[900];
-    if (!g_dd_id || (int)(now - g_dd_until) > 0 || now - last < 500) return;
-    last = now;
-    obj = entity_obj(g_dd_id, &hd);
-    if (hd) (*(int *)((BYTE *)hd + 8))--;
-    if (!obj || !(ac = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDF190))) || IsBadReadPtr(ac + 0x1C, 4)) return;
-    vb = *(BYTE **)(ac + 0x1C);
-    if (!vb || !safe_read(vb, cur, sizeof cur)) return;
-    if (previd != g_dd_id) {
-        logf_("dumpd %llu: anim component %p, variables at %p, header %08x %08x %08x %08x", g_dd_id, ac, vb, cur[0], cur[1], cur[2], cur[3]);
-        for (k = 0; k < DD_N; k += 10) {
-            int o = snprintf(line, sizeof line, "dumpd v%02x:", k), j;
-            for (j = 0; j < 10 && k + j < DD_N; j++) o += snprintf(line + o, sizeof line - o, " %08x", cur[4 + k + j]);
-            logf_("%s", line);
-        }
-        previd = g_dd_id;
-    } else {
-        int o = snprintf(line, sizeof line, "dumpd %lu:", now);
-        for (k = 0; k < DD_N && o < (int)sizeof line - 24; k++)
-            if (cur[4 + k] != prev[4 + k]) { o += snprintf(line + o, sizeof line - o, " v%02x=%08x", k, cur[4 + k]); n++; }
-        if (n) logf_("%s", line);
-    }
-    memcpy(prev, cur, sizeof prev);
-}
-
 static void hit_tick(DWORD now)
 {
     static DWORD last;
@@ -2441,6 +2399,10 @@ static void npc_host_tick(DWORD now)
         memcpy(e->pos, obj + 0x60, sizeof e->pos);
         for (k = 0; k < 3; k++) e->vel[k] = *(int *)(m + 0x78 + 0x14 * k);
         e->aim[0] = *(int *)(m + 0xB4); e->aim[1] = *(int *)(m + 0xC8); e->aim[2] = *(int *)(m + 0xDC); e->aim[3] = *(int *)(m + 0xF0);
+        /* the encoder leaves the first (look) pair at 0/0 for AI pawns while the second pair holds the body yaw (a doorman
+         * facing 1.67 rad stood at 0 on the joiner, the third-person beautifier turns the body to the look pair): the body
+         * yaw goes into both; head turns come with the animation graph inputs */
+        e->aim[0] = 0; e->aim[1] = e->aim[3];
         e->s104 = m[0x104]; e->s11c = m[0x11C]; e->s110 = m[0x110];
         if (e->s104 && !g_nh[i].lastfire) g_nh[i].fires++;
         g_nh[i].lastfire = e->s104;
@@ -2858,6 +2820,59 @@ static void av_tick(DWORD now)
         }
         if (holder) (*(int *)((BYTE *)holder + 8))--;
     }
+}
+
+/* dumpd: an NPC's animation graph variables, to see which of them carry the idle actions (flask, food, holstered
+ * weapon). The setters (FUN_1051f460 bool, FUN_1051f480 / FUN_1051f4a0 float / int, FUN_10520a20 wrapped angle) all
+ * write *(anim component (key FDF190) + 0x1C) + 0x10 + index * 4; FUN_100ac190 sets indices up to 0x66. The block is
+ * logged once (with its 16-byte header), then the variables that changed, twice a second. The pawn's desired-state
+ * block (pawn +0x140) of an AI NPC did not change at all in 90 s, and its base beautifier (vtable E0F010) has empty
+ * update methods: idle actions do not come through the beautifiers. */
+#define DD_N 160
+static void dumpd_tick(DWORD now)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    static DWORD last;
+    static unsigned prev[DD_N + 4];
+    static unsigned long long previd;
+    void *hd = NULL;
+    BYTE *obj, *ac, *vb;
+    unsigned cur[DD_N + 4];
+    int k, n = 0;
+    char line[900];
+    if (!g_dd_id || (int)(now - g_dd_until) > 0 || now - last < 500) return;
+    last = now;
+    obj = entity_obj(g_dd_id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (obj) {
+        /* facing: the entity's matrix rows before the position (+0x60) against the yaw/pitch pairs the host encodes */
+        float *mx = (float *)(obj + 0x30);
+        int i;
+        for (i = 0; i < g_nh_n && g_nh[i].id != g_dd_id; i++) ;
+        logf_("dumpd facing: rows (%.2f %.2f %.2f %.2f) (%.2f %.2f %.2f %.2f) (%.2f %.2f %.2f %.2f) pos (%.1f %.1f %.1f)%s", mx[0], mx[1], mx[2], mx[3],
+              mx[4], mx[5], mx[6], mx[7], mx[8], mx[9], mx[10], mx[11], mx[12], mx[13], mx[14], i < g_nh_n ? "" : " (not a host NPC)");
+        if (i < g_nh_n && g_nh[i].mem)
+            logf_("dumpd facing: encoded aim (%.3f %.3f | %.3f %.3f)", np_dq(g_nh[i].mem + 0xAC, 360), np_dq(g_nh[i].mem + 0xC0, 360),
+                  np_dq(g_nh[i].mem + 0xD4, 360), np_dq(g_nh[i].mem + 0xE8, 360));
+    }
+    if (!obj || !(ac = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDF190))) || IsBadReadPtr(ac + 0x1C, 4)) return;
+    vb = *(BYTE **)(ac + 0x1C);
+    if (!vb || !safe_read(vb, cur, sizeof cur)) return;
+    if (previd != g_dd_id) {
+        logf_("dumpd %llu: anim component %p, variables at %p, header %08x %08x %08x %08x", g_dd_id, ac, vb, cur[0], cur[1], cur[2], cur[3]);
+        for (k = 0; k < DD_N; k += 10) {
+            int o = snprintf(line, sizeof line, "dumpd v%02x:", k), j;
+            for (j = 0; j < 10 && k + j < DD_N; j++) o += snprintf(line + o, sizeof line - o, " %08x", cur[4 + k + j]);
+            logf_("%s", line);
+        }
+        previd = g_dd_id;
+    } else {
+        int o = snprintf(line, sizeof line, "dumpd %lu:", now);
+        for (k = 0; k < DD_N && o < (int)sizeof line - 24; k++)
+            if (cur[4 + k] != prev[4 + k]) { o += snprintf(line + o, sizeof line - o, " v%02x=%08x", k, cur[4 + k]); n++; }
+        if (n) logf_("%s", line);
+    }
+    memcpy(prev, cur, sizeof prev);
 }
 
 static void net_tick(void)
