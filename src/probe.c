@@ -1511,7 +1511,7 @@ static void tx_encode(BYTE *obj, NetPktX *p, DWORD now)
     }
     if (now - g_tx_lastlog >= 1000) {
         g_tx_lastlog = now;
-        logf_("tx: vel (%.2f %.2f %.2f) aim (%.1f %.1f | %.1f %.1f) stance %u mode %u flag %u",
+        logf_("tx: vel (%.2f %.2f %.2f) aim (%.3f %.3f | %.3f %.3f) stance %u mode %u flag %u",
               np_dq(m + 0x70, 15), np_dq(m + 0x84, 15), np_dq(m + 0x98, 15),
               np_dq(m + 0xAC, 360), np_dq(m + 0xC0, 360), np_dq(m + 0xD4, 360), np_dq(m + 0xE8, 360), m[0x104], m[0x11C], m[0x110]);
     }
@@ -1872,11 +1872,20 @@ static void av_remove(void)
 #pragma pack(push, 1)
 typedef struct { unsigned magic, seq; int type, amount; unsigned flags, part, w60; float pos[3]; unsigned subvt, tail[8]; } HitPkt;
 #pragma pack(pop)
-static unsigned g_hit_tx, g_hit_rx, g_hit_blocked;
-static void *g_st_vt[2][257], *g_st_orig[2];
+/* NPC hits (npcsync): slot 2 is one vtable copy shared by the synced NPCs. On the joiner a stim on a puppet whose
+ * source is our player goes to the host as NHIT (with the NPC id) and still lands locally (hit reaction); the host
+ * applies it to its NPC with the avatar as source and drops the avatar's replayed shots at NPCs. Health and death then
+ * come back with the NPC packets. */
+#define NHIT_MAGIC 0x3154484Eu
+#pragma pack(push, 1)
+typedef struct { HitPkt h; unsigned long long npc; } NpcHitPkt;
+#pragma pack(pop)
+static unsigned g_hit_tx, g_hit_rx, g_hit_blocked, g_nhit_tx, g_nhit_rx, g_nhit_blocked;
+static void *g_st_vt[3][257], *g_st_orig[3];
 static BYTE *g_st_obj[2];
 static unsigned long long g_st_id[2];
-static unsigned g_st_n[2], g_st_other[2];
+static unsigned g_st_n[3], g_st_other[3];
+static unsigned long long npc_id_of(BYTE *obj);
 static unsigned long long st_hid(BYTE *h) { return h && !IsBadReadPtr(h, 8) ? *(unsigned long long *)h : 0; }
 /* an event's name: MSVC std::string at +0xC (inline buffer up to 15 chars, size +0x1C, capacity +0x20) */
 static const char *st_name(BYTE *ev)
@@ -1886,9 +1895,17 @@ static const char *st_name(BYTE *ev)
     if (len > 64 || !s || IsBadReadPtr(s, len + 1) || s[len]) return "?";
     return s;
 }
+static void st_pack(HitPkt *hp, BYTE *ev, unsigned evt)
+{
+    hp->type = *(int *)(ev + 0x48); hp->amount = *(int *)(ev + 0x58);
+    hp->flags = *(unsigned *)(ev + 0x5C); hp->part = *(unsigned *)(ev + 0x44); hp->w60 = *(unsigned *)(ev + 0x60);
+    memcpy(hp->pos, ev + 0x64, sizeof hp->pos); hp->subvt = evt - (unsigned)g_base;
+    /* bullet stims (vtable RVA E119A4, 0xB4 bytes) carry 0x20 more bytes after the base */
+    if (hp->subvt == 0xE119A4 && !IsBadReadPtr(ev, 0xB4)) memcpy(hp->tail, ev + 0x94, sizeof hp->tail); else memset(hp->tail, 0, sizeof hp->tail);
+}
 static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
 {
-    int s = *(void ***)self == &g_st_vt[1][1] ? 1 : 0;
+    int s = *(void ***)self == &g_st_vt[1][1] ? 1 : *(void ***)self == &g_st_vt[2][1] ? 2 : 0;
     unsigned evt = ev && !IsBadReadPtr(ev, 0x24) ? *(unsigned *)ev : 0;
     const char *nm = evt ? st_name(ev) : "";
     if (!strcmp(nm, "IsUsable")) evt = 0;
@@ -1896,14 +1913,22 @@ static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
         unsigned long long src = st_hid(*(BYTE **)(ev + 0x3C));
         if (g_hitsync && s == 0 && src == g_net_id && *(int *)(ev + 0x58) && g_ns != INVALID_SOCKET) {
             HitPkt hp;
-            hp.magic = HIT_MAGIC; hp.seq = ++g_hit_tx; hp.type = *(int *)(ev + 0x48); hp.amount = *(int *)(ev + 0x58);
-            hp.flags = *(unsigned *)(ev + 0x5C); hp.part = *(unsigned *)(ev + 0x44); hp.w60 = *(unsigned *)(ev + 0x60);
-            memcpy(hp.pos, ev + 0x64, sizeof hp.pos); hp.subvt = evt - (unsigned)g_base;
-            /* bullet stims (vtable RVA E119A4, 0xB4 bytes) carry 0x20 more bytes after the base */
-            if (hp.subvt == 0xE119A4 && !IsBadReadPtr(ev, 0xB4)) memcpy(hp.tail, ev + 0x94, sizeof hp.tail); else memset(hp.tail, 0, sizeof hp.tail);
+            st_pack(&hp, ev, evt);
+            hp.magic = HIT_MAGIC; hp.seq = ++g_hit_tx;
             sendto(g_ns, (char *)&hp, sizeof hp, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
             if (g_hit_tx <= 50) logf_("hit %u: we hit the avatar (type %d, amount %d, flags %x, part %08x, sub rva %x, tail %08x %08x %08x %08x %08x %08x %08x %08x) -> sent",
                                       g_hit_tx, hp.type, hp.amount, hp.flags, hp.part, hp.subvt, hp.tail[0], hp.tail[1], hp.tail[2], hp.tail[3], hp.tail[4], hp.tail[5], hp.tail[6], hp.tail[7]);
+        }
+        if (g_hitsync && s == 2 && g_npc_role == 2 && src == g_net_id && *(int *)(ev + 0x58) && g_ns != INVALID_SOCKET) {
+            NpcHitPkt nk;
+            st_pack(&nk.h, ev, evt);
+            nk.h.magic = NHIT_MAGIC; nk.h.seq = ++g_nhit_tx; nk.npc = npc_id_of(self);
+            if (nk.npc) sendto(g_ns, (char *)&nk, sizeof nk, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+            if (g_nhit_tx <= 50) logf_("npc hit %u: we hit NPC %llu (type %d, amount %d, part %08x) -> sent to the host", g_nhit_tx, nk.npc, nk.h.type, nk.h.amount, nk.h.part);
+        }
+        if (g_hitsync && s == 2 && g_npc_role == 1 && src && src == g_av_id) {
+            if (++g_nhit_blocked <= 50) logf_("npc hit: dropped the avatar's replayed stim on NPC %llu (amount %d) - the joiner's window decides", npc_id_of(self), *(int *)(ev + 0x58));
+            return 0;
         }
         if (g_hitsync && s == 1 && src && src == g_av_id) {
             if (++g_hit_blocked <= 50) logf_("hit: dropped the avatar's own stim on us (type %d, amount %d) - the shooter's window decides", *(int *)(ev + 0x48), *(int *)(ev + 0x58));
@@ -1911,13 +1936,13 @@ static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
         }
         if (g_st_verbose && ++g_st_n[s] <= 200)
             logf_("stim %u (vt rva %x) -> %s %llu: type %d %d %d %d amount %d / %.2f flags %x src %llu inst %llu bytes %02x%02x%02x%02x%02x i78 %d "
-                  "v1 (%.2f %.2f %.2f) v2 (%.2f %.2f %.2f) w %08x %08x %08x %08x %08x", g_st_n[s], evt - (unsigned)g_base, s ? "me" : "avatar", g_st_id[s],
+                  "v1 (%.2f %.2f %.2f) v2 (%.2f %.2f %.2f) w %08x %08x %08x %08x %08x", g_st_n[s], evt - (unsigned)g_base, s == 2 ? "npc" : s ? "me" : "avatar", s == 2 ? npc_id_of(self) : g_st_id[s],
                   *(int *)(ev + 0x48), *(int *)(ev + 0x4C), *(int *)(ev + 0x50), *(int *)(ev + 0x54), *(int *)(ev + 0x58), *(float *)(ev + 0x58),
                   *(unsigned *)(ev + 0x5C), st_hid(*(BYTE **)(ev + 0x3C)), st_hid(*(BYTE **)(ev + 0x40)), ev[0x70], ev[0x71], ev[0x72], ev[0x73], ev[0x74],
                   *(int *)(ev + 0x78), *(float *)(ev + 0x7C), *(float *)(ev + 0x80), *(float *)(ev + 0x84), *(float *)(ev + 0x88), *(float *)(ev + 0x8C),
                   *(float *)(ev + 0x90), *(unsigned *)(ev + 0x60), *(unsigned *)(ev + 0x64), *(unsigned *)(ev + 0x68), *(unsigned *)(ev + 0x6C), *(unsigned *)(ev + 0x44));
     } else if (evt && g_st_verbose && ++g_st_other[s] <= 40)
-        logf_("event -> %s: %s (vt rva %x)", s ? "me" : "avatar", nm, evt - (unsigned)g_base);
+        logf_("event -> %s: %s (vt rva %x)", s == 2 ? "npc" : s ? "me" : "avatar", nm, evt - (unsigned)g_base);
     return ((int (__attribute__((thiscall)) *)(void *, void *))g_st_orig[s])(self, ev);
 }
 static void stim_install(unsigned long long id, int slot)
@@ -1939,18 +1964,31 @@ static void stim_install(unsigned long long id, int slot)
     logf_("stimlog: %s %llu object %p vtable %p (rva %x), events now logged", slot ? "me" : "avatar", id, obj, vt, (unsigned)vt - (unsigned)g_base);
 }
 
-/* a HIT from the peer: the peer's player hit our avatar there, so our player takes it here. Bullet hits are rebuilt as
- * the bullet stim class (ctor FUN_1050ffb0, vtable RVA E119A4, "none" at +0xB0, the sender's 0x20-byte tail); a base
- * Stim with type 3 read past its end left the player's health at -inf. */
-static void hit_apply(const HitPkt *hp)
+/* put a synced NPC on the shared NPC vtable copy (slot 2); NPCs of another class are left alone */
+static void st_hook_npc(BYTE *obj)
+{
+    static int warned;
+    void **vt = *(void ***)obj;
+    if (vt == &g_st_vt[2][1]) return;
+    if (!g_st_orig[2]) {
+        if (IsBadReadPtr(vt - 1, sizeof g_st_vt[2])) return;
+        memcpy(g_st_vt[2], vt - 1, sizeof g_st_vt[2]);
+        g_st_orig[2] = vt[0x20 / 4];
+        g_st_vt[2][1 + 0x20 / 4] = (void *)st_hook;
+        logf_("npc hits: NPC class vtable %p (rva %x) copied", vt, (unsigned)vt - (unsigned)g_base);
+    } else if (memcmp(vt, &g_st_vt[2][1], 0x20) || vt[0x20 / 4] != g_st_orig[2]) {
+        if (!warned++) logf_("npc hits: NPC %p has another class (vtable rva %x), not hooked", obj, (unsigned)vt - (unsigned)g_base);
+        return;
+    }
+    *(void ***)obj = &g_st_vt[2][1];
+}
+
+/* build a stim from a hit packet and hand it to the target's original event method, with the avatar as source */
+static void st_deliver(const HitPkt *hp, BYTE *target, void *orig)
 {
     typedef void *(__fastcall *ctor_t)(void *ev);
-    BYTE ev[0xC0], *me, *nh;
-    void *hd = NULL, *ah = NULL;
-    if (!g_hitsync || !g_st_orig[1]) return;
-    me = entity_obj(g_net_id, &hd);
-    if (hd) (*(int *)((BYTE *)hd + 8))--;
-    if (!me || *(void ***)me != &g_st_vt[1][1]) return;
+    BYTE ev[0xC0], *nh;
+    void *ah = NULL;
     memset(ev, 0, sizeof ev);
     if (hp->subvt == 0xE119A4) {
         ((ctor_t)(g_base + 0x50FFB0))(ev);
@@ -1967,8 +2005,35 @@ static void hit_apply(const HitPkt *hp)
         (*(int *)((BYTE *)ah + 8))++;
         *(void **)(ev + 0x3C) = ah; *(void **)(ev + 0x40) = ah;
     } else if (ah) (*(int *)((BYTE *)ah + 8))--;
-    ((int (__attribute__((thiscall)) *)(void *, void *))g_st_orig[1])(me, ev);
+    ((int (__attribute__((thiscall)) *)(void *, void *))orig)(target, ev);
     ((ctor_t)(g_base + 0x50E9F0))(ev);
+}
+
+/* NHIT on the host: the joiner's player hit this NPC there */
+static void npc_hit_apply(const NpcHitPkt *nk)
+{
+    void *hd = NULL;
+    BYTE *obj;
+    if (!g_hitsync || g_npc_role != 1) return;
+    obj = entity_obj(nk->npc, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!obj) return;
+    st_deliver(&nk->h, obj, *(void ***)obj == &g_st_vt[2][1] ? g_st_orig[2] : (*(void ***)obj)[0x20 / 4]);
+    if (++g_nhit_rx <= 50) logf_("npc hit %u: the joiner hit NPC %llu (type %d, amount %d, part %08x) -> applied", nk->h.seq, nk->npc, nk->h.type, nk->h.amount, nk->h.part);
+}
+
+/* a HIT from the peer: the peer's player hit our avatar there, so our player takes it here. Bullet hits are rebuilt as
+ * the bullet stim class (ctor FUN_1050ffb0, vtable RVA E119A4, "none" at +0xB0, the sender's 0x20-byte tail); a base
+ * Stim with type 3 read past its end left the player's health at -inf. */
+static void hit_apply(const HitPkt *hp)
+{
+    void *hd = NULL;
+    BYTE *me;
+    if (!g_hitsync || !g_st_orig[1]) return;
+    me = entity_obj(g_net_id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!me || *(void ***)me != &g_st_vt[1][1]) return;
+    st_deliver(hp, me, g_st_orig[1]);
     if (++g_hit_rx <= 50) logf_("hit %u: the peer hit us (type %d, amount %d, flags %x, part %08x, sub rva %x) -> applied", hp->seq, hp->type, hp->amount, hp->flags, hp->part, hp->subvt);
 }
 
@@ -1999,10 +2064,10 @@ static void hit_tick(DWORD now)
 typedef struct { unsigned long long id; float pos[3]; int vel[3], aim[4]; unsigned char s104, s11c, s110, pad; float hp, hpmax; } NpcEnt;
 typedef struct { unsigned magic, seq, count; NpcEnt e[NPC_MAX]; } NpcPkt;
 #pragma pack(pop)
-static struct { unsigned long long id; BYTE *mem; } g_nh[NPC_MAX];
+static struct { unsigned long long id; BYTE *mem, *obj; } g_nh[NPC_MAX];
 static int g_nh_n;
 static BYTE g_npc_this[0x40];
-static struct { unsigned long long id; BYTE *agent, *comp, *mem; int state; NpcEnt e; DWORD last; } g_np[NPC_MAX];
+static struct { unsigned long long id; BYTE *agent, *comp, *mem, *obj; int state; NpcEnt e; DWORD last; } g_np[NPC_MAX];
 static int g_np_n;
 
 /* scan all CPawnAgents (vtable RVA EC5078, agent+4 = pawn holder); calls back with id, entity, agent */
@@ -2048,7 +2113,7 @@ static void npc_host_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx
     (void)agent;
     if (g_nh_n >= NPC_MAX || id == g_net_id || id == g_av_id || dx * dx + dy * dy > g_npc_rad * g_npc_rad || npc_has_netcomp(obj)) return;
     for (i = 0; i < g_nh_n; i++) if (g_nh[i].id == id) return;
-    g_nh[g_nh_n].id = id; g_nh[g_nh_n].mem = NULL; g_nh_n++;
+    g_nh[g_nh_n].id = id; g_nh[g_nh_n].mem = NULL; g_nh[g_nh_n].obj = obj; g_nh_n++;
 }
 static float npc_hp(BYTE *obj, float *hpmax)
 {
@@ -2067,7 +2132,7 @@ static void npc_host_tick(DWORD now)
     last_send = now;
     if (!last_scan || now - last_scan > 30000) {
         /* re-pick the NPCs around us every 30 s (a full memory scan, a visible hitch) (keeps the existing mementos of those still in range) */
-        struct { unsigned long long id; BYTE *mem; } old[NPC_MAX];
+        struct { unsigned long long id; BYTE *mem, *obj; } old[NPC_MAX];
         int on = g_nh_n, j;
         void *hd = NULL;
         BYTE *me = entity_obj(g_net_id, &hd);
@@ -2092,6 +2157,8 @@ static void npc_host_tick(DWORD now)
         pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
         if (!pawn) continue;
         if (!g_nh[i].mem) g_nh[i].mem = ((np_factory_t)(g_base + 0x40110))();
+        g_nh[i].obj = obj;
+        if (g_hitsync) st_hook_npc(obj);
         if (!(m = g_nh[i].mem)) continue;
         *(void **)(g_npc_this + 0x10) = pawn;
         ((np_encode_t)(g_base + 0xA6EC0))(g_npc_this, m);
@@ -2116,6 +2183,13 @@ static void npc_rx(const NpcPkt *pk, int len)
         if (j == g_np_n) { if (g_np_n >= NPC_MAX) continue; memset(&g_np[j], 0, sizeof g_np[j]); g_np[j].id = pk->e[i].id; g_np_n++; }
         g_np[j].e = pk->e[i]; g_np[j].last = GetTickCount();
     }
+}
+static unsigned long long npc_id_of(BYTE *obj)
+{
+    int i;
+    for (i = 0; i < g_np_n; i++) if (g_np[i].obj == obj) return g_np[i].id;
+    for (i = 0; i < g_nh_n; i++) if (g_nh[i].obj == obj) return g_nh[i].id;
+    return 0;
 }
 static void npc_join_find_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx)
 {
@@ -2151,7 +2225,8 @@ static void npc_join_tick(DWORD now)
             *(unsigned *)(comp + 0x40) = 1; comp[0x44] = 1; *(unsigned *)(comp + 0x164) = 1; *(BYTE **)(comp + 0x170) = m;
             *(float *)(m + 0x13C) = e->hp > 0 ? e->hp : 0; m[0x134] = 1; *(unsigned *)(m + 0x14C) = (unsigned)e->hpmax; m[0x148] = 1;
             np_pos(m + 4, e->pos); np_pos(m + 0x1A4, e->pos);
-            g_np[j].comp = comp; g_np[j].mem = m; g_np[j].state = 1;
+            g_np[j].comp = comp; g_np[j].mem = m; g_np[j].state = 1; g_np[j].obj = obj;
+            if (g_hitsync) st_hook_npc(obj);
             np_slot(obj, 0x2C, 0x608487bc, 0xFFFFFFFFu, 0xFFFFFFFFu);
             bc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4));
             if (bc) mf_install(bc);
@@ -2313,6 +2388,7 @@ static void net_tick(void)
         static NpcPkt rb;
         int r = recvfrom(g_ns, (char *)&rb, sizeof rb, 0, (struct sockaddr *)&from, &fl);
         if (r == SOCKET_ERROR) { if (WSAGetLastError() == WSAEMSGSIZE) { g_net_drop++; continue; } break; }
+        if (r == (int)sizeof(NpcHitPkt) && rb.magic == NHIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_hit_apply((const NpcHitPkt *)&rb); continue; }
         if (r == (int)sizeof(HitPkt) && rb.magic == HIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) hit_apply((const HitPkt *)&rb); continue; }
         if (r >= 12 && rb.magic == NPC_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_rx(&rb, r); continue; }
         if (r > (int)sizeof q4) { g_net_drop++; continue; }
