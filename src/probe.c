@@ -973,6 +973,14 @@ static void native_cmd(const char *ln)
         { const char *sp = strchr(ln + 6, ' '); if (sp) secs = atoi(sp + 1); }
         g_dd_until = GetTickCount() + secs * 1000u;
         logf_("dumpd: NPC %llu for %d s", g_dd_id, secs);
+    } else if (strncmp(ln, "savegame", 8) == 0) {
+        /* the pause menu's save button: FUN_10735f20(char), a method of the menu page (vtable slot at RVA E9E104) that
+         * takes its context from the game's globals and returns with RET 4; 0 saves as "quicksave.<n>", the game names
+         * the file (random number). Runs on the main thread like the button. */
+        int arg = atoi(ln + 8);
+        logf_("savegame: calling the menu's save (%d)", arg);
+        ((void (__stdcall *)(char))(g_base + 0x735F20))((char)arg);
+        logf_("savegame: returned");
     } else if (strncmp(ln, "npcrespawn ", 11) == 0) {
         g_npcrespawn = atoi(ln + 11) != 0;
         logf_("npcrespawn: %s", g_npcrespawn ? "on" : "off");
