@@ -377,6 +377,8 @@ static float g_av_yawoff, g_av_off[2];
 static unsigned long long g_av_id;
 static int g_npc_role;            /* npcsync: 1 host, 2 join */
 static float g_npc_rad = 80.0f;
+static void stim_install(unsigned long long id, int slot);
+static int g_hitsync = 1, g_st_verbose;  /* hit sync on by default; stimlog turns on event logging */
 static void av_remove(void);
 static void *np_slot(BYTE *obj, int slot, unsigned k0, unsigned k1, unsigned k2);
 static int g_ws_role;
@@ -868,6 +870,15 @@ static void native_cmd(const char *ln)
         g_lanfwd = inet_addr(ln + 7);
         if (g_lanfwd == INADDR_NONE) g_lanfwd = 0;
         logf_("lanfwd: broadcasts also go to %s", g_lanfwd ? ln + 7 : "(off)");
+    } else if (strncmp(ln, "hitsync ", 8) == 0) {
+        g_hitsync = atoi(ln + 8) != 0;
+        logf_("hitsync: %s", g_hitsync ? "on (the shooter's window decides hits between players)" : "off (the avatar's replayed shots hurt us)");
+    } else if (strncmp(ln, "stimlog", 7) == 0) {
+        unsigned long long sid = strtoull(ln + 7, NULL, 10);
+        g_st_verbose = 1;
+        if (strstr(ln, "avatar")) stim_install(g_av_id, 0);
+        else if (strstr(ln, "me") || !sid) stim_install(g_net_id, 1);
+        else stim_install(sid, 0);
     } else if (strncmp(ln, "xhook", 5) == 0) {
         /* xhook [avatar | <entity id>]: hook the shot method of the current weapon object X of our player (default), the
          * avatar, or any pawn entity (e.g. a remote MP player) */
@@ -1847,6 +1858,134 @@ static void av_remove(void)
     g_av_mem = NULL; g_av_comp = NULL; g_av_npstate = 0; g_av_weap[0] = 0; g_av_lastseq = 0; g_av_smhave = 0;
 }
 
+/* ---- stims (damage events) ----
+ * Damage reaches an entity as a "Stim" event (class vtable RVA E11ECC, ctor FUN_1050f580, 0x94 bytes): type +0x48,
+ * amount +0x58, flags +0x5C, two entity handles +0x3C / +0x40 (handle: id +0, refcount +8, object +0xC), two vectors
+ * +0x7C / +0x88. KillPawnAgent sends one {type 3, 100000, 0x40} through the entity's event method vf+0x20.
+ * stimlog <avatar|me|id>: the entity gets a private vtable copy (with the RTTI slot in front) whose vf+0x20 logs every
+ * event; stims are dumped field by field. Slot 0 = avatar, 1 = local player. */
+/* hit sync (on by default, "hitsync 0|1"): hits between players are decided by the shooter's window. A damage stim on
+ * the avatar from our own player goes to the peer as a HIT packet; there it becomes a base Stim (built like
+ * KillPawnAgent does) on the local player with the avatar as source. The avatar's replayed shots no longer hurt the
+ * local player: stims on it whose source is the avatar are dropped. */
+#define HIT_MAGIC 0x31544948u
+#pragma pack(push, 1)
+typedef struct { unsigned magic, seq; int type, amount; unsigned flags, part, w60; float pos[3]; unsigned subvt, tail[8]; } HitPkt;
+#pragma pack(pop)
+static unsigned g_hit_tx, g_hit_rx, g_hit_blocked;
+static void *g_st_vt[2][257], *g_st_orig[2];
+static BYTE *g_st_obj[2];
+static unsigned long long g_st_id[2];
+static unsigned g_st_n[2], g_st_other[2];
+static unsigned long long st_hid(BYTE *h) { return h && !IsBadReadPtr(h, 8) ? *(unsigned long long *)h : 0; }
+/* an event's name: MSVC std::string at +0xC (inline buffer up to 15 chars, size +0x1C, capacity +0x20) */
+static const char *st_name(BYTE *ev)
+{
+    unsigned cap = *(unsigned *)(ev + 0x20), len = *(unsigned *)(ev + 0x1C);
+    const char *s = cap > 15 ? *(const char **)(ev + 0xC) : (const char *)(ev + 0xC);
+    if (len > 64 || !s || IsBadReadPtr(s, len + 1) || s[len]) return "?";
+    return s;
+}
+static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
+{
+    int s = *(void ***)self == &g_st_vt[1][1] ? 1 : 0;
+    unsigned evt = ev && !IsBadReadPtr(ev, 0x24) ? *(unsigned *)ev : 0;
+    const char *nm = evt ? st_name(ev) : "";
+    if (!strcmp(nm, "IsUsable")) evt = 0;
+    if (!strcmp(nm, "Stims") && !IsBadReadPtr(ev, 0x94)) {
+        unsigned long long src = st_hid(*(BYTE **)(ev + 0x3C));
+        if (g_hitsync && s == 0 && src == g_net_id && *(int *)(ev + 0x58) && g_ns != INVALID_SOCKET) {
+            HitPkt hp;
+            hp.magic = HIT_MAGIC; hp.seq = ++g_hit_tx; hp.type = *(int *)(ev + 0x48); hp.amount = *(int *)(ev + 0x58);
+            hp.flags = *(unsigned *)(ev + 0x5C); hp.part = *(unsigned *)(ev + 0x44); hp.w60 = *(unsigned *)(ev + 0x60);
+            memcpy(hp.pos, ev + 0x64, sizeof hp.pos); hp.subvt = evt - (unsigned)g_base;
+            /* bullet stims (vtable RVA E119A4, 0xB4 bytes) carry 0x20 more bytes after the base */
+            if (hp.subvt == 0xE119A4 && !IsBadReadPtr(ev, 0xB4)) memcpy(hp.tail, ev + 0x94, sizeof hp.tail); else memset(hp.tail, 0, sizeof hp.tail);
+            sendto(g_ns, (char *)&hp, sizeof hp, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+            if (g_hit_tx <= 50) logf_("hit %u: we hit the avatar (type %d, amount %d, flags %x, part %08x, sub rva %x, tail %08x %08x %08x %08x %08x %08x %08x %08x) -> sent",
+                                      g_hit_tx, hp.type, hp.amount, hp.flags, hp.part, hp.subvt, hp.tail[0], hp.tail[1], hp.tail[2], hp.tail[3], hp.tail[4], hp.tail[5], hp.tail[6], hp.tail[7]);
+        }
+        if (g_hitsync && s == 1 && src && src == g_av_id) {
+            if (++g_hit_blocked <= 50) logf_("hit: dropped the avatar's own stim on us (type %d, amount %d) - the shooter's window decides", *(int *)(ev + 0x48), *(int *)(ev + 0x58));
+            return 0;
+        }
+        if (g_st_verbose && ++g_st_n[s] <= 200)
+            logf_("stim %u (vt rva %x) -> %s %llu: type %d %d %d %d amount %d / %.2f flags %x src %llu inst %llu bytes %02x%02x%02x%02x%02x i78 %d "
+                  "v1 (%.2f %.2f %.2f) v2 (%.2f %.2f %.2f) w %08x %08x %08x %08x %08x", g_st_n[s], evt - (unsigned)g_base, s ? "me" : "avatar", g_st_id[s],
+                  *(int *)(ev + 0x48), *(int *)(ev + 0x4C), *(int *)(ev + 0x50), *(int *)(ev + 0x54), *(int *)(ev + 0x58), *(float *)(ev + 0x58),
+                  *(unsigned *)(ev + 0x5C), st_hid(*(BYTE **)(ev + 0x3C)), st_hid(*(BYTE **)(ev + 0x40)), ev[0x70], ev[0x71], ev[0x72], ev[0x73], ev[0x74],
+                  *(int *)(ev + 0x78), *(float *)(ev + 0x7C), *(float *)(ev + 0x80), *(float *)(ev + 0x84), *(float *)(ev + 0x88), *(float *)(ev + 0x8C),
+                  *(float *)(ev + 0x90), *(unsigned *)(ev + 0x60), *(unsigned *)(ev + 0x64), *(unsigned *)(ev + 0x68), *(unsigned *)(ev + 0x6C), *(unsigned *)(ev + 0x44));
+    } else if (evt && g_st_verbose && ++g_st_other[s] <= 40)
+        logf_("event -> %s: %s (vt rva %x)", s ? "me" : "avatar", nm, evt - (unsigned)g_base);
+    return ((int (__attribute__((thiscall)) *)(void *, void *))g_st_orig[s])(self, ev);
+}
+static void stim_install(unsigned long long id, int slot)
+{
+    void *hd = NULL;
+    BYTE *obj = entity_obj(id, &hd);
+    void **vt;
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!obj) { logf_("stimlog: no entity %llu", id); return; }
+    vt = *(void ***)obj;
+    if (vt == &g_st_vt[slot][1]) return;
+    if (g_st_obj[slot] == obj && g_st_orig[slot] && vt[0x20 / 4] != g_st_orig[slot]) { logf_("stimlog: %llu has another event method now, left alone", id); return; }
+    if (IsBadReadPtr(vt - 1, sizeof g_st_vt[slot])) { logf_("stimlog: vtable %p not readable", vt); return; }
+    memcpy(g_st_vt[slot], vt - 1, sizeof g_st_vt[slot]);
+    g_st_orig[slot] = vt[0x20 / 4];
+    g_st_vt[slot][1 + 0x20 / 4] = (void *)st_hook;
+    *(void ***)obj = &g_st_vt[slot][1];
+    g_st_obj[slot] = obj; g_st_id[slot] = id;
+    logf_("stimlog: %s %llu object %p vtable %p (rva %x), events now logged", slot ? "me" : "avatar", id, obj, vt, (unsigned)vt - (unsigned)g_base);
+}
+
+/* a HIT from the peer: the peer's player hit our avatar there, so our player takes it here. Bullet hits are rebuilt as
+ * the bullet stim class (ctor FUN_1050ffb0, vtable RVA E119A4, "none" at +0xB0, the sender's 0x20-byte tail); a base
+ * Stim with type 3 read past its end left the player's health at -inf. */
+static void hit_apply(const HitPkt *hp)
+{
+    typedef void *(__fastcall *ctor_t)(void *ev);
+    BYTE ev[0xC0], *me, *nh;
+    void *hd = NULL, *ah = NULL;
+    if (!g_hitsync || !g_st_orig[1]) return;
+    me = entity_obj(g_net_id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!me || *(void ***)me != &g_st_vt[1][1]) return;
+    memset(ev, 0, sizeof ev);
+    if (hp->subvt == 0xE119A4) {
+        ((ctor_t)(g_base + 0x50FFB0))(ev);
+        *(unsigned *)ev = (unsigned)(g_base + 0xE119A4);
+        memcpy(ev + 0x94, hp->tail, sizeof hp->tail);
+        *(unsigned *)(ev + 0xB0) = *(unsigned *)(g_base + 0xE2C55C);
+    } else ((ctor_t)(g_base + 0x50F580))(ev);
+    *(int *)(ev + 0x48) = hp->type; *(int *)(ev + 0x58) = hp->amount; *(unsigned *)(ev + 0x5C) = hp->flags;
+    *(unsigned *)(ev + 0x44) = hp->part; *(unsigned *)(ev + 0x60) = hp->w60; memcpy(ev + 0x64, hp->pos, sizeof hp->pos);
+    /* source and instigator = the avatar (one reference each, released by the destructor like the null handles) */
+    if (g_av_id && entity_obj(g_av_id, &ah) && ah) {
+        nh = *(BYTE **)(ev + 0x3C); (*(int *)(nh + 8))--;
+        nh = *(BYTE **)(ev + 0x40); (*(int *)(nh + 8))--;
+        (*(int *)((BYTE *)ah + 8))++;
+        *(void **)(ev + 0x3C) = ah; *(void **)(ev + 0x40) = ah;
+    } else if (ah) (*(int *)((BYTE *)ah + 8))--;
+    ((int (__attribute__((thiscall)) *)(void *, void *))g_st_orig[1])(me, ev);
+    ((ctor_t)(g_base + 0x50E9F0))(ev);
+    if (++g_hit_rx <= 50) logf_("hit %u: the peer hit us (type %d, amount %d, flags %x, part %08x, sub rva %x) -> applied", hp->seq, hp->type, hp->amount, hp->flags, hp->part, hp->subvt);
+}
+
+/* keep the event hooks on the avatar and on our player (both get new objects after a respawn) */
+static void hit_tick(DWORD now)
+{
+    static DWORD last;
+    void *hd = NULL;
+    BYTE *o;
+    if (!g_hitsync || now - last < 1000) return;
+    last = now;
+    if (g_av_id && (o = entity_obj(g_av_id, &hd)) && *(void ***)o != &g_st_vt[0][1]) stim_install(g_av_id, 0);
+    if (hd) { (*(int *)((BYTE *)hd + 8))--; hd = NULL; }
+    if (g_net_id && (o = entity_obj(g_net_id, &hd)) && *(void ***)o != &g_st_vt[1][1]) stim_install(g_net_id, 1);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+}
+
 /* ---- NPC sync (npcsync host <radius> | join | off) ----
  * host: every 100 ms the AI pawns within the radius (CPawnAgent scan, no players) are encoded by the game's own
  * ThirdParty encoder (FUN_100a6ec0) into a private memento each and sent as one NPC packet.
@@ -2174,6 +2313,7 @@ static void net_tick(void)
         static NpcPkt rb;
         int r = recvfrom(g_ns, (char *)&rb, sizeof rb, 0, (struct sockaddr *)&from, &fl);
         if (r == SOCKET_ERROR) { if (WSAGetLastError() == WSAEMSGSIZE) { g_net_drop++; continue; } break; }
+        if (r == (int)sizeof(HitPkt) && rb.magic == HIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) hit_apply((const HitPkt *)&rb); continue; }
         if (r >= 12 && rb.magic == NPC_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_rx(&rb, r); continue; }
         if (r > (int)sizeof q4) { g_net_drop++; continue; }
         memcpy(&q4, &rb, r);
@@ -2213,6 +2353,7 @@ static void net_tick(void)
     av_tick(now);
     world_tick(now);
     npc_host_tick(now);
+    hit_tick(now);
     npc_join_tick(now);
     /* send at 20 Hz */
     if ((g_bodymat || g_net_id) && now - g_net_lastsend >= 50) {
