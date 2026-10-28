@@ -262,6 +262,7 @@ static Target g_targets[] = {
 };
 #define NT (sizeof g_targets / sizeof g_targets[0])
 
+static int g_npc_role;            /* npcsync: 1 host, 2 join (declared here for coop_flags.txt) */
 static int patch_iat(HMODULE m)
 {
     BYTE *base = (BYTE *)m;
@@ -281,6 +282,10 @@ static int patch_iat(HMODULE m)
         GetModuleFileNameA(g_self, fp, MAX_PATH);
         if ((s = strrchr(fp, '\\'))) strcpy(s + 1, "coop_flags.txt");
         if ((f = fopen(fp, "rb"))) { size_t n = fread(flags, 1, sizeof flags - 1, f); flags[n] = 0; fclose(f); logf_("probe flags: %s", flags); }
+        /* "npchost" / "npcjoin": the NPC sync role from the start, so a joiner's NPCs never get to act on their own
+         * while the world loads and the session connects (they started idle actions the host never saw) */
+        if (strstr(flags, "npchost")) g_npc_role = 1;
+        if (strstr(flags, "npcjoin")) g_npc_role = 2;
     }
     for (i = 0; i < NT; i++) {
         HMODULE h = GetModuleHandleA(g_targets[i].dll);
@@ -421,6 +426,7 @@ static int g_npc_role;            /* npcsync: 1 host, 2 join */
 static float g_npc_rad = 80.0f;
 static void stim_install(unsigned long long id, int slot);
 static void npc_stat(void);
+static void npc_join_tick(DWORD now);
 static int g_hitsync = 1, g_st_verbose, g_npcev_left;
 static int g_npcanim = 1;           /* npcanim: puppets take the host NPCs' animation graph inputs */
 static void npc_anim_apply(BYTE *mb);
@@ -2232,11 +2238,11 @@ static void hit_tick(DWORD now)
 typedef struct { unsigned long long id; float pos[3]; int vel[3], aim[4]; unsigned char s104, s11c, s110, pad; float hp, hpmax; unsigned pulls; } NpcEnt;
 typedef struct { unsigned magic, seq, count; NpcEnt e[NPC_MAX]; } NpcPkt;
 #pragma pack(pop)
-static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; void *wcur; int wmode; char wname[64]; unsigned wcat; DWORD wsent; } g_nh[NPC_MAX];
+static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; void *wcur; int wmode; char wname[64]; unsigned wcat; DWORD wsent; unsigned lastact; } g_nh[NPC_MAX];
 static int g_nh_n;
 static BYTE g_npc_this[0x40];
 /* lid: the local entity id when the NPC had to be spawned here (the host's id is unknown to this world) */
-static struct { unsigned long long id, lid; BYTE *agent, *comp, *mem, *obj; int state, nospawn, gone; NpcEnt e; DWORD last, req; unsigned shots, fires, supp, av[0x70]; int avok; BYTE *mb; void *wcur; int wmode; char wname[64], hw[64]; unsigned wcat, hcat; int hset, wtries; DWORD wfix; } g_np[NPC_MAX];
+static struct { unsigned long long id, lid; BYTE *agent, *comp, *mem, *obj; int state, nospawn, gone; NpcEnt e; DWORD last, req; unsigned shots, fires, supp, av[0x70]; int avok; BYTE *mb; void *wcur; int wmode; char wname[64], hw[64]; unsigned wcat, hcat, lastact; int hset, wtries; DWORD wfix; } g_np[NPC_MAX];
 static int g_np_n;
 
 /* scan for CPawnAgents (vtable RVA EC5078, agent+4 = pawn holder), calling back with id, entity, agent; spread over many
@@ -2285,7 +2291,7 @@ static int npc_has_netcomp(BYTE *obj)
     for (k = 0; cs && k < n && k < 64; k++) if (cs[k] && !IsBadReadPtr(cs[k], 4) && *(DWORD *)cs[k] == (DWORD)(g_base + 0xE1AE00)) return 1;
     return 0;
 }
-static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; void *wcur; int wmode; char wname[64]; unsigned wcat; DWORD wsent; } g_nb[NPC_MAX];  /* list being built */
+static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; void *wcur; int wmode; char wname[64]; unsigned wcat; DWORD wsent; unsigned lastact; } g_nb[NPC_MAX];  /* list being built */
 static int g_nb_n;
 static unsigned long long g_nx[64];  /* ids never synced (buddies) */
 static int g_nx_n;
@@ -2396,7 +2402,7 @@ static void npc_host_tick(DWORD now)
         int j, changed = g_nb_n != g_nh_n;
         for (i = 0; i < g_nb_n; i++) {
             for (j = 0; j < g_nh_n && g_nh[j].id != g_nb[i].id; j++) ;
-            if (j < g_nh_n) { g_nb[i].mem = g_nh[j].mem; g_nb[i].shots = g_nh[j].shots; g_nb[i].fires = g_nh[j].fires; g_nb[i].lastfire = g_nh[j].lastfire; g_nb[i].wcur = g_nh[j].wcur; g_nb[i].wmode = g_nh[j].wmode; memcpy(g_nb[i].wname, g_nh[j].wname, 64); g_nb[i].wcat = g_nh[j].wcat; }
+            if (j < g_nh_n) { g_nb[i].mem = g_nh[j].mem; g_nb[i].shots = g_nh[j].shots; g_nb[i].fires = g_nh[j].fires; g_nb[i].lastfire = g_nh[j].lastfire; g_nb[i].wcur = g_nh[j].wcur; g_nb[i].wmode = g_nh[j].wmode; memcpy(g_nb[i].wname, g_nh[j].wname, 64); g_nb[i].wcat = g_nh[j].wcat; g_nb[i].lastact = g_nh[j].lastact; }
             else changed = 1;
         }
         memcpy(g_nh, g_nb, sizeof g_nh); g_nh_n = g_nb_n;
@@ -2445,6 +2451,11 @@ static void npc_host_tick(DWORD now)
             NpcAnimPkt a;
             unsigned *v = g_nh[i].obj ? npc_animvars(g_nh[i].obj) : NULL;
             if (!v || !safe_read(v, a.v, sizeof a.v)) continue;
+            if (a.v[0x58] != g_nh[i].lastact) {
+                logf_("npcact host %llu: action v58 %d -> %d (v42 %u v48 %u v11 %u v12 %u)", g_nh[i].id, (int)g_nh[i].lastact, (int)a.v[0x58], a.v[0x42],
+                      a.v[0x48], a.v[0x11], a.v[0x12]);
+                g_nh[i].lastact = a.v[0x58];
+            }
             a.magic = NANM_MAGIC; a.id = g_nh[i].id;
             sendto(g_ns, (char *)&a, sizeof a, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
         }
@@ -2561,8 +2572,14 @@ static void npc_anim_apply(BYTE *mb)
     if (!init) { for (k = 0; k < (int)sizeof g_anim_own; k++) own[g_anim_own[k]] = 1; init = 1; }
     for (j = 0; j < g_np_n; j++)
         if (g_np[j].mb == mb) {
-            if (g_np[j].avok && (v = npc_animvars(g_np[j].obj)))
+            if (g_np[j].avok && (v = npc_animvars(g_np[j].obj))) {
+                if (g_np[j].av[0x58] != g_np[j].lastact) {
+                    logf_("npcact puppet %llu: host action %d -> %d, puppet graph had %d (v42 %u -> %u)", g_np[j].id, (int)g_np[j].lastact,
+                          (int)g_np[j].av[0x58], (int)v[0x58], v[0x42], g_np[j].av[0x42]);
+                    g_np[j].lastact = g_np[j].av[0x58];
+                }
                 for (k = 0; k < NANM_VARS; k++) if (!own[k]) v[k] = g_np[j].av[k];
+            }
             return;
         }
 }
@@ -2626,11 +2643,22 @@ static unsigned long long g_nr[32];
 static int g_nr_n;
 static unsigned long long g_nkeep[32];
 static int g_nkeep_n;
+static BYTE *g_npaused[160];
+static int g_npaused_n;
 static void npc_join_local_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx)
 {
     int j;
     (void)obj; (void)agent; (void)ctx;
     npc_join_find_cb(id, obj, agent, ctx);
+    /* every NPC of the save is paused as soon as it is found, before the host's packets make it a puppet */
+    if (!(id >> 63) && id != g_net_id && id != g_av_id && agent) {
+        for (j = 0; j < g_npaused_n && g_npaused[j] != agent; j++) ;
+        if (j == g_npaused_n && g_npaused_n < 160) {
+            ((void (__attribute__((thiscall)) *)(void *, char))(*(void ***)agent)[0x164 / 4])(agent, 1);
+            g_npaused[g_npaused_n++] = agent;
+            if (g_npaused_n <= 3 || g_npaused_n % 20 == 0) logf_("npcsync join: paused the AI of %d NPCs so far (last %llu)", g_npaused_n, id);
+        }
+    }
     if (!(id >> 63) || id == g_net_id || id == g_av_id || g_nr_n >= 32) return;
     for (j = 0; j < g_np_n; j++) if (g_np[j].lid == id || g_np[j].id == id) return;
     for (j = 0; j < g_nkeep_n; j++) if (g_nkeep[j] == id) return;
@@ -2796,6 +2824,8 @@ static void net_tick(void)
     if (g_net_cfg == 0) {
         if (g_av_id) av_remove();
         if (g_ns != INVALID_SOCKET) { closesocket(g_ns); g_ns = INVALID_SOCKET; logf_("net socket closed (tx=%u rx=%u)", g_net_tx, g_net_rx); }
+        /* a joiner (coop_flags npcjoin) pauses its NPCs from the moment the world exists, before the session runs */
+        if (g_npc_role == 2 && g_nstates && GetCurrentThreadId() == g_states[0].thread) npc_join_tick(GetTickCount());
         return;
     }
     if (g_nstates == 0 || GetCurrentThreadId() != g_states[0].thread) return;
