@@ -2265,7 +2265,7 @@ static void hit_tick(DWORD now)
 typedef struct { unsigned long long id; float pos[3]; int vel[3], aim[4]; unsigned char s104, s11c, s110, pad; float hp, hpmax; unsigned pulls; } NpcEnt;
 typedef struct { unsigned magic, seq, count; NpcEnt e[NPC_MAX]; } NpcPkt;
 #pragma pack(pop)
-static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; void *wcur; int wmode; char wname[64]; unsigned wcat; DWORD wsent; unsigned lastact; } g_nh[NPC_MAX];
+static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; void *wcur; int wmode; char wname[64]; unsigned wcat; DWORD wsent; unsigned lastact, animhash; DWORD animsent; } g_nh[NPC_MAX];
 static int g_nh_n;
 static BYTE g_npc_this[0x40];
 /* lid: the local entity id when the NPC had to be spawned here (the host's id is unknown to this world) */
@@ -2318,7 +2318,7 @@ static int npc_has_netcomp(BYTE *obj)
     for (k = 0; cs && k < n && k < 64; k++) if (cs[k] && !IsBadReadPtr(cs[k], 4) && *(DWORD *)cs[k] == (DWORD)(g_base + 0xE1AE00)) return 1;
     return 0;
 }
-static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; void *wcur; int wmode; char wname[64]; unsigned wcat; DWORD wsent; unsigned lastact; } g_nb[NPC_MAX];  /* list being built */
+static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; void *wcur; int wmode; char wname[64]; unsigned wcat; DWORD wsent; unsigned lastact, animhash; DWORD animsent; } g_nb[NPC_MAX];  /* list being built */
 static int g_nb_n;
 static unsigned long long g_nx[64];  /* ids never synced (buddies) */
 static int g_nx_n;
@@ -2490,11 +2490,33 @@ static void npc_host_tick(DWORD now)
                       a.v[0x48], a.v[0x11], a.v[0x12]);
                 g_nh[i].lastact = a.v[0x58];
             }
+            /* only when the inputs changed (at most 5 times a second per NPC) and every 3 s: one datagram per NPC five times
+             * a second came to ~90 messages a second with the rest, too much for the Steam relay */
+            {
+                unsigned hsum = 2166136261u;
+                int k2;
+                for (k2 = 0; k2 < NANM_VARS; k2++) {
+                    /* the joiner keeps its own movement variables, and they change every frame on a walking NPC */
+                    int own = 0, k3;
+                    for (k3 = 0; k3 < (int)sizeof g_anim_own; k3++) if (g_anim_own[k3] == k2) own = 1;
+                    if (!own) hsum = (hsum ^ a.v[k2]) * 16777619u;
+                }
+                if (hsum == g_nh[i].animhash && now - g_nh[i].animsent < 3000) continue;
+                g_nh[i].animhash = hsum; g_nh[i].animsent = now;
+            }
             a.magic = NANM_MAGIC; a.id = g_nh[i].id;
             sendto(g_ns, (char *)&a, sizeof a, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
         }
     pk.magic = NPC_MAGIC; pk.seq = ++seq; pk.count = n;
-    if (n) sendto(g_ns, (char *)&pk, 12 + n * sizeof(NpcEnt), 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+    /* at most 12 NPCs per datagram (~800 bytes): 24 made ~1.5 KB, over one network packet; over the Steam relay both
+     * sides then saw the other leave the lobby 16 s into the session */
+    for (i = 0; i < n; i += 12) {
+        NpcPkt part;
+        int c = n - i < 12 ? n - i : 12;
+        part.magic = NPC_MAGIC; part.seq = pk.seq; part.count = c;
+        memcpy(part.e, pk.e + i, c * sizeof(NpcEnt));
+        sendto(g_ns, (char *)&part, 12 + c * sizeof(NpcEnt), 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+    }
 }
 static unsigned g_np_hostcount;
 static DWORD g_np_first;
