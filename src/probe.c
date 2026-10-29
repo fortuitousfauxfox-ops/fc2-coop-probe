@@ -2841,7 +2841,7 @@ static void av_tick(DWORD now)
         /* the joiner loads the host's save and stands where the host stood: an avatar spawned there overlapped a player,
          * and the game pushed that player out to a safe spot far away. The joiner spawns the avatar only after its own
          * placement next to the host; the host only once the peer is more than 1.5 m from its player. */
-        if (g_npc_role == 2 && g_join_tp < 4) return;
+        if (g_npc_role == 2 && !g_join_tp) return;
         {
             void *hd = NULL;
             BYTE *me = entity_obj(g_net_id, &hd);
@@ -2990,7 +2990,7 @@ static void dumpd_tick(DWORD now)
 }
 
 /* the player is really in the world: entity and pawn exist at a real position (both exist at 0,0,0 while the load
- * screen is up) and have for 12 s. Encoding the own player earlier crashed in the ThirdParty encoder (Dunia+0x493bb0,
+ * screen is up) and have for 3 s. Encoding the own player earlier crashed in the ThirdParty encoder (Dunia+0x493bb0,
  * null +0x2C) - after netstart from coop_auto.txt 3 s in, and from start-coop.ps1 1 s after the player id answered. */
 static int player_ready(unsigned long long me)
 {
@@ -3006,7 +3006,7 @@ static int player_ready(unsigned long long me)
     if (!obj || !((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)) ||
         (*(float *)(obj + 0x60) == 0.0f && *(float *)(obj + 0x64) == 0.0f)) { since = 0; return 0; }
     if (!since) since = GetTickCount() | 1;
-    return GetTickCount() - since >= 12000;
+    return GetTickCount() - since >= 3000;   /* was 12 s; the encoder calls are guarded now (enc_safe) */
 }
 static void net_tick(void)
 {
@@ -3132,8 +3132,9 @@ static void net_tick(void)
         g_bodymat && !IsBadWritePtr(g_bodymat, 0x40) && *(unsigned *)g_body == (unsigned)(g_base + RVA_BODY_VTABLE)) {
         /* the joiner loads the host's save, so it starts where the host stood when it saved; put it 2 m beside the host
          * now (the physics body's matrix as "tpb" does, and the entity position as "setpos"). Right after loading the
-         * player then died and woke up 80 m away (2705, 2499) - the same move done later stayed - so: wait 5 s after
-         * the first contact, check 4 s later, and try another side of the host up to 4 times. */
+         * player was pushed out 80 m away: the host's avatar had been spawned on the same spot. The move comes 1 s after
+         * the first contact (the avatar spawns right after it, see av_tick), is checked 4 s later, and another side of
+         * the host is tried up to 4 times. */
         static DWORD first, moved;
         static float tx, ty;
         float d2 = (*(float *)(g_bodymat + 0x30) - tx) * (*(float *)(g_bodymat + 0x30) - tx) + (*(float *)(g_bodymat + 0x34) - ty) * (*(float *)(g_bodymat + 0x34) - ty);
@@ -3141,11 +3142,11 @@ static void net_tick(void)
         if (moved && now - moved > 4000 && d2 < 9.0f) {
             logf_("join: our player stayed next to the host (try %d)", g_join_tp);
             g_join_tp = 4;
-        } else if (!moved && now - first > 5000 && (d2 = (*(float *)(g_bodymat + 0x30) - g_remote.pos[0]) * (*(float *)(g_bodymat + 0x30) - g_remote.pos[0]) +
+        } else if (!moved && now - first > 1000 && (d2 = (*(float *)(g_bodymat + 0x30) - g_remote.pos[0]) * (*(float *)(g_bodymat + 0x30) - g_remote.pos[0]) +
                    (*(float *)(g_bodymat + 0x34) - g_remote.pos[1]) * (*(float *)(g_bodymat + 0x34) - g_remote.pos[1])) >= 4.0f && d2 <= 100.0f) {
             logf_("join: our player is already %.1f m from the host, no move needed", sqrtf(d2));
             g_join_tp = 4;
-        } else if (now - first > 5000 && (!moved || now - moved > 4000)) {
+        } else if (now - first > 1000 && (!moved || now - moved > 4000)) {
             static const float ox[4] = { 2.0f, -2.0f, 0.0f, 0.0f }, oy[4] = { 0.0f, 0.0f, 2.0f, -2.0f };
             float x = g_remote.pos[0] + ox[g_join_tp], y = g_remote.pos[1] + oy[g_join_tp], z = g_remote.pos[2] + 0.3f;
             void *hd = NULL;
