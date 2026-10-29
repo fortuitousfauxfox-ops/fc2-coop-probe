@@ -2838,6 +2838,20 @@ static void av_tick(DWORD now)
         char code[256], out[64];
         unsigned long long id;
         if (now - g_av_lastspawn < 3000) return;
+        /* the joiner loads the host's save and stands where the host stood: an avatar spawned there overlapped a player,
+         * and the game pushed that player out to a safe spot far away. The joiner spawns the avatar only after its own
+         * placement next to the host; the host only once the peer is more than 1.5 m from its player. */
+        if (g_npc_role == 2 && g_join_tp < 4) return;
+        {
+            void *hd = NULL;
+            BYTE *me = entity_obj(g_net_id, &hd);
+            float dx, dy;
+            if (hd) (*(int *)((BYTE *)hd + 8))--;
+            if (me) {
+                dx = g_remote.pos[0] - *(float *)(me + 0x60); dy = g_remote.pos[1] - *(float *)(me + 0x64);
+                if (dx * dx + dy * dy < 1.5f * 1.5f) return;
+            }
+        }
         g_av_lastspawn = now;
         if (g_av_np)
             snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('%s', %.3f, %.3f, %.3f, 0, 0, 0))",
@@ -3116,7 +3130,7 @@ static void net_tick(void)
     }
     if (g_npc_role == 2 && g_join_tp < 4 && g_net_rx > 10 && now - g_net_lastrx < 200 && g_remote.pos[0] != 0.0f && player_ready(g_net_id) &&
         g_bodymat && !IsBadWritePtr(g_bodymat, 0x40) && *(unsigned *)g_body == (unsigned)(g_base + RVA_BODY_VTABLE)) {
-        /* the joiner loads the host's save, so it starts where the host stood when it saved; put it 1.5 m beside the host
+        /* the joiner loads the host's save, so it starts where the host stood when it saved; put it 2 m beside the host
          * now (the physics body's matrix as "tpb" does, and the entity position as "setpos"). Right after loading the
          * player then died and woke up 80 m away (2705, 2499) - the same move done later stayed - so: wait 5 s after
          * the first contact, check 4 s later, and try another side of the host up to 4 times. */
@@ -3127,8 +3141,12 @@ static void net_tick(void)
         if (moved && now - moved > 4000 && d2 < 9.0f) {
             logf_("join: our player stayed next to the host (try %d)", g_join_tp);
             g_join_tp = 4;
+        } else if (!moved && now - first > 5000 && (d2 = (*(float *)(g_bodymat + 0x30) - g_remote.pos[0]) * (*(float *)(g_bodymat + 0x30) - g_remote.pos[0]) +
+                   (*(float *)(g_bodymat + 0x34) - g_remote.pos[1]) * (*(float *)(g_bodymat + 0x34) - g_remote.pos[1])) >= 4.0f && d2 <= 100.0f) {
+            logf_("join: our player is already %.1f m from the host, no move needed", sqrtf(d2));
+            g_join_tp = 4;
         } else if (now - first > 5000 && (!moved || now - moved > 4000)) {
-            static const float ox[4] = { 1.5f, -1.5f, 0.0f, 0.0f }, oy[4] = { 0.0f, 0.0f, 1.5f, -1.5f };
+            static const float ox[4] = { 2.0f, -2.0f, 0.0f, 0.0f }, oy[4] = { 0.0f, 0.0f, 2.0f, -2.0f };
             float x = g_remote.pos[0] + ox[g_join_tp], y = g_remote.pos[1] + oy[g_join_tp], z = g_remote.pos[2] + 0.3f;
             void *hd = NULL;
             BYTE *me = entity_obj(g_net_id, &hd);
