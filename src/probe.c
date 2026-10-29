@@ -429,6 +429,7 @@ static int lua_eval(const char *code, char *out, size_t on)
 typedef void *(__attribute__((thiscall)) *getent_t)(void *mgr, void **out, unsigned lo, unsigned hi);
 #define RVA_BODY_VTABLE 0xE67658
 static BYTE *g_body, *g_bodymat;
+static unsigned g_findtries;   /* findbody tries since the body was last lost (3 s apart for 5 tries, then 60 s) */
 static BYTE **g_av_body_p;
 static int g_walk;
 static float g_walk_c[3], g_walk_r, g_walk_secs, g_walk_speed;
@@ -445,6 +446,7 @@ static int player_ready(unsigned long long me);
 static void npc_join_tick(DWORD now);
 static int g_hitsync = 1, g_st_verbose, g_npcev_left;
 static int g_npcanim = 1;           /* npcanim: puppets take the host NPCs' animation graph inputs */
+static int g_join_tp;              /* the joiner was put next to the host once */
 static int g_npcrespawn;            /* npcrespawn 1: replace puppets that run an action of their own (off: replacements are
                                      * spawned from the generic archetype and look different, and actions still differed) */
 static void npc_anim_apply(BYTE *mb);
@@ -563,9 +565,21 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 WINBASEAPI PVOID WINAPI AddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
+/* guarded calls into the game's ThirdParty encoder (enc_safe): the encoder dereferences pawn state that is null while
+ * a pawn dies, is rescued or loads (Dunia+0x493bb0, read of +0x2C); an access violation inside it jumps back to the
+ * guarded call, which skips that packet. The SEH chain (fs:[0]) is put back to its value at the call. */
+static void *g_enc_jb[5];
+static volatile int g_enc_guard;
+static DWORD g_enc_seh, g_enc_tid;
 static LONG WINAPI veh_filter(EXCEPTION_POINTERS *ep)
 {
     static int n;
+    if (g_enc_guard && ep->ExceptionRecord->ExceptionCode == 0xC0000005 && GetCurrentThreadId() == g_enc_tid) {
+        DWORD seh = g_enc_seh;
+        g_enc_guard = 0;
+        __asm__ volatile("movl %0, %%fs:0" : : "r"(seh) : "memory");
+        __builtin_longjmp(g_enc_jb, 1);
+    }
     if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && n < 30) {
         char mod[96];
         n++;
@@ -647,6 +661,16 @@ static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, con
  * the old weapon of that category FUN_10129de0 -> FUN_1012e3e0(old, 0) and its entity removed, FUN_101289f0(weapon),
  * then select it like SelectWeapon (FUN_1012ce80 -> FUN_1012b9b0: inventory weapon mode +0x78 = 1, current weapon) */
 static int pawn_give_weapon(BYTE *obj, const char *arch, const char *who);
+/* holster what a pawn holds (FUN_1012b340 on its inventory, what the Lua HolsterWeapon does for the player) */
+static void pawn_holster(BYTE *obj)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    typedef void *(__fastcall *inv_t)(void *pawn);
+    typedef int (__attribute__((thiscall)) *iget_t)(void *inv);
+    typedef void (__attribute__((thiscall)) *inv0_t)(void *inv);
+    void *pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)), *inv;
+    if (pawn && (inv = ((inv_t)(g_base + 0x7E140))(pawn)) && ((iget_t)(g_base + 0x125F40))(inv) == 1) ((inv0_t)(g_base + 0x12B340))(inv);
+}
 static int av_give_weapon(const char *arch)
 {
     void *holder = NULL;
@@ -1586,6 +1610,22 @@ static void lx_hook_weapon(void *wc)
 }
 
 typedef void (__attribute__((thiscall)) *np_encode_t)(void *self, void *memento);
+static unsigned g_enc_faults;
+static int __attribute__((noinline)) enc_safe(void *self, void *mem, unsigned long long who)
+{
+    DWORD seh;
+    __asm__ volatile("movl %%fs:0, %0" : "=r"(seh));
+    g_enc_seh = seh; g_enc_tid = GetCurrentThreadId();
+    if (__builtin_setjmp(g_enc_jb)) {
+        g_enc_guard = 0;
+        if (++g_enc_faults <= 20 || g_enc_faults % 500 == 0) logf_("encoder fault on %llu (pawn not ready: dying, rescued or loading), packet skipped (%u so far)", who, g_enc_faults);
+        return 0;
+    }
+    g_enc_guard = 1;
+    ((np_encode_t)(g_base + 0xA6EC0))(self, mem);
+    g_enc_guard = 0;
+    return 1;
+}
 static void tx_encode(BYTE *obj, NetPktX *p, DWORD now)
 {
     BYTE *m;
@@ -1600,7 +1640,7 @@ static void tx_encode(BYTE *obj, NetPktX *p, DWORD now)
     m = g_tx_mem;
     shot_hook_install(obj);
     *(void **)(g_tx_this + 0x10) = pawn;
-    ((np_encode_t)(g_base + 0xA6EC0))(g_tx_this, m);
+    if (!enc_safe(g_tx_this, m, g_net_id)) return;
     for (k = 0; k < 3; k++) p->vel[k] = *(int *)(m + 0x78 + 0x14 * k);
     p->aim[0] = *(int *)(m + 0xB4); p->aim[1] = *(int *)(m + 0xC8);
     p->aim[2] = *(int *)(m + 0xDC); p->aim[3] = *(int *)(m + 0xF0);
@@ -2424,7 +2464,7 @@ static void npc_host_tick(DWORD now)
         }
         if (!(m = g_nh[i].mem)) continue;
         *(void **)(g_npc_this + 0x10) = pawn;
-        ((np_encode_t)(g_base + 0xA6EC0))(g_npc_this, m);
+        if (!enc_safe(g_npc_this, m, g_nh[i].id)) continue;
         e->id = g_nh[i].id;
         memcpy(e->pos, obj + 0x60, sizeof e->pos);
         for (k = 0; k < 3; k++) e->vel[k] = *(int *)(m + 0x78 + 0x14 * k);
@@ -2456,11 +2496,15 @@ static void npc_host_tick(DWORD now)
     pk.magic = NPC_MAGIC; pk.seq = ++seq; pk.count = n;
     if (n) sendto(g_ns, (char *)&pk, 12 + n * sizeof(NpcEnt), 0, (struct sockaddr *)&g_peer, sizeof g_peer);
 }
+static unsigned g_np_hostcount;
+static DWORD g_np_first;
 static void npc_rx(const NpcPkt *pk, int len)
 {
     unsigned i;
     int j;
     if (g_npc_role != 2 || len < 12 || pk->count > NPC_MAX || len < (int)(12 + pk->count * sizeof(NpcEnt))) return;
+    g_np_hostcount = pk->count;
+    if (!g_np_first) g_np_first = GetTickCount() | 1;
     for (i = 0; i < pk->count; i++) {
         for (j = 0; j < g_np_n && g_np[j].id != pk->e[i].id; j++) ;
         if (j == g_np_n) { if (g_np_n >= NPC_MAX) continue; memset(&g_np[j], 0, sizeof g_np[j]); g_np[j].id = pk->e[i].id; g_np_n++; }
@@ -2686,9 +2730,22 @@ static void npc_join_local_cb(unsigned long long id, BYTE *obj, BYTE *agent, voi
             if (g_npaused_n <= 3 || g_npaused_n % 20 == 0) logf_("npcsync join: paused the AI of %d NPCs so far (last %llu)", g_npaused_n, id);
         }
     }
-    if (!(id >> 63) || id == g_net_id || id == g_av_id || g_nr_n >= 32) return;
+    if (id == g_net_id || id == g_av_id || g_nr_n >= 32) return;
     for (j = 0; j < g_np_n; j++) if (g_np[j].lid == id || g_np[j].id == id) return;
     for (j = 0; j < g_nkeep_n; j++) if (g_nkeep[j] == id) return;
+    if (!(id >> 63)) {
+        /* a save NPC within 60 m of us that the host has not reported 10 s into the session: dead or gone on the host
+         * (the joiner loaded an older save) - unless the host's list was full */
+        void *hd = NULL;
+        BYTE *me;
+        float dx, dy;
+        if (!g_np_first || GetTickCount() - g_np_first < 10000 || g_np_hostcount >= NPC_MAX) return;
+        me = entity_obj(g_net_id, &hd);
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        if (!me) return;
+        dx = *(float *)(obj + 0x60) - *(float *)(me + 0x60); dy = *(float *)(obj + 0x64) - *(float *)(me + 0x64);
+        if (dx * dx + dy * dy > 60.0f * 60.0f) return;
+    }
     g_nr[g_nr_n++] = id;
 }
 static void npc_join_tick(DWORD now)
@@ -2707,7 +2764,7 @@ static void npc_join_tick(DWORD now)
             if (!strncmp(name, "buddies.", 8) || !strncmp(name, "player.", 7)) { if (g_nkeep_n < 32) g_nkeep[g_nkeep_n++] = g_nr[k]; continue; }
             snprintf(code, sizeof code, "RemoveEntity('%llu')", g_nr[k]);
             lua_eval(code, name, sizeof name);
-            logf_("npcsync join: removed our own NPC %llu (%s) - the host runs NPCs", g_nr[k], name);
+            logf_("npcsync join: removed our own NPC %llu (%s) - %s", g_nr[k], name, (g_nr[k] >> 63) ? "the host runs NPCs" : "not on the host (dead or gone there)");
         }
     }
     for (j = 0; j < g_np_n; j++) {
@@ -2719,7 +2776,9 @@ static void npc_join_tick(DWORD now)
         if (!obj) {
             /* not in this world (spawned on the host after the save): ask for its archetype, at most every 3 s */
             if (g_np[j].state == 1 && !g_np[j].gone) { g_np[j].gone = 1; logf_("npcsync join: puppet %llu is gone from this world", g_np[j].id); }
-            if (g_np[j].state == 0 && !g_np[j].lid && !g_np[j].nospawn && e->hp > 0 && now - g_np[j].req > 3000 && g_ns != INVALID_SOCKET) {
+            /* only NPCs spawned during play (ids with the high bit): a save NPC can simply not be streamed in yet, and
+             * spawning one made a second copy next to the original */
+            if (g_np[j].state == 0 && (g_np[j].id >> 63) && !g_np[j].lid && !g_np[j].nospawn && e->hp > 0 && now - g_np[j].req > 3000 && g_ns != INVALID_SOCKET) {
                 NpcArcPkt q;
                 memset(&q, 0, sizeof q); q.magic = NREQ_MAGIC; q.id = g_np[j].id; g_np[j].req = now;
                 sendto(g_ns, (char *)&q, sizeof q, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
@@ -2809,7 +2868,16 @@ static void av_tick(DWORD now)
         /* the peer changed the weapon in its hands: give the avatar the same one (retry at most every 2 s) */
         if (strcmp(g_rx_weap, g_av_weap) && now - g_av_weap_try > 2000) {
             g_av_weap_try = now;
-            if (!g_rx_weap[0]) { logf_("avweapon: peer holds no weapon (keeping '%s')", g_av_weap); strcpy(g_av_weap, g_rx_weap); }
+            /* empty hands, or a stationary gun (weapons.MountedWeapons.*, given as a hand weapon it hung at the avatar's
+             * side): holster; using the mounted gun itself is not replicated yet */
+            if (!g_rx_weap[0] || !strncmp(g_rx_weap, "weapons.MountedWeapons.", 23)) {
+                void *hd = NULL;
+                BYTE *ao = entity_obj(g_av_id, &hd);
+                if (hd) (*(int *)((BYTE *)hd + 8))--;
+                if (ao) pawn_holster(ao);
+                logf_("avweapon: peer holds '%s' -> avatar holsters", g_rx_weap);
+                strcpy(g_av_weap, g_rx_weap);
+            }
             else if (av_give_weapon(g_rx_weap)) strcpy(g_av_weap, g_rx_weap);
         }
         return;
@@ -2969,12 +3037,24 @@ static void net_tick(void)
         }
     }
     /* make sure we know our own body */
+    if (g_bodymat) {
+        /* the cached body dies with the player (death, rescue, respawn) and its memory is freed: the 1 s status line read
+         * its matrix and crashed the host. Drop it when it no longer looks like our body, or is away from our entity. */
+        void *hd = NULL;
+        BYTE *me = g_net_id ? entity_obj(g_net_id, &hd) : NULL;
+        int bad = IsBadReadPtr(g_body, 4) || *(unsigned *)g_body != (unsigned)(g_base + RVA_BODY_VTABLE) || IsBadReadPtr(g_bodymat, 0x40);
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        if (!bad && me) {
+            float dx = *(float *)(g_bodymat + 0x30) - *(float *)(me + 0x60), dy = *(float *)(g_bodymat + 0x34) - *(float *)(me + 0x64);
+            if (dx * dx + dy * dy > 25.0f) bad = 1;
+        }
+        if (bad) { logf_("our cached body is gone (death, rescue or respawn): looking for it again"); g_body = NULL; g_bodymat = NULL; g_findtries = 0; }
+    }
     if (!g_bodymat || IsBadReadPtr(g_body, 4) || *(unsigned *)g_body != (unsigned)(g_base + RVA_BODY_VTABLE)) {
         /* the body search scans all memory (a visible hitch): retry every 3 s at first, then back off to 60 s */
-        static unsigned tries;
-        if (now - g_net_lastfind > (tries < 5 ? 3000u : 60000u)) {
+        if (now - g_net_lastfind > (g_findtries < 5 ? 3000u : 60000u)) {
             char c[64];
-            g_net_lastfind = now; tries++;
+            g_net_lastfind = now; g_findtries++;
             snprintf(c, sizeof c, "findbody %llu", g_net_id);
             native_cmd(c);
         }
@@ -3032,6 +3112,32 @@ static void net_tick(void)
             g_remote.pos[2] = g_av_fake_c[2];
             g_remote.dir[0] = -sinf(ang); g_remote.dir[1] = cosf(ang);
             g_net_rx++; g_net_lastrx = now;
+        }
+    }
+    if (g_npc_role == 2 && g_join_tp < 4 && g_net_rx > 10 && now - g_net_lastrx < 200 && g_remote.pos[0] != 0.0f && player_ready(g_net_id) &&
+        g_bodymat && !IsBadWritePtr(g_bodymat, 0x40) && *(unsigned *)g_body == (unsigned)(g_base + RVA_BODY_VTABLE)) {
+        /* the joiner loads the host's save, so it starts where the host stood when it saved; put it 1.5 m beside the host
+         * now (the physics body's matrix as "tpb" does, and the entity position as "setpos"). Right after loading the
+         * player then died and woke up 80 m away (2705, 2499) - the same move done later stayed - so: wait 5 s after
+         * the first contact, check 4 s later, and try another side of the host up to 4 times. */
+        static DWORD first, moved;
+        static float tx, ty;
+        float d2 = (*(float *)(g_bodymat + 0x30) - tx) * (*(float *)(g_bodymat + 0x30) - tx) + (*(float *)(g_bodymat + 0x34) - ty) * (*(float *)(g_bodymat + 0x34) - ty);
+        if (!first) first = now;
+        if (moved && now - moved > 4000 && d2 < 9.0f) {
+            logf_("join: our player stayed next to the host (try %d)", g_join_tp);
+            g_join_tp = 4;
+        } else if (now - first > 5000 && (!moved || now - moved > 4000)) {
+            static const float ox[4] = { 1.5f, -1.5f, 0.0f, 0.0f }, oy[4] = { 0.0f, 0.0f, 1.5f, -1.5f };
+            float x = g_remote.pos[0] + ox[g_join_tp], y = g_remote.pos[1] + oy[g_join_tp], z = g_remote.pos[2] + 0.3f;
+            void *hd = NULL;
+            BYTE *me = entity_obj(g_net_id, &hd);
+            if (hd) (*(int *)((BYTE *)hd + 8))--;
+            logf_("join: moving our player from (%.1f %.1f %.1f) next to the host (%.1f %.1f %.1f), try %d", *(float *)(g_bodymat + 0x30),
+                  *(float *)(g_bodymat + 0x34), *(float *)(g_bodymat + 0x38), x, y, z, g_join_tp + 1);
+            *(float *)(g_bodymat + 0x30) = x; *(float *)(g_bodymat + 0x34) = y; *(float *)(g_bodymat + 0x38) = z;
+            if (me) { *(float *)(me + 0x60) = x; *(float *)(me + 0x64) = y; *(float *)(me + 0x68) = z; }
+            tx = x; ty = y; moved = now; g_join_tp++;
         }
     }
     av_tick(now);
