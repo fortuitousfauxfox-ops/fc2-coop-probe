@@ -2450,7 +2450,7 @@ static void npc_host_tick(DWORD now)
         NpcEnt *e = &pk.e[n];
         int k;
         if (hd) (*(int *)((BYTE *)hd + 8))--;
-        if (!obj) continue;
+        if (!obj) { g_nh[i].obj = NULL; continue; }   /* gone from the world: never use the old pointer again */
         pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
         if (!pawn) continue;
         if (!g_nh[i].mem) g_nh[i].mem = ((np_factory_t)(g_base + 0x40110))();
@@ -2485,7 +2485,13 @@ static void npc_host_tick(DWORD now)
     if (g_npcanim)
         for (i = 0; i < g_nh_n; i++) {
             NpcAnimPkt a;
-            unsigned *v = g_nh[i].obj ? npc_animvars(g_nh[i].obj) : NULL;
+            /* the entity is looked up again: a cached pointer of an NPC that had left the world crashed the host in
+             * GetComponent (Dunia+0x4ddb8a, read of ffffffff) */
+            void *hd2 = NULL;
+            BYTE *o2 = entity_obj(g_nh[i].id, &hd2);
+            unsigned *v;
+            if (hd2) (*(int *)((BYTE *)hd2 + 8))--;
+            v = o2 ? npc_animvars(o2) : NULL;
             if (!v || !safe_read(v, a.v, sizeof a.v)) continue;
             if (a.v[0x58] != g_nh[i].lastact) {
                 logf_("npcact host %llu: action v58 %d -> %d (v42 %u v48 %u v11 %u v12 %u)", g_nh[i].id, (int)g_nh[i].lastact, (int)a.v[0x58], a.v[0x42],
@@ -2658,7 +2664,11 @@ static void npc_anim_apply(BYTE *mb)
     if (!init) { for (k = 0; k < (int)sizeof g_anim_own; k++) own[g_anim_own[k]] = 1; init = 1; }
     for (j = 0; j < g_np_n; j++)
         if (g_np[j].mb == mb) {
-            if (g_np[j].avok && (v = npc_animvars(g_np[j].obj))) {
+            void *hd3 = NULL;
+            BYTE *o3 = entity_obj(g_np[j].lid ? g_np[j].lid : g_np[j].id, &hd3);
+            if (hd3) (*(int *)((BYTE *)hd3 + 8))--;
+            if (o3 != g_np[j].obj) return;   /* the puppet left the world: its cached entity pointer is stale */
+            if (g_np[j].avok && (v = npc_animvars(o3))) {
                 if (!g_np[j].lastact && !g_np[j].lid && (v[0x58] != g_np[j].av[0x58] || v[0x42] != g_np[j].av[0x42])) g_np[j].ownact = 1;
                 if (g_np[j].av[0x58] != g_np[j].lastact) {
                     logf_("npcact puppet %llu: host action %d -> %d, puppet graph had %d (v42 %u -> %u)", g_np[j].id, (int)g_np[j].lastact,

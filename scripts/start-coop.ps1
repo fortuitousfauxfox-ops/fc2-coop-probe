@@ -149,7 +149,12 @@ try {
     while (-not $game.HasExited -and (-not $Seconds -or ((Get-Date) - $start).TotalSeconds -lt $Seconds)) {
         Start-Sleep -Milliseconds 500; Guard
         if (-not $avatar) { $a = LogLines | Select-String 'avatar spawned: (\d+)' | Select-Object -Last 1; if ($a) { $avatar = $a.Matches[0].Groups[1].Value; Say "avatar of the other player spawned: $avatar" } }
-        if ($Role -eq 'join' -and $avatar -and ((Get-Date) - $sample).TotalSeconds -ge 2) { $sample = Get-Date; Native "pos $avatar`r`npos $id" }
+        if ($Role -eq 'join' -and $avatar -and ((Get-Date) - $sample).TotalSeconds -ge 2) {
+            # position samples are only for the log: a probe slow to take the command file (10 s) used to end the run
+            # and close the game; now that sample is skipped and the file removed
+            $sample = Get-Date
+            try { Native "pos $avatar`r`npos $id" } catch { Say "position sample skipped: $_"; Remove-Item (Join-Path $bin 'coop_native.txt') -ErrorAction SilentlyContinue }
+        }
         if (((Get-Date) - $last).TotalSeconds -ge 5) {
             $last = Get-Date
             $net = LogLines | Select-String '\] net: ' | Select-Object -Last 1
