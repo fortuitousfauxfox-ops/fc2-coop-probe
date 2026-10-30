@@ -171,6 +171,10 @@ class SteamTransport:
         # put: once a lobby had vanished, "could not enter lobby (response 2)" and no further try); the host checks its
         # lobby every 30 s and makes a new one if Steam no longer lists it
         self.join_mode, self.rejoin_at, self.lobby_check = join, 0.0, time.time() + 30
+        # session requests are accepted after the callback loop, not inside it: both relays logged the SteamNetworking
+        # assert "!IsLocked()" and soon after each saw the other leave the lobby; and a peer that the lobby no longer
+        # lists is kept while its messages keep coming (unlisted_at), it only counts as gone after 15 s of silence
+        self.pending_accept, self.unlisted_at, self.last_rx = [], 0.0, 0.0
         self.peer_name = "(none yet)"
         self.invite = invite
         self.sender_offset = None
@@ -217,15 +221,17 @@ class SteamTransport:
         for i in range(F["NumMembers"](self.mm, self.lobby)):
             m = F["MemberByIndex"](self.mm, self.lobby, i)
             if m != self.me:
+                self.unlisted_at = 0.0
                 if m != self.peer:
                     self.peer = m
                     self.peer_name = F["FriendName"](self.fr, m).decode(errors="replace")
                     log("steam: peer is %s" % self.peer_name)
                 return
         if self.peer:
-            log("steam: peer left the lobby")
-            if not self.host and self.join_mode == "friend":
-                self.leave_and_retry()
+            if not self.unlisted_at:
+                self.unlisted_at = time.time()
+                log("steam: peer is no longer listed in the lobby; keeping it while its messages arrive")
+            return
         self.peer, self.peer_name = 0, "(none yet)"
 
     def leave_and_retry(self):
@@ -237,6 +243,11 @@ class SteamTransport:
 
     def upkeep(self):
         F, now = self.f, time.time()
+        if self.peer and self.unlisted_at and now - self.unlisted_at > 15 and now - self.last_rx > 15:
+            log("steam: peer left the lobby (unlisted and silent for 15 s)")
+            self.peer, self.peer_name, self.unlisted_at = 0, "(none yet)", 0.0
+            if not self.host and self.join_mode == "friend":
+                self.leave_and_retry()
         if self.rejoin_at and now >= self.rejoin_at:
             lobby = self.find_friend_lobby()
             if lobby:
@@ -286,8 +297,8 @@ class SteamTransport:
         elif cb == 1251:  # SteamNetworkingMessagesSessionRequest: identity at offset 0
             sid = F["IdGet"](ctypes.c_void_p(param))
             if self.is_member(sid):
-                F["Accept"](self.nm, ctypes.c_void_p(param))
-                log("steam: accepted session from a lobby member")
+                ident = ctypes.create_string_buffer(ctypes.string_at(param, 136), 160)  # SteamNetworkingIdentity, 136 bytes
+                self.pending_accept.append(ident)
             else:
                 log("steam: ignored a session request from someone not in the lobby")
         elif cb == 1252:
@@ -346,6 +357,9 @@ class SteamTransport:
             else:
                 self.on_callback(msg.callback, msg.param)
             F["MD_Free"](self.pipe)
+        while self.pending_accept:
+            ok = F["Accept"](self.nm, self.pending_accept.pop(0))
+            log("steam: accepted session from a lobby member (%s)" % ok)
         out = []
         for ch in (0, 1, 2):
             n = F["Recv"](self.nm, ch, self.msgs, len(self.msgs))
@@ -358,6 +372,7 @@ class SteamTransport:
                     self.sender_offset = 16
                     log("steam: first message, sender identity read at offset 16 (x64)")
                 if sender == self.peer and 0 < size <= 2048:
+                    self.last_rx = time.time()
                     out.append((ch, ctypes.string_at(data_ptr, size)))
                 F["MsgRelease"](ctypes.c_void_p(m))
         return out

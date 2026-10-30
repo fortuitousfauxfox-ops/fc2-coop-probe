@@ -36,7 +36,12 @@ $gamePort = if ($Role -eq 'host') { 9101 } else { 9102 }
 $relayPort = if ($Role -eq 'host') { 9201 } else { 9202 }
 $runDir = Join-Path $TestDir ("coop-runs\{0:yyyyMMdd-HHmmss}-{1}" -f (Get-Date), $Role)
 New-Item -ItemType Directory -Force $runDir | Out-Null
-function Say($m) { $l = "[{0:HH:mm:ss}] {1}" -f (Get-Date), $m; Write-Output $l; Add-Content (Join-Path $runDir 'run.txt') $l }
+function Say($m) {
+    $l = "[{0:HH:mm:ss}] {1}" -f (Get-Date), $m; Write-Output $l
+    # someone reading run.txt at the same moment made Add-Content fail, and under ErrorActionPreference Stop that ended
+    # the run and closed the game: retry a few times, then give up on that line only
+    for ($i = 0; $i -lt 5; $i++) { try { [IO.File]::AppendAllText((Join-Path $runDir 'run.txt'), $l + "`r`n"); break } catch { Start-Sleep -Milliseconds 50 } }
+}
 
 Add-Type @"
 using System; using System.Runtime.InteropServices;
