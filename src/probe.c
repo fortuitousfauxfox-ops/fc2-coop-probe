@@ -181,12 +181,58 @@ static void bye_send(void);
                                     * two PCs, where the host's packets paused for ~5 s every ~10 s */
 static volatile int g_peer_bye;    /* the peer said it is leaving, at g_bye_at */
 static DWORD g_bye_at;
+static char g_peer_nick[64];      /* the other player's Steam name (NAM1) */
+static int g_peer_named;
 static VOID WINAPI h_PostQuitMessage(int c)
 {
     g_quitting = 1;
     bye_send();
     logf_("PostQuitMessage(%d) caller=%p: per-frame work stopped", c, __builtin_return_address(0));
     o_PostQuitMessage(c);
+}
+/* ---- on-screen notices ("Игрок <Steam name> подключается") ----
+ * Shown the way the game shows "QUICK_SAVING" in the top left (FUN_1071b590 area): the message widget is
+ * FUN_104ce530(manager [0x11644d74], 1); its vf+0x4C(text, duration [0x10F48190]) shows a UTF-16 text, which the game
+ * gets from its string table (FUN_104d1e40(&category, &key, [0x10F9B554]), RET 0xC, -> FUN_104d1d90 returns the wide
+ * string). Our own text goes in instead. Works in the DX9 and DX10 renderers alike (a Direct3D 9 overlay never saw a frame: the game ran DX10).
+ * Called on the main thread (net tick); the text buffer stays alive until the next notice. */
+static BYTE *g_base;
+static wchar_t g_ov_text[2][160];
+static volatile LONG g_ov_pending;
+static int g_ov_slot;
+static void notice_w(const wchar_t *text)
+{
+    lstrcpynW(g_ov_text[g_ov_slot ^ 1], text, 160);
+    g_ov_slot ^= 1;
+    InterlockedExchange(&g_ov_pending, 1);
+}
+/* "Игрок <name> <what>" with a UTF-8 name */
+static void notice_player(const char *name_utf8, const wchar_t *what)
+{
+    wchar_t n[64], t[160];
+    if (!MultiByteToWideChar(CP_UTF8, 0, name_utf8, -1, n, 64)) lstrcpyW(n, L"?");
+    n[63] = 0;
+    _snwprintf(t, 159, L"Игрок %ls %ls", n, what);
+    t[159] = 0;
+    notice_w(t);
+}
+static void notice_tick(void)
+{
+    typedef void *(__attribute__((thiscall)) *getw_t)(void *mgr, int which);
+    typedef void (__attribute__((thiscall)) *show_t)(void *w, const wchar_t *text, float seconds);
+    void *mgr, *w;
+    if (!g_ov_pending || !g_base) return;
+    mgr = *(void **)(g_base + 0x1644D74);
+    if (!mgr) return;   /* not in the world yet: keep it pending */
+    InterlockedExchange(&g_ov_pending, 0);
+    w = ((getw_t)(g_base + 0x4CE530))(mgr, 1);
+    if (!w) { logf_("notice: no message widget"); return; }
+    ((show_t)(*(void ***)w)[0x4C / 4])(w, g_ov_text[g_ov_slot], *(float *)(g_base + 0xF48190));
+    {
+        char u8[480];
+        WideCharToMultiByte(CP_UTF8, 0, g_ov_text[g_ov_slot], -1, u8, sizeof u8, NULL, NULL);
+        logf_("notice shown: %s", u8);
+    }
 }
 
 static BOOL (WINAPI *o_PeekMessageA)(LPMSG, HWND, UINT, UINT, UINT);
@@ -1036,6 +1082,11 @@ static void native_cmd(const char *ln)
     } else if (strncmp(ln, "mapsign ", 8) == 0) {
         g_mk_sign = atoi(ln + 8) < 0 ? -1 : atoi(ln + 8) > 0 ? 1 : 0;   /* 0: same heading as ours (test) */
         logf_("mapsign: %d", g_mk_sign);
+    } else if (strncmp(ln, "notice ", 7) == 0) {
+        /* notice <UTF-8 text>: show it on screen (test) */
+        wchar_t w[160];
+        if (MultiByteToWideChar(CP_UTF8, 0, ln + 7, -1, w, 160)) { w[159] = 0; notice_w(w); }
+        logf_("notice: %s", ln + 7);
     } else if (strcmp(ln, "rldsend") == 0) {
         /* rldsend (host): send the reload message for the save we read last, as after a load (test) */
         g_rld_force = 1;
@@ -2965,6 +3016,10 @@ static void npc_join_tick(DWORD now)
 static void av_tick(DWORD now)
 {
     av_init_ptr();
+    if (g_peer_named && (g_peer_bye || (g_net_rx && now - g_net_lastrx > AV_SILENT_MS))) {
+        notice_player(g_peer_nick, L"отключился");
+        g_peer_named = 0;
+    }
     /* the peer left (BYE1) or has been silent (crash, lost link): its avatar leaves the world too */
     if (g_av_id && (g_peer_bye || (g_net_rx && now - g_net_lastrx > AV_SILENT_MS))) {
         logf_("avatar: the peer %s - removing its avatar", g_peer_bye ? "left" : "is silent");
@@ -3173,6 +3228,9 @@ static int player_ready(unsigned long long me)
 /* BYE1: our game is closing (quit, or ending for a reload): the peer removes our avatar at once. Without it (a crash,
  * a lost link) the avatar goes after AV_SILENT_MS without packets; packets coming back spawn it again. */
 #define BYE_MAGIC 0x31455942u
+/* NAM1 + UTF-8 Steam name: sent by the relay to its own game every 3 s while the peer is up. The first one of a session
+ * shows "Игрок <name> подключается"; a bye or silence then shows "Игрок <name> отключился". */
+#define NAM_MAGIC 0x314D414Eu
 static void bye_send(void)
 {
     unsigned m[4] = { BYE_MAGIC, 0, 0, 0 };
@@ -3549,6 +3607,20 @@ static void net_tick(void)
         if (r == (int)sizeof(NpcAnimPkt) && rb.magic == NANM_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_anim_rx((const NpcAnimPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NSHT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_shot_apply((const NpcHitPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NHIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_hit_apply((const NpcHitPkt *)&rb); continue; }
+        if (r > 4 && r < 68 && rb.magic == NAM_MAGIC) {
+            if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) {
+                char nm[64];
+                memcpy(nm, (char *)&rb + 4, r - 4);
+                nm[r - 4] = 0;
+                if (!g_peer_named || strcmp(nm, g_peer_nick)) {
+                    strcpy(g_peer_nick, nm);
+                    if (!g_peer_named) notice_player(g_peer_nick, L"подключается");
+                    g_peer_named = 1;
+                    logf_("notice: the other player is %s", g_peer_nick);
+                }
+            }
+            continue;
+        }
         if (r == 16 && rb.magic == BYE_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) { if (!g_peer_bye) logf_("bye: the peer is leaving"); g_peer_bye = 1; g_bye_at = GetTickCount(); } continue; }
         if (r == (int)sizeof(RldPkt) && rb.magic == RLD_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) rld_rx((const RldPkt *)&rb); continue; }
         if (r == (int)sizeof(HitPkt) && rb.magic == HIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) hit_apply((const HitPkt *)&rb); continue; }
@@ -3623,6 +3695,7 @@ static void net_tick(void)
     rld_host_tick(now);
     hp_tick(now);
     map_tick(now);
+    notice_tick();
     world_tick(now);
     npc_host_tick(now);
     hit_tick(now);

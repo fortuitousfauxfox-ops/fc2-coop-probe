@@ -425,6 +425,7 @@ def main():
     batch, last_flush = [], time.time()
     kinds = {}  # game datagrams per kind (first 4 bytes, the probe's packet magic) since the last stats line
     last_ka = last_heard = last_stat = time.time()
+    last_name = 0.0
     t0, peer_alive = time.time(), False
     try:
         while not a.seconds or time.time() - t0 < a.seconds:
@@ -478,6 +479,14 @@ def main():
             if now - last_ka >= KEEPALIVE_S and tr.ready():
                 tr.send(1, b"ka", reliable=True)
                 last_ka = now
+            # the other player's name for the probe's on-screen notice ("Игрок <name> подключается"): NAM1 + UTF-8,
+            # every 3 s while the peer is up (the probe shows it once per session)
+            if peer_alive and now - last_name >= 3:
+                last_name = now
+                try:
+                    game.sendto(b"NAM1" + str(tr.peer_name).encode("utf-8")[:60], game_addr)
+                except OSError:
+                    pass
             if peer_alive and now - last_heard > TIMEOUT_S:
                 log("peer silent for %d s, dropped" % TIMEOUT_S)
                 peer_alive = False
