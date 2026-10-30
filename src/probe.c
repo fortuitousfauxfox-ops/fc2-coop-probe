@@ -474,10 +474,9 @@ static DWORD g_av_gone_at;   /* when the avatar entity vanished (the world was r
 static int g_rld_force;
 static int g_mk_sign = 1;     /* mapsign -1 flips the turn of the avatar arrow on the map if it turns the wrong way */
 static float g_mk_dbg[2];     /* mapdbg <dx> <dy>: extra offset of the avatar arrow in map units (test) */
-/* maparch <archetype>: the avatar arrow's look. coop.PeerPosition is the player arrow with the yellow material of the
- * underground mission arrow, added to the test copies' patch archive (tools make_peer_arrow.py); without it the
- * player's own (green) arrow is used */
-static char g_mk_arch[96] = "coop.PeerPosition";
+/* maparch <archetype>: overrides the other player's arrow (empty: by role). coop.PeerPosition is the player arrow in
+ * yellow, added to the test copies' patch archive (tools/make_peer_arrow.py); without it all arrows stay green */
+static char g_mk_arch[96];
 static float g_mk_yaw;        /* mapyaw <degrees>: turn added for a model whose arrow points elsewhere at yaw 0 */
 static int g_mk_respawn;
 static void *np_slot(BYTE *obj, int slot, unsigned k0, unsigned k1, unsigned k2);
@@ -3271,11 +3270,15 @@ static void rld_rx(const RldPkt *pk)
  * directly did not move what is drawn.
  * Visibility: FUN_104ddb20(obj, on); hidden 300 ms after the map stops updating. */
 static void *g_map_orig;
-static unsigned long long g_mk_id;
-static BYTE *g_mk_parent;          /* map model our arrow is attached to */
 static volatile DWORD g_map_seen;
 static unsigned g_map_faults;
-static int g_mk_shown;
+/* the arrows we add to the map. Colours by role: the host is always green, the joiner always yellow (coop.PeerPosition,
+ * see g_mk_arch). Slot 0: the other player's arrow (yellow on the host, green on the joiner). Slot 1, joiner only: our
+ * own arrow in yellow; the game's own (green) player arrow is hidden while it shows. */
+typedef struct { unsigned long long id; BYTE *parent; int shown; const char *arch; } MapMk;
+static MapMk g_mk[2];
+#define MK_GREEN "gadgets.ObjectiveIcons.PlayerPosition"
+static int g_mk_noyellow;          /* coop.PeerPosition could not be spawned (no arrow patch): all green */
 typedef char (__attribute__((thiscall)) *w2m_t)(void *self, int region, float *ref, float *world, float *out, float *ang, char *off);
 typedef void (__fastcall *eflush_t)(void *obj);
 typedef void (__attribute__((thiscall)) *eset3_t)(void *obj, float x, float y, float z);
@@ -3300,94 +3303,105 @@ static int __attribute__((noinline)) map_w2m(BYTE *self, float *world, float *ou
     return r != 0;
 }
 static BYTE *hobj(BYTE *h) { return h && !IsBadReadPtr(h, 0x10) ? *(BYTE **)(h + 0xC) : NULL; }
-static void mk_show(BYTE *mk, int on)
+static void ent_show(BYTE *o, int on)
 {
-    if (!mk || g_mk_shown == on) return;
-    ((eflush_t)(g_base + 0x4DD4F0))(mk);
-    ((evis_t)(g_base + 0x4DDB20))(mk, (unsigned)on);
-    g_mk_shown = on;
+    ((eflush_t)(g_base + 0x4DD4F0))(o);
+    ((evis_t)(g_base + 0x4DDB20))(o, (unsigned)on);
 }
-static void mk_hide(void)
+static void mk_show(MapMk *m, BYTE *o, int on)
+{
+    if (!o || m->shown == on) return;
+    ent_show(o, on);
+    m->shown = on;
+}
+static void mk_hide(MapMk *m)
 {
     void *hd = NULL;
-    BYTE *mk = g_mk_id ? entity_obj(g_mk_id, &hd) : NULL;
+    BYTE *o = m->id ? entity_obj(m->id, &hd) : NULL;
     if (hd) (*(int *)((BYTE *)hd + 8))--;
-    mk_show(mk, 0);
+    mk_show(m, o, 0);
+}
+/* one of our arrows onto the map model at local (x, y) with yaw a */
+static void mk_place(BYTE *self, BYTE *mapobj, MapMk *m, void *h, BYTE *o, const float *l, float a)
+{
+    if (m->parent != mapobj) {
+        (*(int *)((BYTE *)h + 8))++;                  /* the attach call releases one reference */
+        ((eflush_t)(g_base + 0x4DD4F0))(mapobj);
+        /* on the map's lower left corner bone (+0xC0, sMapCornerDownLeftBone), as FUN_106f07d0 attaches markers;
+         * on the model root ("none") the arrow sat behind the paper */
+        ((eattach_t)(g_base + 0x4E11B0))(mapobj, h, self + 0xC0, 0, 0);
+        /* then, as FUN_106f07d0 does: show it and FUN_106eca20(this, handle) - puts its graphic component in the
+         * map's render group (vf+0x98 / +0xA0 / +0xAC); without it the attached arrow was never drawn. Releases
+         * one reference too. */
+        ent_show(o, 1);
+        (*(int *)((BYTE *)h + 8))++;
+        ((void (__attribute__((thiscall)) *)(void *, void *))(g_base + 0x6ECA20))(self, h);
+        m->parent = mapobj; m->shown = -1;
+        logf_("map: arrow %s attached to the map model %p", m->arch, mapobj);
+    }
+    ((eflush_t)(g_base + 0x4DD4F0))(o);
+    ((eset3_t)(g_base + 0x4E01B0))(o, l[0], l[1], l[2] + *(float *)(self + 0xD0));
+    ((eflush_t)(g_base + 0x4DD4F0))(o);
+    ((eset3_t)(g_base + 0x4E01C0))(o, 0, 0, a);
+    mk_show(m, o, 1);
 }
 static void map_place(BYTE *self)
 {
-    static int logged;
-    void *h1 = NULL, *h2 = NULL, *h3 = NULL;
-    BYTE *pm, *mo, *mapobj, *av, *me, *mk;
-    float w[3], l[3], lp[3], a;
+    static DWORD lastlog;
+    void *hm = NULL, *ha = NULL, *h0 = NULL, *h1 = NULL;
+    BYTE *pm, *mo, *mapobj, *me, *av, *o0, *o1;
+    float w[3], l[3], lp[3], pa[3], *ang, a;
     g_map_seen = GetTickCount();
-    if (!g_mk_id || !g_av_id) return;
     pm = hobj(*(BYTE **)(self + 0x110));
     mo = *(BYTE **)(self + 0x38);
     mapobj = mo && !IsBadReadPtr(mo, 0xC) ? hobj(*(BYTE **)(mo + 8)) : NULL;
-    av = entity_obj(g_av_id, &h1); me = entity_obj(g_net_id, &h2); mk = entity_obj(g_mk_id, &h3);
-    if (pm && mapobj && av && me && mk && h3) {
-        if (g_mk_parent != mapobj) {
-            (*(int *)((BYTE *)h3 + 8))++;                 /* the attach call releases one reference */
-            ((eflush_t)(g_base + 0x4DD4F0))(mapobj);
-            /* on the map's lower left corner bone (+0xC0, sMapCornerDownLeftBone), as FUN_106f07d0 attaches markers;
-             * on the model root ("none") the arrow sat behind the paper */
-            ((eattach_t)(g_base + 0x4E11B0))(mapobj, h3, self + 0xC0, 0, 0);
-            /* then, as FUN_106f07d0 does: show it and FUN_106eca20(this, handle) - puts its graphic component in the
-             * map's render group (vf+0x98 / +0xA0 / +0xAC); without it the attached arrow was never drawn. Releases
-             * one reference too. */
-            ((eflush_t)(g_base + 0x4DD4F0))(mk);
-            ((evis_t)(g_base + 0x4DDB20))(mk, 1);
-            (*(int *)((BYTE *)h3 + 8))++;
-            ((void (__attribute__((thiscall)) *)(void *, void *))(g_base + 0x6ECA20))(self, h3);
-            g_mk_parent = mapobj; g_mk_shown = -1;
-            logf_("map: avatar arrow attached to the map model %p", mapobj);
-        }
-        int okw, okp;
-        static DWORD lastlog;
-        memcpy(w, av + 0x60, sizeof w);
+    me = entity_obj(g_net_id, &hm);
+    av = g_av_id ? entity_obj(g_av_id, &ha) : NULL;
+    o0 = g_mk[0].id ? entity_obj(g_mk[0].id, &h0) : NULL;
+    o1 = g_mk[1].id ? entity_obj(g_mk[1].id, &h1) : NULL;
+    if (pm && mapobj && me) {
         memcpy(lp, me + 0x60, sizeof lp);
-        okw = map_w2m(self, w, l); okp = map_w2m(self, lp, lp);
-        if (GetTickCount() - lastlog > 10000) {
-            lastlog = GetTickCount();
-            logf_("map: avatar (%.1f %.1f) -> %d (%.4f %.4f), we (%.1f %.1f) -> %d (%.4f %.4f), mode %d region %d", w[0], w[1], okw, l[0], l[1],
-                  *(float *)(me + 0x60), *(float *)(me + 0x64), okp, lp[0], lp[1], *(int *)(self + 0x138), *(int *)(self + 0x114));
-        }
-        if (okw && okp) {
-            /* heading difference avatar - our player (entity row 0 = facing), added to our player's yaw as the game
-             * reads it (FUN_104df830: angles, z at +8) */
-            float pa[3], *ang;
+        if (map_w2m(self, lp, lp)) {
+            /* our player's yaw as the game reads it for its arrow (FUN_104df830: angles, z at +8) */
             ((eflush_t)(g_base + 0x4DD4F0))(me);
             ang = ((float *(__attribute__((thiscall)) *)(void *, float *))(g_base + 0x4DF830))(me, pa);
-            /* the avatar's heading is the one the peer sends (its player's entity row 0); the avatar entity's own matrix is
-             * turned by NetPlayer every frame and made the arrow spin */
-            a = ang[2] + g_mk_yaw + g_mk_sign * (atan2f(g_remote.dir[1], g_remote.dir[0]) - atan2f(*(float *)(me + 0x34), *(float *)(me + 0x30)));
-            if (GetTickCount() - lastlog < 20) logf_("map: yaw ours %.2f, avatar arrow %.2f (heading avatar %.2f, we %.2f)", ang[2], a,
-                                                     atan2f(g_remote.dir[1], g_remote.dir[0]), atan2f(*(float *)(me + 0x34), *(float *)(me + 0x30)));
-            l[0] += g_mk_dbg[0]; l[1] += g_mk_dbg[1];
-            ((eflush_t)(g_base + 0x4DD4F0))(mk);
-            ((eset3_t)(g_base + 0x4E01B0))(mk, l[0], l[1], l[2] + *(float *)(self + 0xD0));
-            ((eflush_t)(g_base + 0x4DD4F0))(mk);
-            ((eset3_t)(g_base + 0x4E01C0))(mk, 0, 0, a);
-            mk_show(mk, 1);
-            if (logged++ < 3) logf_("map: avatar arrow local (%.4f %.4f), player (%.4f %.4f), yaw %.2f (ours %.2f); world: ours (%.3f %.3f %.3f) "
-                                    "player arrow (%.3f %.3f %.3f), flags %08x / %08x", l[0], l[1], lp[0], lp[1], a, ang[2], *(float *)(mk + 0x60),
-                                    *(float *)(mk + 0x64), *(float *)(mk + 0x68), *(float *)(pm + 0x60), *(float *)(pm + 0x64), *(float *)(pm + 0x68),
-                                    *(unsigned *)(mk + 0x70), *(unsigned *)(pm + 0x70));
+            if (o0 && h0 && av) {
+                memcpy(w, av + 0x60, sizeof w);
+                if (map_w2m(self, w, l)) {
+                    /* heading difference avatar - our player (entity row 0 = facing): the avatar's is the one the peer
+                     * sends; the avatar entity's own matrix is turned by NetPlayer every frame and made the arrow spin */
+                    a = ang[2] + g_mk_yaw + g_mk_sign * (atan2f(g_remote.dir[1], g_remote.dir[0]) - atan2f(*(float *)(me + 0x34), *(float *)(me + 0x30)));
+                    l[0] += g_mk_dbg[0]; l[1] += g_mk_dbg[1];
+                    mk_place(self, mapobj, &g_mk[0], h0, o0, l, a);
+                    if (GetTickCount() - lastlog > 10000) {
+                        lastlog = GetTickCount();
+                        logf_("map: other player at (%.4f %.4f), we at (%.4f %.4f), yaw %.2f / ours %.2f, mode %d", l[0], l[1], lp[0], lp[1], a, ang[2],
+                              *(int *)(self + 0x138));
+                    }
+                }
+            } else mk_show(&g_mk[0], o0, 0);
+            if (o1 && h1) {
+                /* the joiner's own arrow in yellow, where the game puts its green one, which is hidden */
+                mk_place(self, mapobj, &g_mk[1], h1, o1, lp, ang[2]);
+                ent_show(pm, 0);
+            }
         }
-    } else mk_show(mk, 0);
+    } else { mk_show(&g_mk[0], o0, 0); mk_show(&g_mk[1], o1, 0); }
+    if (hm) (*(int *)((BYTE *)hm + 8))--;
+    if (ha) (*(int *)((BYTE *)ha + 8))--;
+    if (h0) (*(int *)((BYTE *)h0 + 8))--;
     if (h1) (*(int *)((BYTE *)h1 + 8))--;
-    if (h2) (*(int *)((BYTE *)h2 + 8))--;
-    if (h3) (*(int *)((BYTE *)h3 + 8))--;
 }
 static void __attribute__((thiscall)) map_hook(BYTE *self, void *dt)
 {
     ((void (__attribute__((thiscall)) *)(void *, void *))g_map_orig)(self, dt);
     if (!g_quitting) map_place(self);
 }
-/* main thread: hook once, spawn our arrow while the map is in use, hide it when the map is put away */
+/* main thread: hook once, spawn our arrows while the map is in use, hide them when the map is put away */
 static void map_tick(DWORD now)
 {
+    int k, joiner = g_npc_role == 2;
+    const char *yellow = g_mk_noyellow ? MK_GREEN : "coop.PeerPosition";
     if (!g_map_orig && g_base) {
         void **slot = (void **)(g_base + 0xE99EC0 + 0x10);   /* vtable E99EC0, slot 4: FUN_106f4d30 */
         DWORD old;
@@ -3397,36 +3411,43 @@ static void map_tick(DWORD now)
             logf_("map: per-frame method of the map hooked");
         } else { g_map_orig = (void *)1; logf_("map: unexpected map vtable slot %p, not hooked", *slot); }
     }
-    if (g_mk_id) {
-        void *hd = NULL;
-        BYTE *mk = entity_obj(g_mk_id, &hd);
-        if (hd) (*(int *)((BYTE *)hd + 8))--;
-        if (!mk) { logf_("map: our arrow %llu is gone (a load?)", g_mk_id); g_mk_id = 0; g_mk_parent = NULL; }
-    }
-    if (g_mk_respawn && g_mk_id) {
-        char code[96], out[32];
-        snprintf(code, sizeof code, "RemoveEntity('%llu') __out = 'removed'", g_mk_id);
-        lua_eval(code, out, sizeof out);
-        g_mk_id = 0; g_mk_parent = NULL;
+    g_mk[0].arch = g_mk_arch[0] ? g_mk_arch : joiner ? MK_GREEN : yellow;
+    g_mk[1].arch = joiner && !g_mk_noyellow ? yellow : NULL;
+    for (k = 0; k < 2; k++) {
+        MapMk *m = &g_mk[k];
+        int want = k == 0 ? g_av_id != 0 : m->arch != NULL;
+        if (m->id) {
+            void *hd = NULL;
+            BYTE *o = entity_obj(m->id, &hd);
+            if (hd) (*(int *)((BYTE *)hd + 8))--;
+            if (!o) { logf_("map: our arrow %llu is gone (a load?)", m->id); m->id = 0; m->parent = NULL; }
+        }
+        if (m->id && ((k == 0 && g_mk_respawn) || !want)) {
+            char code[96], out[32];
+            snprintf(code, sizeof code, "RemoveEntity('%llu') __out = 'removed'", m->id);
+            lua_eval(code, out, sizeof out);
+            m->id = 0; m->parent = NULL;
+        }
+        if (!m->id && want && g_map_seen && now - g_map_seen < 1000) {
+            char out[64], code[200];
+            /* spawned near the players (one spawned far below the world, z -10000, was never drawn) */
+            snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('%s', %.2f, %.2f, %.2f, 0, 0, 0))",
+                     m->arch, g_remote.pos[0], g_remote.pos[1], g_remote.pos[2] + 1.0f);
+            lua_eval(code, out, sizeof out);
+            m->id = strtoull(out, NULL, 10);
+            if (m->id == 0xFFFFFFFFFFFFFFFFull) m->id = 0;
+            if (!m->id && strcmp(m->arch, MK_GREEN)) {
+                logf_("map: no archetype %s (%s): the arrow patch is missing, all arrows stay green", m->arch, out);
+                g_mk_noyellow = 1;
+                if (m->arch == g_mk_arch) g_mk_arch[0] = 0;
+                return;
+            }
+            m->parent = NULL;
+            logf_("map: arrow %s spawned for %s: %s", m->arch, k ? "us" : "the other player", out);
+        }
+        if (m->id && now - g_map_seen > 300) mk_hide(m);
     }
     g_mk_respawn = 0;
-    if (!g_mk_id && g_av_id && g_map_seen && now - g_map_seen < 1000) {
-        char out[64], code[200];
-        /* spawned near the avatar (one spawned far below the world, z -10000, was never drawn) */
-        snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('%s', %.2f, %.2f, %.2f, 0, 0, 0))",
-                 g_mk_arch, g_remote.pos[0], g_remote.pos[1], g_remote.pos[2] + 1.0f);
-        lua_eval(code, out, sizeof out);
-        g_mk_id = strtoull(out, NULL, 10);
-        if (g_mk_id == 0xFFFFFFFFFFFFFFFFull) g_mk_id = 0;
-        if (!g_mk_id && strcmp(g_mk_arch, "gadgets.ObjectiveIcons.PlayerPosition")) {
-            logf_("map: no archetype %s (%s), using the player arrow", g_mk_arch, out);
-            strcpy(g_mk_arch, "gadgets.ObjectiveIcons.PlayerPosition");
-            return;
-        }
-        g_mk_parent = NULL;
-        logf_("map: avatar arrow spawned: %s", out);
-    }
-    if (g_mk_id && (!g_av_id || now - g_map_seen > 300)) mk_hide();
 }
 /* our player's health, logged when it changes (to tell real damage from hit reactions) */
 static void hp_tick(DWORD now)
