@@ -173,9 +173,13 @@ static VOID WINAPI h_ExitProcess(UINT c)
     logf_("ExitProcess(%u) caller=%p", c, __builtin_return_address(0));
     o_ExitProcess(c);
 }
+/* set once the game asks to quit: the per-frame work (sync, avatar, NPC puppets) stops, as the world is torn down
+ * while message pumping goes on (a read of freed memory through D+23ba22 on PC2 right after the quit) */
+static volatile int g_quitting;
 static VOID WINAPI h_PostQuitMessage(int c)
 {
-    logf_("PostQuitMessage(%d) caller=%p", c, __builtin_return_address(0));
+    g_quitting = 1;
+    logf_("PostQuitMessage(%d) caller=%p: per-frame work stopped", c, __builtin_return_address(0));
     o_PostQuitMessage(c);
 }
 
@@ -453,6 +457,7 @@ static void npc_anim_apply(BYTE *mb);
 static unsigned long long g_dd_id;   /* dumpd: NPC whose desired-state block is logged */
 static DWORD g_dd_until;  /* hit sync on by default; stimlog turns on event logging */
 static void av_remove(void);
+static void av_forget(void);
 static void *np_slot(BYTE *obj, int slot, unsigned k0, unsigned k1, unsigned k2);
 static int g_ws_role;
 static BYTE *env_obj(void);
@@ -1571,14 +1576,20 @@ static void __attribute__((thiscall)) xshot_hook(void *self, void *pawn)
     ((void (__attribute__((thiscall)) *)(void *, void *))g_xh_orig)(self, pawn);
 }
 
-/* sender shot counter: bullet events miss shots (e.g. aimed at the ground close by), so the shot method of our own
- * current weapon object X (vf+0x20, FUN_10114330) is hooked through a private vtable copy and counted */
-static void *g_lx_vt[64], *g_lx_orig;
-static BYTE *g_lx_obj;
+/* sender shot counter: bullet events miss shots (e.g. aimed at the ground close by), so the shot method vf+0x20 of the
+ * weapon object classes X (vtable RVA E1EA18 for guns, FUN_10114330; E21DE0 for the machete) is hooked in the class
+ * vtables themselves and the shots of our own current weapon object are counted. It was a private vtable copy put on our weapon once it had been in our hands
+ * for 2 s (hooking during the draw crashed once): a machete drawn and swung at once was never counted, so the avatar
+ * did not swing. */
+static const unsigned g_lx_cls[2] = { 0xE1EA18, 0xE21DE0 };
+static void *g_lx_origs[2];
+static BYTE *g_lx_obj, *g_lx_cur;
 static unsigned g_lx_shots, g_lx_noevent, g_lx_aimed;
 static void __attribute__((thiscall)) lx_hook(void *self, void *pawn)
 {
     unsigned before = g_shot_seq;
+    void *g_lx_orig = g_lx_origs[*(unsigned *)self == (unsigned)(g_base + g_lx_cls[1])];
+    if (self != g_lx_cur) { ((void (__attribute__((thiscall)) *)(void *, void *))g_lx_orig)(self, pawn); return; }
     g_lx_inshot = 1; g_lx_ntypes = 0;
     ((void (__attribute__((thiscall)) *)(void *, void *))g_lx_orig)(self, pawn);
     g_lx_inshot = 0;
@@ -1595,18 +1606,26 @@ static void __attribute__((thiscall)) lx_hook(void *self, void *pawn)
 static void lx_hook_weapon(void *wc)
 {
     BYTE *y = wc ? *(BYTE **)((BYTE *)wc + 0x24) : NULL, *x = y ? *(BYTE **)(y + 0x54) : NULL;
-    static void *seen_wc;
-    static DWORD seen_t;
-    if (!x || *(void ***)x == g_lx_vt || IsBadReadPtr(*(void **)x, sizeof g_lx_vt)) return;
-    /* only the weapon object class we know (vtable RVA E1EA18, shot method FUN_10114330), and only once the weapon
-     * has been in our hands for 2 s (hooking during the draw crashed once in FUN_10110470) */
-    if (*(unsigned *)x != (unsigned)(g_base + 0xE1EA18)) return;
-    if (wc != seen_wc) { seen_wc = wc; seen_t = GetTickCount(); return; }
-    if (GetTickCount() - seen_t < 2000) return;
-    memcpy(g_lx_vt, *(void **)x, sizeof g_lx_vt);
-    g_lx_orig = g_lx_vt[0x20 / 4]; g_lx_vt[0x20 / 4] = (void *)lx_hook;
-    *(void ***)x = g_lx_vt; g_lx_obj = x;
-    logf_("tx: counting shots of our weapon object %p", x);
+    static unsigned other;
+    int c;
+    if (!x || IsBadReadPtr(x, 4)) { g_lx_cur = NULL; return; }
+    c = *(unsigned *)x == (unsigned)(g_base + g_lx_cls[0]) ? 0 : *(unsigned *)x == (unsigned)(g_base + g_lx_cls[1]) ? 1 : -1;
+    if (c < 0) {
+        if (other != *(unsigned *)x) { other = *(unsigned *)x; logf_("tx: our weapon object %p has class vtable rva %x, shots not counted", x, other - (unsigned)g_base); }
+        g_lx_cur = NULL;
+        return;
+    }
+    if (!g_lx_origs[c]) {
+        void **slot = (void **)(g_base + g_lx_cls[c] + 0x20);
+        DWORD old;
+        if (!VirtualProtect(slot, 4, PAGE_READWRITE, &old)) { logf_("tx: class vtable not writable (%lu)", GetLastError()); return; }
+        g_lx_origs[c] = *slot;
+        *slot = (void *)lx_hook;
+        VirtualProtect(slot, 4, old, &old);
+        logf_("tx: shot method of weapon class %X hooked (was %p)", g_lx_cls[c], g_lx_origs[c]);
+    }
+    if (g_lx_cur != x) logf_("tx: counting shots of our weapon object %p", x);
+    g_lx_cur = g_lx_obj = x;
 }
 
 typedef void (__attribute__((thiscall)) *np_encode_t)(void *self, void *memento);
@@ -1657,7 +1676,7 @@ static void tx_encode(BYTE *obj, NetPktX *p, DWORD now)
         typedef void *(__attribute__((thiscall)) *cur_t)(void *inv);
         void *inv = ((inv_t)(g_base + 0x7E140))(pawn), *cur = NULL;
         if (inv && ((iget_t)(g_base + 0x125F40))(inv) == 1) cur = ((cur_t)(g_base + 0x127DA0))(inv);
-        if (cur) lx_hook_weapon(cur);
+        lx_hook_weapon(cur);
         if (cur != g_tx_wcur) {
             char code[96];
             void *wh = cur ? *(void **)((BYTE *)cur + 8) : NULL;
@@ -1848,13 +1867,11 @@ static void av_fire(const float *point, const float *off, int mode)
     wc = inv ? ((cur_t)(g_base + 0x127DA0))(inv) : NULL;
     if (!wc) return;
     {
-        /* research: keep the shot-method hook on the avatar's current weapon object X, and log its state fields */
-        BYTE *y = *(BYTE **)((BYTE *)wc + 0x24), *x = y ? *(BYTE **)(y + 0x54) : NULL;
-        if (x && *(void ***)x != g_xh_vt && !IsBadReadPtr(*(void **)x, sizeof g_xh_vt)) {
-            memcpy(g_xh_vt, *(void **)x, sizeof g_xh_vt);
-            g_xh_orig = g_xh_vt[0x20 / 4]; g_xh_vt[0x20 / 4] = (void *)xshot_hook;
-            *(void ***)x = g_xh_vt; g_xh_obj = x;
-        }
+        /* log the avatar's weapon object state fields. It used to get a private vtable copy here too (research: counting
+         * its shot-method calls); that one shared buffer was put on the machete and then refilled for the pistol while
+         * the machete object kept pointing at it; copy A crashed (FUN_10110470) on the next pistol shot, and without the
+         * copy the same weapon swaps and shots ran without a crash */
+        BYTE *y = *(BYTE **)((BYTE *)wc + 0x24);
         if (y && fired < 200) logf_("avfire state: y %p +18 %d +1c %d +20 %d +24 %d +28 %d +2c %d +5a %u, [y+4]+bc %d", y, *(int *)(y + 0x18),
                                     *(int *)(y + 0x1C), *(int *)(y + 0x20), *(int *)(y + 0x24), *(int *)(y + 0x28), *(int *)(y + 0x2C), y[0x5A],
                                     *(void **)(y + 4) ? *(int *)(*(BYTE **)(y + 4) + 0xBC) : -1);
@@ -1969,6 +1986,20 @@ static void np_tick(DWORD now)
                           *(unsigned *)(m + 0x218), *(unsigned *)(m + 0x21C)); }
                 g_av_shot_seq = g_rx_shot_seq; shot_t = now;
                 for (k = 0; k < 3; k++) d[k] = g_rx_shot_t[k] > 2.99f ? 2.99f : g_rx_shot_t[k] < -2.99f ? -2.99f : g_rx_shot_t[k];
+                {
+                    /* the point is where the peer's bullet stopped, i.e. on a surface; the replayed trace ended there and,
+                     * with the position rounding, often just short of it (a shot at the ground at our feet left no dust
+                     * on the other PC): carry the point 0.5 m on along muzzle -> point */
+                    void *hd = NULL;
+                    BYTE *ao = entity_obj(g_av_id, &hd);
+                    if (hd) (*(int *)((BYTE *)hd + 8))--;
+                    if (ao) {
+                        float v[3], n;
+                        for (k = 0; k < 3; k++) v[k] = g_rx_shot_p[k] - (*(float *)(ao + 0x60 + 4 * k) + d[k]);
+                        n = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                        if (n > 0.05f && n < 500.0f) for (k = 0; k < 3; k++) g_rx_shot_p[k] += v[k] / n * 0.5f;
+                    }
+                }
                 *(int *)(m + 0x1A0) = -1; m[0x19C] = 1;
                 *(unsigned *)(m + 0x218) = 0xFFFFFFFFu; *(unsigned *)(m + 0x21C) = 0xFFFFFFFFu; m[0x214] = 1;
                 np_pos(m + 0x1A4, g_rx_shot_p);
@@ -2016,6 +2047,16 @@ static void av_remove(void)
         lua_eval(code, out, sizeof out);
         logf_("avatar %llu removed: %s", g_av_id, out);
     }
+    av_forget();
+}
+
+/* drop our avatar state without touching the world: after a load (our own game over or reloading a save) the world is
+ * rebuilt and the avatar entity is gone, but its id stayed set, so no new avatar was spawned and the peer stayed
+ * invisible here while it saw us */
+static BYTE *g_st_obj[2];   /* defined with the stim hooks below */
+static void av_forget(void)
+{
+    g_st_obj[0] = NULL;
     g_av_id = 0; g_av_body = g_av_mat = NULL; g_av_have = 0;
     g_av_mem = NULL; g_av_comp = NULL; g_av_npstate = 0; g_av_weap[0] = 0; g_av_lastseq = 0; g_av_smhave = 0;
 }
@@ -2071,6 +2112,20 @@ static void st_pack(HitPkt *hp, BYTE *ev, unsigned evt)
     /* bullet stims (vtable RVA E119A4, 0xB4 bytes) carry 0x20 more bytes after the base */
     if (hp->subvt == 0xE119A4 && !IsBadReadPtr(ev, 0xB4)) memcpy(hp->tail, ev + 0x94, sizeof hp->tail); else memset(hp->tail, 0, sizeof hp->tail);
 }
+/* our player is within r metres (ground plane) of the avatar */
+static int av_near_me(float r)
+{
+    void *h1 = NULL, *h2 = NULL;
+    BYTE *a = entity_obj(g_av_id, &h1), *m = entity_obj(g_net_id, &h2);
+    int touch = 0;
+    if (a && m) {
+        float dx = *(float *)(a + 0x60) - *(float *)(m + 0x60), dy = *(float *)(a + 0x64) - *(float *)(m + 0x64);
+        touch = dx * dx + dy * dy < r * r;
+    }
+    if (h1) (*(int *)((BYTE *)h1 + 8))--;
+    if (h2) (*(int *)((BYTE *)h2 + 8))--;
+    return touch;
+}
 static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
 {
     int s = *(void ***)self == &g_st_vt[1][1] ? 1 : *(void ***)self == &g_st_vt[2][1] ? 2 : 0;
@@ -2116,6 +2171,18 @@ static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
         if (g_hitsync && s == 1 && g_npc_role == 2 && dmg && src && npc_is_synced(src)) {
             if (++g_nsht_blocked <= 50) logf_("npc shot: dropped puppet %llu's own stim on us (amount %d) - the host decides", src, *(int *)(ev + 0x58));
             return 0;
+        }
+        if (s == 1 && dmg && g_av_id && (!src || src == g_net_id) && av_near_me(1.5f)) {
+            /* damage with no other attacker while the avatar touches us: the avatar's pawn is driven by velocity toward
+             * the peer's position and the physics resolved the overlap by throwing our player (the host died this way
+             * snagging on the joiner's body several times); dropped. Own grenades this close to the avatar count too. */
+            static unsigned n;
+            if (++n <= 50) logf_("bump: dropped damage on us next to the avatar (type %d, amount %d, flags %x, src %llu)", *(int *)(ev + 0x48), *(int *)(ev + 0x58), *(unsigned *)(ev + 0x5C), src);
+            return 0;
+        }
+        if (s == 1 && dmg) {
+            static unsigned n;
+            if (++n <= 100) logf_("damage on us: type %d, amount %d, flags %x, src %llu", *(int *)(ev + 0x48), *(int *)(ev + 0x58), *(unsigned *)(ev + 0x5C), src);
         }
         if (g_hitsync && s == 1 && src && src == g_av_id) {
             if (++g_hit_blocked <= 50) logf_("hit: dropped the avatar's own stim on us (type %d, amount %d) - the shooter's window decides", *(int *)(ev + 0x48), *(int *)(ev + 0x58));
@@ -2897,6 +2964,20 @@ static void av_tick(DWORD now)
         logf_("avatar set invincible: status %s", out);
         return;
     }
+    {
+        static DWORD gone;
+        void *hd = NULL;
+        BYTE *o = entity_obj(g_av_id, &hd);
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        if (o) gone = 0;
+        else if (!gone) gone = now | 1;
+        else if (now - gone > 1500 && now - g_av_lastspawn > 5000) {
+            logf_("avatar %llu is gone from the world (a load?), a new one will be spawned", g_av_id);
+            gone = 0;
+            av_forget();
+            return;
+        }
+    }
     if (g_av_np) {
         /* give the new entity a moment to finish spawning, then set it up once */
         if (!g_av_mem) {
@@ -3290,8 +3371,8 @@ static void pump_main(void)
     run_cmd(g_states[0].L);
     g_busy = 0;
 }
-static BOOL WINAPI h_PeekMessageA(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); watchd_tick(); fire_latch_tick(); pump_main(); return o_PeekMessageA(m, h, a, b, c); }
-static BOOL WINAPI h_PeekMessageW(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); watchd_tick(); fire_latch_tick(); pump_main(); return o_PeekMessageW(m, h, a, b, c); }
+static BOOL WINAPI h_PeekMessageA(LPMSG m, HWND h, UINT a, UINT b, UINT c) { if (!g_quitting) { hold_tick(); net_tick(); watchd_tick(); fire_latch_tick(); pump_main(); } return o_PeekMessageA(m, h, a, b, c); }
+static BOOL WINAPI h_PeekMessageW(LPMSG m, HWND h, UINT a, UINT b, UINT c) { if (!g_quitting) { hold_tick(); net_tick(); watchd_tick(); fire_latch_tick(); pump_main(); } return o_PeekMessageW(m, h, a, b, c); }
 
 static int __cdecl h_gettop(void *L)
 {
