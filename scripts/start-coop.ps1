@@ -130,7 +130,7 @@ try {
         Say "in the world, player id $pid_"
         $pid_
     }
-    $id = StartGame
+    $id = StartGame | Select-Object -Last 1   # the function also returns what Say printed
     if ($PlayerId -and $PlayerId -ne $id) { Say "WARNING: expected player id $PlayerId - is it the same save on both PCs?" }
 
     $relay = StartRelay
@@ -165,7 +165,7 @@ try {
             Copy-Item $log (Join-Path $runDir ("coop_probe-until-{0:HHmmss}.log" -f (Get-Date))) -ErrorAction SilentlyContinue
             (Get-Item $sv).LastWriteTime = Get-Date
             Say "the host loaded ${name}: starting the game again with it"
-            $id = StartGame
+            $id = StartGame | Select-Object -Last 1
             Native "netstart $gamePort 127.0.0.1 $relayPort $id"
             Say "probe connected to the relay again"
             $avatar = $null
