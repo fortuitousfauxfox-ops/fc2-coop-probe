@@ -176,9 +176,14 @@ static VOID WINAPI h_ExitProcess(UINT c)
 /* set once the game asks to quit: the per-frame work (sync, avatar, NPC puppets) stops, as the world is torn down
  * while message pumping goes on (a read of freed memory through D+23ba22 on PC2 right after the quit) */
 static volatile int g_quitting;
+static void bye_send(void);
+#define AV_SILENT_MS 5000          /* the avatar leaves after this long without packets (see BYE1) */
+static volatile int g_peer_bye;    /* the peer said it is leaving, at g_bye_at */
+static DWORD g_bye_at;
 static VOID WINAPI h_PostQuitMessage(int c)
 {
     g_quitting = 1;
+    bye_send();
     logf_("PostQuitMessage(%d) caller=%p: per-frame work stopped", c, __builtin_return_address(0));
     o_PostQuitMessage(c);
 }
@@ -2940,6 +2945,15 @@ static void npc_join_tick(DWORD now)
 static void av_tick(DWORD now)
 {
     av_init_ptr();
+    /* the peer left (BYE1) or has been silent (crash, lost link): its avatar leaves the world too */
+    if (g_av_id && (g_peer_bye || (g_net_rx && now - g_net_lastrx > AV_SILENT_MS))) {
+        logf_("avatar: the peer %s - removing its avatar", g_peer_bye ? "left" : "is silent");
+        av_remove();
+    }
+    if (g_peer_bye) {
+        if ((int)(g_net_lastrx - g_bye_at) < 2000) return;   /* packets of a new session, not the last ones before the bye */
+        g_peer_bye = 0;
+    }
     if (g_net_rx == 0 || now - g_net_lastrx > 3000) return;
     if (!g_av_id) {
         char code[256], out[64];
@@ -3136,6 +3150,17 @@ static int player_ready(unsigned long long me)
  * same file writes coop_reload.txt (the file name) next to the game and ends its process. start-coop.ps1 sees the file,
  * makes that save the newest and starts the game again, so it loads the host's save and connects as at the first
  * join. A joiner without the same file only logs it (sending the save over the link is not done yet). */
+/* BYE1: our game is closing (quit, or ending for a reload): the peer removes our avatar at once. Without it (a crash,
+ * a lost link) the avatar goes after AV_SILENT_MS without packets; packets coming back spawn it again. */
+#define BYE_MAGIC 0x31455942u
+static void bye_send(void)
+{
+    unsigned m[4] = { BYE_MAGIC, 0, 0, 0 };
+    int i;
+    if (g_ns == INVALID_SOCKET) return;
+    for (i = 0; i < 3; i++) sendto(g_ns, (char *)m, sizeof m, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+    logf_("bye: told the peer we are leaving");
+}
 #define RLD_MAGIC 0x31444C52u
 typedef struct { unsigned magic, seq, size, crc; char name[64]; } RldPkt;
 static int file_crc(const wchar_t *path, unsigned *size, unsigned *crc)
@@ -3208,6 +3233,7 @@ static void rld_rx(const RldPkt *pk)
     fclose(f);
     logf_("reload: the host loaded %s, ours matches (crc %08x): ending the game, start-coop restarts it with that save", pk->name, crc);
     g_quitting = 1;
+    bye_send();
     TerminateProcess(GetCurrentProcess(), 0);
 }
 /* our player's health, logged when it changes (to tell real damage from hit reactions) */
@@ -3310,6 +3336,7 @@ static void net_tick(void)
         if (r == (int)sizeof(NpcAnimPkt) && rb.magic == NANM_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_anim_rx((const NpcAnimPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NSHT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_shot_apply((const NpcHitPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NHIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_hit_apply((const NpcHitPkt *)&rb); continue; }
+        if (r == 16 && rb.magic == BYE_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) { if (!g_peer_bye) logf_("bye: the peer is leaving"); g_peer_bye = 1; g_bye_at = GetTickCount(); } continue; }
         if (r == (int)sizeof(RldPkt) && rb.magic == RLD_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) rld_rx((const RldPkt *)&rb); continue; }
         if (r == (int)sizeof(HitPkt) && rb.magic == HIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) hit_apply((const HitPkt *)&rb); continue; }
         if (r >= 12 && rb.magic == NPC_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_rx(&rb, r); continue; }
