@@ -150,7 +150,14 @@ try {
             $net = LogLines | Select-String '\] net: ' | Select-Object -Last 1
             $st = Get-Content (Join-Path $runDir 'relay.log') -ErrorAction SilentlyContinue | Select-String 'stats ' | Select-Object -Last 1
             Say ("{0} | {1}" -f $(if ($net) { $net.Line -replace '^\S+ \S+ ', '' } else { 'no net line yet' }), $(if ($st) { $st.Line } else { 'no relay stats yet' }))
-            if ($relay.HasExited) { Say 'relay exited'; break }
+            if ($relay.HasExited) {
+                # restart the relay and keep the game running (this used to end the run, and the finally block closed
+                # the game); the host's new relay makes a new lobby, the joiner's finds the friend's lobby again
+                Say 'relay exited: restarting it, the game keeps running'
+                Copy-Item (Join-Path $runDir 'relay.log') (Join-Path $runDir ("relay-until-{0:HHmmss}.log" -f (Get-Date))) -ErrorAction SilentlyContinue
+                Start-Sleep 3
+                $relay = StartRelay
+            }
         }
     }
 }

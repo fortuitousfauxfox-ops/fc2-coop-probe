@@ -165,6 +165,10 @@ class SteamTransport:
         self.me = F["GetSteamID"](self.user)
         log("steam: init ok, logged on=%s, own id ...%s" % (F["BLoggedOn"](self.user), str(self.me)[-4:]))
         self.lobby, self.peer, self.host = 0, 0, host
+        # the joiner looks for the friend's lobby again 5 s after a failed entry or after the host left (it used to stay
+        # put: once a lobby had vanished, "could not enter lobby (response 2)" and no further try); the host checks its
+        # lobby every 30 s and makes a new one if Steam no longer lists it
+        self.join_mode, self.rejoin_at, self.lobby_check = join, 0.0, time.time() + 30
         self.peer_name = "(none yet)"
         self.invite = invite
         self.sender_offset = None
@@ -178,6 +182,7 @@ class SteamTransport:
             if not lobby:
                 sys.exit("steam transport: no friend is hosting an fc2coop lobby right now")
             F["JoinLobby"](self.mm, lobby)
+            log("steam: joining lobby %d ..." % lobby)
         elif join == "wait":
             # joined later by on_callback: an accepted invite (333) or Join Game in the friends list (337)
             log("steam: waiting for a Steam invite or Join Game from the friends list ...")
@@ -217,7 +222,33 @@ class SteamTransport:
                 return
         if self.peer:
             log("steam: peer left the lobby")
+            if not self.host and self.join_mode == "friend":
+                self.leave_and_retry()
         self.peer, self.peer_name = 0, "(none yet)"
+
+    def leave_and_retry(self):
+        if self.lobby:
+            self.f["LeaveLobby"](self.mm, self.lobby)
+            self.lobby = 0
+        self.rejoin_at = time.time() + 5
+        log("steam: looking for the friend's lobby again in 5 s")
+
+    def upkeep(self):
+        F, now = self.f, time.time()
+        if self.rejoin_at and now >= self.rejoin_at:
+            lobby = self.find_friend_lobby()
+            if lobby:
+                self.rejoin_at = 0
+                F["JoinLobby"](self.mm, lobby)
+                log("steam: joining lobby %d ..." % lobby)
+            else:
+                self.rejoin_at = now + 5
+        if self.host and self.lobby and now >= self.lobby_check:
+            self.lobby_check = now + 30
+            if F["NumMembers"](self.mm, self.lobby) < 1:
+                log("steam: lobby %d is gone, creating a new one" % self.lobby)
+                self.lobby, self.peer, self.peer_name = 0, 0, "(none yet)"
+                F["CreateLobby"](self.mm, 1, 2)
 
     def on_callback(self, cb, param):
         F = self.f
@@ -236,6 +267,8 @@ class SteamTransport:
             lobby, response = ctypes.c_uint64.from_address(param).value, ctypes.c_uint32.from_address(param + 16).value
             if response != 1:
                 log("steam: could not enter lobby %d (response %d)" % (lobby, response))
+                if not self.host and self.join_mode == "friend":
+                    self.leave_and_retry()
                 return
             if not self.host:
                 tag = F["GetLobbyData"](self.mm, lobby, LOBBY_KEY)
@@ -298,6 +331,7 @@ class SteamTransport:
     def poll(self):
         F = self.f
         F["MD_RunFrame"](self.pipe)
+        self.upkeep()
         msg = CallbackMsg()
         while F["MD_Next"](self.pipe, ctypes.byref(msg)):
             if msg.callback == 703:  # SteamAPICallCompleted: call (u64), callback (i32), size (u32)
