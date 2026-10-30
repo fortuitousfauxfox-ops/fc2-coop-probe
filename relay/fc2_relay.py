@@ -33,6 +33,8 @@ import sys
 import time
 
 KEEPALIVE_S = 1.0
+BATCH_S = 0.05      # pack game datagrams for this long into one transport message
+BATCH_MAX = 1100    # bytes per packed message (under one network packet)
 TIMEOUT_S = 20.0
 LOBBY_KEY, LOBBY_VAL = b"fc2coop", b"1"
 
@@ -345,7 +347,7 @@ class SteamTransport:
                 self.on_callback(msg.callback, msg.param)
             F["MD_Free"](self.pipe)
         out = []
-        for ch in (0, 1):
+        for ch in (0, 1, 2):
             n = F["Recv"](self.nm, ch, self.msgs, len(self.msgs))
             for i in range(n):
                 m = self.msgs[i]
@@ -402,6 +404,11 @@ def main():
     log("relay up: probe 127.0.0.1:%d <-> relay 127.0.0.1:%d <-> %s" % (a.game_port, a.relay_port, a.transport))
 
     stats = dict(from_game=0, to_peer=0, from_peer=0, to_game=0, dropped=0)
+    # game datagrams are packed into one transport message per 50 ms (channel 2: [u16 length][datagram]...), at most
+    # BATCH_MAX bytes each: one Steam message per datagram (~80 a second with NPC sync) broke the Steam link after
+    # 15-20 s in two runs; a relay still accepts single datagrams on channel 0
+    batch, last_flush = [], time.time()
+    kinds = {}  # game datagrams per kind (first 4 bytes, the probe's packet magic) since the last stats line
     last_ka = last_heard = last_stat = time.time()
     t0, peer_alive = time.time(), False
     try:
@@ -417,22 +424,39 @@ def main():
                     stats["dropped"] += 1
                     continue
                 stats["from_game"] += 1
+                k = d[:4].decode("latin-1") if len(d) >= 4 and all(32 <= c < 127 for c in d[:4]) else "%08x" % int.from_bytes(d[:4].ljust(4, b"\x00"), "little")
+                kinds[k] = kinds.get(k, 0) + 1
                 if tr.ready():
-                    tr.send(0, d)
+                    if sum(len(x) + 2 for x in batch) + len(d) + 2 > BATCH_MAX:
+                        tr.send(2, b"".join(len(x).to_bytes(2, "little") + x for x in batch))
+                        stats["to_peer"] += 1
+                        batch, last_flush = [], now
+                    batch.append(d)
+            if batch and (now - last_flush >= BATCH_S or not tr.ready()):
+                if tr.ready():
+                    tr.send(2, b"".join(len(x).to_bytes(2, "little") + x for x in batch))
                     stats["to_peer"] += 1
+                batch, last_flush = [], now
             # peer -> probe
             for ch, d in tr.poll():
                 last_heard = now
                 if not peer_alive:
                     peer_alive = True
                     log("peer is talking (%s)" % tr.peer_name)
-                if ch == 0:
+                if ch == 0 or ch == 2:
                     stats["from_peer"] += 1
-                    try:
-                        game.sendto(d, game_addr)
-                        stats["to_game"] += 1
-                    except OSError:
-                        pass
+                    parts = [d] if ch == 0 else []
+                    i = 0
+                    while ch == 2 and i + 2 <= len(d):
+                        n = int.from_bytes(d[i:i + 2], "little")
+                        parts.append(d[i + 2:i + 2 + n])
+                        i += 2 + n
+                    for x in parts:
+                        try:
+                            game.sendto(x, game_addr)
+                            stats["to_game"] += 1
+                        except OSError:
+                            pass
                 elif d == b"bye":
                     log("peer said goodbye")
                     peer_alive = False
@@ -444,7 +468,9 @@ def main():
                 peer_alive = False
             if now - last_stat >= 5:
                 last_stat = now
-                log("stats " + " ".join("%s=%d" % kv for kv in stats.items()) + " peer=%s" % ("up" if peer_alive else "down"))
+                log("stats " + " ".join("%s=%d" % kv for kv in stats.items()) + " peer=%s" % ("up" if peer_alive else "down") +
+                    " | game datagrams by kind: " + " ".join("%s=%d" % kv for kv in sorted(kinds.items(), key=lambda x: -x[1])))
+                kinds = {}
             time.sleep(0.002)
     except KeyboardInterrupt:
         pass

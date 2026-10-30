@@ -2438,7 +2438,9 @@ static void npc_host_tick(DWORD now)
         memcpy(g_nh, g_nb, sizeof g_nh); g_nh_n = g_nb_n;
         if (changed) logf_("npcsync host: %d NPCs within %.0f m of us or the avatar (pass %lu ms)", g_nh_n, g_npc_rad, GetTickCount() - last_scan);
     }
-    if (now - last_send < 100) return;
+    /* 5 states a second (was 10): with the animation and weapon messages the host sent ~75 datagrams a second, and the
+     * Steam link broke after 15-20 s twice; NetPlayer smooths between states */
+    if (now - last_send < 200) return;
     last_send = now;
     memset(&pk, 0, sizeof pk);
     for (i = 0; i < g_nh_n; i++) {
@@ -2480,7 +2482,7 @@ static void npc_host_tick(DWORD now)
         e->pulls = g_nh[i].shots;
         n++;
     }
-    if (g_npcanim && seq % 2 == 0)
+    if (g_npcanim)
         for (i = 0; i < g_nh_n; i++) {
             NpcAnimPkt a;
             unsigned *v = g_nh[i].obj ? npc_animvars(g_nh[i].obj) : NULL;
@@ -2490,19 +2492,13 @@ static void npc_host_tick(DWORD now)
                       a.v[0x48], a.v[0x11], a.v[0x12]);
                 g_nh[i].lastact = a.v[0x58];
             }
-            /* only when the inputs changed (at most 5 times a second per NPC) and every 3 s: one datagram per NPC five times
-             * a second came to ~90 messages a second with the rest, too much for the Steam relay */
+            /* right away when the action state changes (v58 action, v42 running, v11/v12/v48 calm or alert), otherwise
+             * every 2 s. "Only on change" was not enough: during an action the progress variables change every frame,
+             * and these datagrams were ~43 of the host's ~67 a second through the relay */
             {
-                unsigned hsum = 2166136261u;
-                int k2;
-                for (k2 = 0; k2 < NANM_VARS; k2++) {
-                    /* the joiner keeps its own movement variables, and they change every frame on a walking NPC */
-                    int own = 0, k3;
-                    for (k3 = 0; k3 < (int)sizeof g_anim_own; k3++) if (g_anim_own[k3] == k2) own = 1;
-                    if (!own) hsum = (hsum ^ a.v[k2]) * 16777619u;
-                }
-                if (hsum == g_nh[i].animhash && now - g_nh[i].animsent < 3000) continue;
-                g_nh[i].animhash = hsum; g_nh[i].animsent = now;
+                unsigned key = (a.v[0x58] * 31u + a.v[0x42]) * 31u + ((a.v[0x11] * 31u + a.v[0x12]) * 31u + a.v[0x48]);
+                if (key == g_nh[i].animhash && now - g_nh[i].animsent < 2000) continue;
+                g_nh[i].animhash = key; g_nh[i].animsent = now;
             }
             a.magic = NANM_MAGIC; a.id = g_nh[i].id;
             sendto(g_ns, (char *)&a, sizeof a, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
