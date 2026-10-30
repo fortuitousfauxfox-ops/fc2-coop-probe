@@ -474,7 +474,10 @@ static DWORD g_av_gone_at;   /* when the avatar entity vanished (the world was r
 static int g_rld_force;
 static int g_mk_sign = 1;     /* mapsign -1 flips the turn of the avatar arrow on the map if it turns the wrong way */
 static float g_mk_dbg[2];     /* mapdbg <dx> <dy>: extra offset of the avatar arrow in map units (test) */
-static char g_mk_arch[96] = "gadgets.ObjectiveIcons.PlayerPosition";   /* maparch <archetype>: the avatar arrow's look */
+/* maparch <archetype>: the avatar arrow's look. coop.PeerPosition is the player arrow with the yellow material of the
+ * underground mission arrow, added to the test copies' patch archive (tools make_peer_arrow.py); without it the
+ * player's own (green) arrow is used */
+static char g_mk_arch[96] = "coop.PeerPosition";
 static float g_mk_yaw;        /* mapyaw <degrees>: turn added for a model whose arrow points elsewhere at yaw 0 */
 static int g_mk_respawn;
 static void *np_slot(BYTE *obj, int slot, unsigned k0, unsigned k1, unsigned k2);
@@ -3345,7 +3348,7 @@ static void map_place(BYTE *self)
         memcpy(w, av + 0x60, sizeof w);
         memcpy(lp, me + 0x60, sizeof lp);
         okw = map_w2m(self, w, l); okp = map_w2m(self, lp, lp);
-        if (GetTickCount() - lastlog > 2000) {
+        if (GetTickCount() - lastlog > 10000) {
             lastlog = GetTickCount();
             logf_("map: avatar (%.1f %.1f) -> %d (%.4f %.4f), we (%.1f %.1f) -> %d (%.4f %.4f), mode %d region %d", w[0], w[1], okw, l[0], l[1],
                   *(float *)(me + 0x60), *(float *)(me + 0x64), okp, lp[0], lp[1], *(int *)(self + 0x138), *(int *)(self + 0x114));
@@ -3367,23 +3370,6 @@ static void map_place(BYTE *self)
             ((eflush_t)(g_base + 0x4DD4F0))(mk);
             ((eset3_t)(g_base + 0x4E01C0))(mk, 0, 0, a);
             mk_show(mk, 1);
-            if (logged < 3) {
-                /* where the arrows actually are in the map model's frame (rows of the model matrix, scale divided out) */
-                float *R = (float *)(mapobj + 0x30), *P = (float *)(mapobj + 0x60), q[2][3];
-                int k, r;
-                for (r = 0; r < 2; r++) {
-                    BYTE *o = r ? mk : pm;
-                    float d[3];
-                    for (k = 0; k < 3; k++) d[k] = *(float *)(o + 0x60 + 4 * k) - P[k];
-                    for (k = 0; k < 3; k++) {
-                        float *v = R + 4 * k, n2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-                        q[r][k] = n2 > 1e-12f ? (d[0] * v[0] + d[1] * v[1] + d[2] * v[2]) / n2 : 0;
-                    }
-                }
-                logf_("map: in the model frame: player arrow (%.4f %.4f %.4f), ours (%.4f %.4f %.4f); row lengths %.3f %.3f %.3f",
-                      q[0][0], q[0][1], q[0][2], q[1][0], q[1][1], q[1][2], sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]),
-                      sqrtf(R[4] * R[4] + R[5] * R[5] + R[6] * R[6]), sqrtf(R[8] * R[8] + R[9] * R[9] + R[10] * R[10]));
-            }
             if (logged++ < 3) logf_("map: avatar arrow local (%.4f %.4f), player (%.4f %.4f), yaw %.2f (ours %.2f); world: ours (%.3f %.3f %.3f) "
                                     "player arrow (%.3f %.3f %.3f), flags %08x / %08x", l[0], l[1], lp[0], lp[1], a, ang[2], *(float *)(mk + 0x60),
                                     *(float *)(mk + 0x64), *(float *)(mk + 0x68), *(float *)(pm + 0x60), *(float *)(pm + 0x64), *(float *)(pm + 0x68),
@@ -3432,6 +3418,11 @@ static void map_tick(DWORD now)
         lua_eval(code, out, sizeof out);
         g_mk_id = strtoull(out, NULL, 10);
         if (g_mk_id == 0xFFFFFFFFFFFFFFFFull) g_mk_id = 0;
+        if (!g_mk_id && strcmp(g_mk_arch, "gadgets.ObjectiveIcons.PlayerPosition")) {
+            logf_("map: no archetype %s (%s), using the player arrow", g_mk_arch, out);
+            strcpy(g_mk_arch, "gadgets.ObjectiveIcons.PlayerPosition");
+            return;
+        }
         g_mk_parent = NULL;
         logf_("map: avatar arrow spawned: %s", out);
     }
