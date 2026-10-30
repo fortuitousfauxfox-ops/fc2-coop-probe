@@ -1,4 +1,4 @@
-﻿<#
+<#
 Starts one side of a two-PC Far Cry 2 co-op probe session over Steam.
 
   host (PC A):  powershell -ExecutionPolicy Bypass -File scripts\start-coop.ps1 -Role host -TestDir <test copy> -SteamDll <steam_api64.dll>
@@ -109,21 +109,28 @@ try {
     if (-not (Get-ChildItem (Join-Path $pdir 'Saved Games') -Filter *.sav -ErrorAction SilentlyContinue)) { throw "no .sav in $pdir\Saved Games: Story Mode would offer only New Story" }
     Say "copy uses its own profile and save list: $pdir"
     if (Get-Process FarCry2 -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$bin\*" }) { throw 'this test copy is already running' }
-    if (Test-Path $log) { Move-Item $log (Join-Path $bin ("coop_probe.{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))) }
-    Remove-Item (Join-Path $bin 'coop_cmd.lua'), (Join-Path $bin 'coop_native.txt') -ErrorAction SilentlyContinue
-
-    $game = Start-Process (Join-Path $bin 'FarCry2.exe') -WorkingDirectory $bin -PassThru
-    Say "game started (pid $($game.Id)), window title $title"
-    $pl = WaitFor 'profile read' 60 { LogLines | Select-String 'CreateFileW .*GamerProfile\.xml' | Select-Object -First 1 }
-    Say "profile: $($pl.Line -replace '^\S+ \S+ ', '')"
-    Start-Sleep 6
-    $n = 0
-    while (-not (LogLines | Select-String '\.sav ') -and $n -lt 25) { Guard; Key 0x0D; $n++; Start-Sleep 4 }
-    $sl = LogLines | Select-String '\.sav ' | Select-Object -First 1
-    if (-not $sl) { throw 'the save was not opened after 25 Enter presses' }
-    Say "save: $($sl.Line -replace '^\S+ \S+ ', '')"
-    $id = WaitFor 'player id' 240 { try { $v = Lua 'tostring(GetLocalPlayerId())' } catch { if ("$_" -like 'timeout*') { $v = $null } else { throw } }; if ($v -match '^\d+$' -and $v -ne '0' -and $v -ne '18446744073709551615') { $v } }
-    Say "in the world, player id $id"
+    $reloadFlag = Join-Path $bin 'coop_reload.txt'
+    Remove-Item $reloadFlag -ErrorAction SilentlyContinue
+    # starts the game, presses Enter until the newest save is loaded and returns the player id (also used to start it
+    # again when the probe asks for a reload together with the host)
+    function StartGame {
+        if (Test-Path $log) { Move-Item $log (Join-Path $bin ("coop_probe.{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))) }
+        Remove-Item (Join-Path $bin 'coop_cmd.lua'), (Join-Path $bin 'coop_native.txt') -ErrorAction SilentlyContinue
+        $script:game = Start-Process (Join-Path $bin 'FarCry2.exe') -WorkingDirectory $bin -PassThru
+        Say "game started (pid $($game.Id)), window title $title"
+        $pl = WaitFor 'profile read' 60 { LogLines | Select-String 'CreateFileW .*GamerProfile\.xml' | Select-Object -First 1 }
+        Say "profile: $($pl.Line -replace '^\S+ \S+ ', '')"
+        Start-Sleep 6
+        $n = 0
+        while (-not (LogLines | Select-String '\.sav ') -and $n -lt 25) { Guard; Key 0x0D; $n++; Start-Sleep 4 }
+        $sl = LogLines | Select-String '\.sav ' | Select-Object -First 1
+        if (-not $sl) { throw 'the save was not opened after 25 Enter presses' }
+        Say "save: $($sl.Line -replace '^\S+ \S+ ', '')"
+        $pid_ = WaitFor 'player id' 240 { try { $v = Lua 'tostring(GetLocalPlayerId())' } catch { if ("$_" -like 'timeout*') { $v = $null } else { throw } }; if ($v -match '^\d+$' -and $v -ne '0' -and $v -ne '18446744073709551615') { $v } }
+        Say "in the world, player id $pid_"
+        $pid_
+    }
+    $id = StartGame
     if ($PlayerId -and $PlayerId -ne $id) { Say "WARNING: expected player id $PlayerId - is it the same save on both PCs?" }
 
     $relay = StartRelay
@@ -146,8 +153,25 @@ try {
     Say "probe connected to the relay (netstart $gamePort 127.0.0.1 $relayPort)"
 
     $avatar = $null; $last = Get-Date; $sample = Get-Date; $start = Get-Date
-    while (-not $game.HasExited -and (-not $Seconds -or ((Get-Date) - $start).TotalSeconds -lt $Seconds)) {
-        Start-Sleep -Milliseconds 500; Guard
+    while (-not $Seconds -or ((Get-Date) - $start).TotalSeconds -lt $Seconds) {
+        Start-Sleep -Milliseconds 500
+        if ($game.HasExited) {
+            # the probe ended the game to load the save the host just loaded (game over / reload on the host): make that
+            # save the newest one, start the game again (Continue loads it) and connect it to the running relay
+            if ($Role -ne 'join' -or -not (Test-Path $reloadFlag)) { break }
+            $name = (Get-Content $reloadFlag -TotalCount 1).Trim(); Remove-Item $reloadFlag
+            $sv = Join-Path (Join-Path $pdir 'Saved Games') $name
+            if ($name -notmatch '^[\w.-]+\.sav$' -or -not (Test-Path $sv)) { Say "reload asked for '$name', not in the save folder: stopping"; break }
+            Copy-Item $log (Join-Path $runDir ("coop_probe-until-{0:HHmmss}.log" -f (Get-Date))) -ErrorAction SilentlyContinue
+            (Get-Item $sv).LastWriteTime = Get-Date
+            Say "the host loaded ${name}: starting the game again with it"
+            $id = StartGame
+            Native "netstart $gamePort 127.0.0.1 $relayPort $id"
+            Say "probe connected to the relay again"
+            $avatar = $null
+            continue
+        }
+        Guard
         if (-not $avatar) { $a = LogLines | Select-String 'avatar spawned: (\d+)' | Select-Object -Last 1; if ($a) { $avatar = $a.Matches[0].Groups[1].Value; Say "avatar of the other player spawned: $avatar" } }
         if ($Role -eq 'join' -and $avatar -and ((Get-Date) - $sample).TotalSeconds -ge 2) {
             # position samples are only for the log: a probe slow to take the command file (10 s) used to end the run

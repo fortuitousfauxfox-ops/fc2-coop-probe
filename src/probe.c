@@ -198,6 +198,8 @@ static HANDLE WINAPI h_CreateFileA(LPCSTR n, DWORD a, DWORD sh, LPSECURITY_ATTRI
     return h;
 }
 static DWORD g_sav_tick;   /* when the game first opened a save (coop_auto.txt runs a few seconds later) */
+static wchar_t g_sav_last[MAX_PATH];   /* the save the game read last, and how many it has read: a load */
+static volatile LONG g_sav_loads;
 static BYTE *g_base;
 static int safe_read(const void *addr, void *buf, size_t n);
 static HANDLE WINAPI h_CreateFileW(LPCWSTR n, DWORD a, DWORD sh, LPSECURITY_ATTRIBUTES sa, DWORD cd, DWORD fl, HANDLE t)
@@ -205,6 +207,10 @@ static HANDLE WINAPI h_CreateFileW(LPCWSTR n, DWORD a, DWORD sh, LPSECURITY_ATTR
     HANDLE h = o_CreateFileW(n, a, sh, sa, cd, fl, t); DWORD le = GetLastError(); /* our logging must not change the caller's error code (WSAEWOULDBLOCK) */
     if (n && (wcsstr(n, L"av") || wcsstr(n, L"Saved") || wcsstr(n, L"Documents") || wcsstr(n, L"Profile"))) logf_("CreateFileW %ls acc=%lx disp=%lu -> %s", n, a, cd, h == INVALID_HANDLE_VALUE ? "FAIL" : "ok");
     if (n && !g_sav_tick && wcsstr(n, L".sav") && h != INVALID_HANDLE_VALUE) g_sav_tick = GetTickCount() | 1;
+    if (n && wcsstr(n, L".sav") && h != INVALID_HANDLE_VALUE && !(a & (GENERIC_WRITE | FILE_WRITE_DATA)) && wcslen(n) < MAX_PATH) {
+        wcscpy(g_sav_last, n);
+        InterlockedIncrement(&g_sav_loads);
+    }
     if (n && g_base && wcsstr(n, L".sav")) {
         /* who reads or writes a save: return addresses into Dunia.dll on the stack (to find the engine's save/load) */
         DWORD *sp = (DWORD *)__builtin_frame_address(0), v;
@@ -458,6 +464,8 @@ static unsigned long long g_dd_id;   /* dumpd: NPC whose desired-state block is 
 static DWORD g_dd_until;  /* hit sync on by default; stimlog turns on event logging */
 static void av_remove(void);
 static void av_forget(void);
+static DWORD g_av_gone_at;
+static int g_rld_force;   /* when the avatar entity vanished (the world was rebuilt: a load) */
 static void *np_slot(BYTE *obj, int slot, unsigned k0, unsigned k1, unsigned k2);
 static int g_ws_role;
 static BYTE *env_obj(void);
@@ -1003,6 +1011,10 @@ static void native_cmd(const char *ln)
         { const char *sp = strchr(ln + 6, ' '); if (sp) secs = atoi(sp + 1); }
         g_dd_until = GetTickCount() + secs * 1000u;
         logf_("dumpd: NPC %llu for %d s", g_dd_id, secs);
+    } else if (strcmp(ln, "rldsend") == 0) {
+        /* rldsend (host): send the reload message for the save we read last, as after a load (test) */
+        g_rld_force = 1;
+        logf_("rldsend: reload message for %ls requested", g_sav_last);
     } else if (strncmp(ln, "savegame", 8) == 0) {
         /* the pause menu's save button: FUN_10735f20(char), a method of the menu page (vtable slot at RVA E9E104) that
          * takes its context from the game's globals and returns with RET 4; 0 saves as "quicksave.<n>", the game names
@@ -2973,6 +2985,7 @@ static void av_tick(DWORD now)
         else if (!gone) gone = now | 1;
         else if (now - gone > 1500 && now - g_av_lastspawn > 5000) {
             logf_("avatar %llu is gone from the world (a load?), a new one will be spawned", g_av_id);
+            g_av_gone_at = now;
             gone = 0;
             av_forget();
             return;
@@ -3117,6 +3130,103 @@ static int player_ready(unsigned long long me)
     if (!since) since = GetTickCount() | 1;
     return GetTickCount() - since >= 3000;   /* was 12 s; the encoder calls are guarded now (enc_safe) */
 }
+/* ---- reload together (RLD1) ----
+ * A game over or a load on the host rolls its world back to a save, and the joiner stayed in the old one (NPCs no
+ * longer matched). The host sends the save's file name, size and CRC-32 for 6 s after it read it; a joiner holding the
+ * same file writes coop_reload.txt (the file name) next to the game and ends its process. start-coop.ps1 sees the file,
+ * makes that save the newest and starts the game again, so it loads the host's save and connects as at the first
+ * join. A joiner without the same file only logs it (sending the save over the link is not done yet). */
+#define RLD_MAGIC 0x31444C52u
+typedef struct { unsigned magic, seq, size, crc; char name[64]; } RldPkt;
+static int file_crc(const wchar_t *path, unsigned *size, unsigned *crc)
+{
+    static unsigned tab[256];
+    BYTE buf[65536];
+    DWORD got;
+    unsigned c = 0xFFFFFFFFu, n = 0, i, k;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    if (!tab[1]) for (i = 0; i < 256; i++) { unsigned r = i; for (k = 0; k < 8; k++) r = (r >> 1) ^ (0xEDB88320u & (0u - (r & 1))); tab[i] = r; }
+    while (ReadFile(f, buf, sizeof buf, &got, NULL) && got) { for (i = 0; i < got; i++) c = tab[(c ^ buf[i]) & 0xFF] ^ (c >> 8); n += got; }
+    CloseHandle(f);
+    *size = n; *crc = ~c;
+    return 1;
+}
+static void rld_host_tick(DWORD now)
+{
+    static LONG seen = -1;
+    static DWORD since, last, read_at;
+    static unsigned sent;
+    static RldPkt pk;
+    if (g_npc_role != 1 || g_ns == INVALID_SOCKET || g_net_rx == 0) return;
+    if (seen < 0) { seen = g_sav_loads; return; }
+    /* a save read alone can be the menu's save list; it counts as a load once the world was rebuilt as well (our
+     * avatar vanished) within 60 s */
+    if (g_sav_loads != seen && !read_at) read_at = now | 1;
+    if (read_at && (int)(now - read_at) > 60000) { read_at = 0; seen = g_sav_loads; }   /* signed: read_at is now | 1 */
+    if ((read_at && g_av_gone_at && (int)(g_av_gone_at - read_at) >= -1) || g_rld_force) {
+        read_at = 0; g_rld_force = 0;
+        const wchar_t *b = wcsrchr(g_sav_last, L'\\');
+        seen = g_sav_loads; since = now | 1;
+        memset(&pk, 0, sizeof pk);
+        pk.magic = RLD_MAGIC; pk.seq = now | 1;   /* unique per load: the joiner ignores a number it has handled */
+        WideCharToMultiByte(CP_ACP, 0, b ? b + 1 : g_sav_last, -1, pk.name, sizeof pk.name - 1, NULL, NULL);
+        logf_("reload: we loaded %s - the joiner reloads it too", pk.name);
+    }
+    if (!since) return;
+    if ((int)(now - since) > 6000) { since = 0; logf_("reload: %u message(s) sent (%s, %u bytes, crc %08x)", sent, pk.name, pk.size, pk.crc); sent = 0; return; }
+    if ((int)(now - since) < 1000 || now - last < 500) return;   /* let the game finish reading the file */
+    last = now;
+    if (!pk.size && !file_crc(g_sav_last, &pk.size, &pk.crc)) { logf_("reload: cannot read %ls", g_sav_last); since = 0; return; }
+    if (sendto(g_ns, (char *)&pk, sizeof pk, 0, (struct sockaddr *)&g_peer, sizeof g_peer) == sizeof pk) sent++;
+    else logf_("reload: send failed (%d)", WSAGetLastError());
+}
+static void rld_rx(const RldPkt *pk)
+{
+    static unsigned done;
+    wchar_t path[MAX_PATH], *b;
+    unsigned size, crc;
+    char flag[MAX_PATH];
+    FILE *f;
+    if (pk->seq != done) logf_("reload: message %u from the host: %.63s (role %d, our last save %ls)", pk->seq, pk->name, g_npc_role, g_sav_last);
+    if (g_npc_role != 2 || pk->seq == done || !g_sav_last[0] || memchr(pk->name, 0, sizeof pk->name) == NULL ||
+        strchr(pk->name, '\\') || strchr(pk->name, '/') || strstr(pk->name, "..")) return;
+    done = pk->seq;
+    wcscpy(path, g_sav_last);
+    b = wcsrchr(path, L'\\');
+    if (!b) return;
+    MultiByteToWideChar(CP_ACP, 0, pk->name, -1, b + 1, MAX_PATH - (int)(b + 1 - path));
+    if (!file_crc(path, &size, &crc) || size != pk->size || crc != pk->crc) {
+        logf_("reload: the host loaded %s (%u bytes, crc %08x), ours is %s - not following", pk->name, pk->size, pk->crc,
+              GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES ? "missing" : "different");
+        return;
+    }
+    strcpy(flag, g_cmdpath);
+    strcpy(strrchr(flag, '\\') + 1, "coop_reload.txt");
+    if (!(f = fopen(flag, "w"))) { logf_("reload: cannot write %s", flag); return; }
+    fprintf(f, "%s\n", pk->name);
+    fclose(f);
+    logf_("reload: the host loaded %s, ours matches (crc %08x): ending the game, start-coop restarts it with that save", pk->name, crc);
+    g_quitting = 1;
+    TerminateProcess(GetCurrentProcess(), 0);
+}
+/* our player's health, logged when it changes (to tell real damage from hit reactions) */
+static void hp_tick(DWORD now)
+{
+    static DWORD last;
+    static float prev = -1;
+    void *hd = NULL;
+    BYTE *me;
+    float hp, mx;
+    if (now - last < 250) return;
+    last = now;
+    me = g_net_id ? entity_obj(g_net_id, &hd) : NULL;
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!me) return;
+    hp = npc_hp(me, &mx);
+    if (prev >= 0 && fabsf(hp - prev) >= 1.0f) logf_("health: %.0f -> %.0f of %.0f", prev, hp, mx);
+    prev = hp;
+}
 static void net_tick(void)
 {
     DWORD now;
@@ -3200,6 +3310,7 @@ static void net_tick(void)
         if (r == (int)sizeof(NpcAnimPkt) && rb.magic == NANM_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_anim_rx((const NpcAnimPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NSHT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_shot_apply((const NpcHitPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NHIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_hit_apply((const NpcHitPkt *)&rb); continue; }
+        if (r == (int)sizeof(RldPkt) && rb.magic == RLD_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) rld_rx((const RldPkt *)&rb); continue; }
         if (r == (int)sizeof(HitPkt) && rb.magic == HIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) hit_apply((const HitPkt *)&rb); continue; }
         if (r >= 12 && rb.magic == NPC_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_rx(&rb, r); continue; }
         if (r > (int)sizeof q4) { g_net_drop++; continue; }
@@ -3269,6 +3380,8 @@ static void net_tick(void)
         }
     }
     av_tick(now);
+    rld_host_tick(now);
+    hp_tick(now);
     world_tick(now);
     npc_host_tick(now);
     hit_tick(now);
