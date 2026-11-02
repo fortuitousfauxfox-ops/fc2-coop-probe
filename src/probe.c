@@ -3868,6 +3868,192 @@ static int __cdecl h_gettop(void *L)
     return o_gettop(L);
 }
 
+/* ---- "Cooperative" under Story Mode ----
+ * Menus are code, not data (menus.fat holds only DLC map pictures, ui\*.mgb only layout). A list page builds its
+ * rows as action objects passed to FUN_10cdbb80(page, UTF-16 label, char enabled, action) (thiscall, RET 0xC);
+ * vf+0x40 FUN_10cdba50 clears the list (deletes each action through its vf 0 with 1); vf+0x10 is the page's update
+ * (thiscall, float dt). The Story Mode page (vtable 0x10EBB120) gets its rows from FUN_108c9c50 (ECX = page: Continue
+ * and Load Game when there are saves, New Story), called from its update once the save list is read.
+ * We detour FUN_108c9c50: the page first shows "Singleplayer" (the game's own rows) and "Cooperative" (host or join,
+ * then the same Continue / Load Game rows, with start-coop doing the Steam side). Labels are English: the English
+ * menu font has no Cyrillic (Russian text showed as "?"). Our rows reuse the Quit action: 0x78 bytes from the game
+ * allocator FUN_10228f30(size, 0) (cdecl), base ctor FUN_10188e20(page, 0) (thiscall), vtable 0x10EA23EC (8 slots);
+ * its slot 5 (thiscall, one stack argument, called from the action's state machine FUN_101886f0) shows the Quit
+ * box (FUN_10707760) and returns 1, our copy of the vtable has our function there and byte
+ * +0x74 holds the row code. Sub-pages are the list cleared and built again from the update hook (never inside the
+ * action, which the clear deletes). Once the page has not updated for a second (left), it starts at the top again.
+ * Bridge to start-coop.ps1 -Role menu: we write bin\coop_menu.txt (host | join | pick <steamid> | cancel), it writes
+ * bin\coop_menu_state.txt (UTF-8: line 1 the status, then "<steamid>\t<label>" per friend's game found). */
+#define SM_VT    0xEBB120
+#define SM_ROWS  0x8C9C50
+#define MM_MAXH  4
+enum { MM_TOP, MM_SP, MM_COOP, MM_FRIENDS, MM_PLAY };
+static void *g_mm_rows, *g_mm_update;    /* trampoline to FUN_108c9c50, the page's own update */
+static void *g_mm_vt[8];                 /* Quit action vtable with our slot 5 */
+static int g_mm_sub;
+static volatile LONG g_mm_click = -1;
+static int g_mm_state;                   /* start-coop wrote a state file (it runs in menu mode) */
+static wchar_t g_mm_status[96];
+static int g_mm_nh;
+static char g_mm_hid[MM_MAXH][24];
+static wchar_t g_mm_hl[MM_MAXH][96];
+static FILETIME g_mm_stamp;
+static DWORD g_mm_poll, g_mm_seen;
+static char g_mm_dir[MAX_PATH];          /* bin\ with the trailing backslash */
+
+/* slot 5 is thiscall with one stack argument (the Quit one ends RET 4); returns "done" in AL */
+static int __attribute__((thiscall)) mm_act(BYTE *self, void *arg)
+{
+    (void)arg;
+    InterlockedExchange(&g_mm_click, self[0x74]);
+    return 1;
+}
+static void mm_add(void *page, const wchar_t *label, int code, int enabled)
+{
+    BYTE *a = ((void *(__cdecl *)(unsigned, int))(g_base + 0x228F30))(0x78, 0);
+    if (!a) return;
+    ((void *(__attribute__((thiscall)) *)(void *, void *, int))(g_base + 0x188E20))(a, page, 0);
+    *(void ***)a = g_mm_vt;
+    a[0x74] = (BYTE)code;
+    ((int (__attribute__((thiscall)) *)(void *, const wchar_t *, char, void *))(g_base + 0xCDBB80))(page, label, (char)enabled, a);
+}
+static void mm_request(const char *text)
+{
+    char p[MAX_PATH], t[MAX_PATH];
+    FILE *f;
+    snprintf(t, sizeof t, "%scoop_menu.tmp", g_mm_dir);
+    snprintf(p, sizeof p, "%scoop_menu.txt", g_mm_dir);
+    if (!(f = fopen(t, "wb"))) { logf_("menu: cannot write %s", t); return; }
+    fprintf(f, "%s\r\n", text);
+    fclose(f);
+    MoveFileExA(t, p, MOVEFILE_REPLACE_EXISTING);
+    logf_("menu: request '%s' for start-coop", text);
+}
+/* re-reads coop_menu_state.txt when it changed (or force); 1 = something changed */
+static int mm_poll(int force)
+{
+    char p[MAX_PATH], buf[4096], *ln, *nx, *tab;
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    FILETIME st = {0, 0};
+    int have, n = 0;
+    FILE *f;
+    DWORD now = GetTickCount();
+    if (!force && now - g_mm_poll < 1000) return 0;
+    g_mm_poll = now;
+    snprintf(p, sizeof p, "%scoop_menu_state.txt", g_mm_dir);
+    have = GetFileAttributesExA(p, GetFileExInfoStandard, &fa);
+    if (have) st = fa.ftLastWriteTime;
+    if (!force && have == g_mm_state && CompareFileTime(&st, &g_mm_stamp) == 0) return 0;
+    g_mm_state = have; g_mm_stamp = st;
+    g_mm_status[0] = 0; g_mm_nh = 0;
+    if (!have || !(f = fopen(p, "rb"))) return 1;
+    n = (int)fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n > 0 ? n : 0] = 0;
+    ln = buf;
+    if (!strncmp(ln, "\xEF\xBB\xBF", 3)) ln += 3;
+    for (n = 0; ln && *ln; ln = nx, n++) {
+        if ((nx = strchr(ln, '\n'))) *nx++ = 0;
+        if (*ln && ln[strlen(ln) - 1] == '\r') ln[strlen(ln) - 1] = 0;
+        if (n == 0) { MultiByteToWideChar(CP_UTF8, 0, ln, -1, g_mm_status, 96); g_mm_status[95] = 0; continue; }
+        if (!(tab = strchr(ln, '\t')) || tab == ln || g_mm_nh >= MM_MAXH) continue;
+        *tab = 0;
+        lstrcpynA(g_mm_hid[g_mm_nh], ln, 24);
+        if (!MultiByteToWideChar(CP_UTF8, 0, tab + 1, -1, g_mm_hl[g_mm_nh], 96)) lstrcpyW(g_mm_hl[g_mm_nh], L"?");
+        g_mm_hl[g_mm_nh][95] = 0;
+        g_mm_nh++;
+    }
+    return 1;
+}
+static void __attribute__((thiscall)) mm_rows(void *page)
+{
+    int k;
+    mm_poll(1);
+    switch (g_mm_sub) {
+    case MM_TOP:
+        mm_add(page, L"Singleplayer", 7, 1);
+        mm_add(page, L"Cooperative", 1, 1);
+        break;
+    case MM_SP:
+        ((void (__attribute__((thiscall)) *)(void *))g_mm_rows)(page);
+        mm_add(page, L"Back", 4, 1);
+        break;
+    case MM_COOP:
+        if (!g_mm_state) mm_add(page, L"Needs start-coop -Role menu", 6, 0);
+        mm_add(page, L"Host a game", 2, g_mm_state);
+        mm_add(page, L"Join a friend's game", 3, g_mm_state);
+        mm_add(page, L"Back", 4, 1);
+        break;
+    case MM_FRIENDS:
+        for (k = 0; k < g_mm_nh; k++) mm_add(page, g_mm_hl[k], 10 + k, 1);
+        mm_add(page, g_mm_status[0] ? g_mm_status : L"Looking for friends' games...", 6, 0);
+        mm_add(page, L"Back", 4, 1);
+        break;
+    default:   /* MM_PLAY: the game's own rows to load the save, our status, a way out */
+        ((void (__attribute__((thiscall)) *)(void *))g_mm_rows)(page);
+        if (g_mm_status[0]) mm_add(page, g_mm_status, 6, 0);
+        mm_add(page, L"Stop co-op", 5, 1);
+    }
+    if (g_mm_sub != MM_SP && g_mm_sub != MM_PLAY) *(int *)((BYTE *)page + 0x204) = -1;   /* the New Story row */
+    /* the end of FUN_108c9c50: give the list the input focus (without it no row is highlighted, Enter does nothing) */
+    ((void (__attribute__((thiscall)) *)(void *, int, void *))(g_base + 0xAA5180))(*(void **)((BYTE *)page + 0x14), 0, *(void **)((BYTE *)page + 8));
+}
+static void mm_rebuild(void *page)
+{
+    ((void (__attribute__((thiscall)) *)(void *))(g_base + 0xCDBA50))(page);
+    mm_rows(page);
+}
+static void __attribute__((thiscall)) mm_update(void *page, void *dt)
+{
+    LONG c;
+    char req[48];
+    DWORD now = GetTickCount();
+    if (now - g_mm_seen > 1000 && g_mm_sub != MM_TOP) { logf_("menu: Story Mode page entered again, top level"); g_mm_sub = MM_TOP; }
+    g_mm_seen = now;
+    ((void (__attribute__((thiscall)) *)(void *, void *))g_mm_update)(page, dt);
+    if (g_quitting) return;
+    /* the chosen row's action is still queued on the page (+0x54 list, +0x58 count) until its state machine is done:
+     * clearing the list deletes it, so wait for an empty queue */
+    if (*(int *)((BYTE *)page + 0x58)) return;
+    c = InterlockedExchange(&g_mm_click, -1);
+    if (c < 0) {
+        if (mm_poll(0) && g_mm_sub >= MM_COOP) mm_rebuild(page);
+        return;
+    }
+    logf_("menu: row %ld chosen (page %d)", c, g_mm_sub);
+    if (c == 7) g_mm_sub = MM_SP;
+    else if (c == 1) g_mm_sub = MM_COOP;
+    else if (c == 2) { mm_request("host"); g_mm_sub = MM_PLAY; }
+    else if (c == 3) { mm_request("join"); g_mm_sub = MM_FRIENDS; }
+    else if (c == 4) { if (g_mm_sub == MM_FRIENDS) mm_request("cancel"); g_mm_sub = g_mm_sub == MM_FRIENDS ? MM_COOP : MM_TOP; }
+    else if (c == 5) { mm_request("cancel"); g_mm_sub = MM_COOP; }
+    else if (c >= 10 && c < 10 + g_mm_nh) { snprintf(req, sizeof req, "pick %s", g_mm_hid[c - 10]); mm_request(req); g_mm_sub = MM_PLAY; }
+    else return;
+    mm_rebuild(page);
+}
+static void menu_install(void)
+{
+    void **vt = (void **)(g_base + SM_VT);
+    BYTE *rows = g_base + SM_ROWS;
+    DWORD old;
+    char *s;
+    GetModuleFileNameA(g_self, g_mm_dir, MAX_PATH);
+    if ((s = strrchr(g_mm_dir, '\\'))) s[1] = 0;
+    /* SUB ESP,0x9C at FUN_108c9c50 (6 bytes, moved to the trampoline) */
+    if (vt[4] != (void *)(g_base + 0x8C9FA0) || memcmp(rows, "\x81\xEC\x9C\x00\x00\x00", 6) ||
+        *(void **)(g_base + 0xEA23EC + 5 * 4) != (void *)(g_base + 0x7F8EE0)) {
+        logf_("menu: unexpected Story Mode page / Quit action code, no co-op rows");
+        return;
+    }
+    memcpy(g_mm_vt, g_base + 0xEA23EC, sizeof g_mm_vt);
+    g_mm_vt[5] = (void *)mm_act;
+    if (!VirtualProtect(vt + 4, 4, PAGE_READWRITE, &old)) { logf_("menu: vtable not writable (%lu)", GetLastError()); return; }
+    g_mm_update = vt[4]; vt[4] = (void *)mm_update;
+    VirtualProtect(vt + 4, 4, old, &old);
+    g_mm_rows = make_detour(rows, 6, (void *)mm_rows, 1);
+    logf_("menu: Singleplayer / Cooperative rows hooked into Story Mode (bridge files in %s)", g_mm_dir);
+}
+
 static void install_lua(HMODULE m)
 {
     char *s;
@@ -3884,6 +4070,7 @@ static void install_lua(HMODULE m)
     o_gettop = (void *)make_detour(g_base + RVA_GETTOP, 7, h_gettop, 1);
     make_detour(g_base + RVA_ALERT, 6, h_alert, 0);
     logf_("lua hooks installed (gettop, _ALERT); command file %s", g_cmdpath);
+    menu_install();
 }
 
 static DWORD WINAPI watcher(LPVOID p)

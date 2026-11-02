@@ -13,10 +13,18 @@ picks it - then keeps rejoining that host's lobby; -Lobby <id> skips the list, s
 the link state every 5 s. The join side also samples the avatar's and the own player's position every 2 s.
 Stop with Ctrl+C or by closing the game; the logs then go to <test copy>\coop-runs\<time>\.
 
+  from the game menu:  ... start-coop.ps1 -Role menu -TestDir <test copy> -SteamDll <steam_api64.dll>
+The game starts at its menu and nothing presses keys. Story Mode shows Singleplayer and Cooperative; under
+Cooperative, "Host a game" opens the friends lobby, "Join a friend's game" lists the friends hosting one (Join Game
+in Steam works too while that list is open). Then the game's own Continue / Load Game rows load the save (the
+joiner's copy of the host's save is made the newest, so Continue loads it). The probe and this script talk through
+bin\coop_menu.txt (the probe's request) and bin\coop_menu_state.txt (status and friends' games for the menu).
+
 Kill switch: if the probe log ever names the real profile folder (My Games\Far Cry 2\), the game is killed at once.
 #>
 param(
-    [Parameter(Mandatory = $true)][ValidateSet('host', 'join')][string]$Role,
+    # menu: host or join is picked in the game (Story Mode > Cooperative)
+    [Parameter(Mandatory = $true)][ValidateSet('host', 'join', 'menu')][string]$Role,
     [Parameter(Mandatory = $true)][string]$TestDir,
     [Parameter(Mandatory = $true)][string]$SteamDll,
     [string]$Python = 'python',
@@ -41,9 +49,15 @@ $kit = $PSScriptRoot
 $relayPy = if (Test-Path (Join-Path $kit 'fc2_relay.py')) { Join-Path $kit 'fc2_relay.py' } else { Join-Path $kit '..\relay\fc2_relay.py' }
 $bin = Join-Path $TestDir 'bin'
 $log = Join-Path $bin 'coop_probe.log'
-$title = if ($Role -eq 'host') { 'A' } else { 'B' }
-$gamePort = if ($Role -eq 'host') { 9101 } else { 9102 }
-$relayPort = if ($Role -eq 'host') { 9201 } else { 9202 }
+$menuMode = $Role -eq 'menu'
+# menu mode: the window keeps the copy's letter (test-a -> A), the role comes from the game menu
+$title = if ($menuMode) { if ((Split-Path $TestDir -Leaf) -match '-([a-z])$') { $Matches[1].ToUpper() } else { 'FC2' } } elseif ($Role -eq 'host') { 'A' } else { 'B' }
+function SetRole($r) {
+    $script:Role = $r
+    $script:gamePort = if ($r -eq 'host') { 9101 } else { 9102 }
+    $script:relayPort = if ($r -eq 'host') { 9201 } else { 9202 }
+}
+if (-not $menuMode) { SetRole $Role }
 $runDir = Join-Path $TestDir ("coop-runs\{0:yyyyMMdd-HHmmss}-{1}" -f (Get-Date), $Role)
 New-Item -ItemType Directory -Force $runDir | Out-Null
 function Say($m) {
@@ -121,16 +135,31 @@ function AppIdHint($errFile) {
 # co-op lobby and the owner presses a host's number; Join Game on a friend in the Steam friends list or an accepted
 # invite to the host's lobby also picks it (the listing runs under our AppID, so Steam hands those to it instead of
 # starting the real game). Returns 'friend:<host steamid>' so the relay keeps rejoining that host's lobby.
-function PickHost {
+function StartListing($out) {
     $wd = Join-Path $kit 'steam-run'; New-Item -ItemType Directory -Force $wd | Out-Null
-    $out = Join-Path $runDir 'lobbies.json'; $joinFile = "$out.join"; $myBuild = Sha8 (Join-Path $bin 'dinput8.dll')
-    $interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
-    Remove-Item $out, $joinFile -ErrorAction SilentlyContinue
+    Remove-Item $out, "$out.join" -ErrorAction SilentlyContinue
     $largs = @('-I', '-u', "`"$relayPy`"", '--transport', 'steam', '--steam-dll', "`"$SteamDll`"", '--appid', $AppId, '--list', "`"$out`"", '--watch', '--seconds', 3600)
     # test with one Steam account: lobby ids to list besides the friends' ones (our own host lobby)
     foreach ($x in "$env:FC2COOP_LIST_EXTRA" -split ',') { if ($x -match '^\d+$') { $largs += @('--list-extra', $x) } }
-    $lp = Start-Process $Python -ArgumentList $largs -WorkingDirectory $wd -WindowStyle Hidden -PassThru `
+    Start-Process $Python -ArgumentList $largs -WorkingDirectory $wd -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $runDir 'relay-list.log') -RedirectStandardError (Join-Path $runDir 'relay-list.err')
+}
+# friends' co-op lobbies the listing wrote last (ForEach-Object: PowerShell 5.1 passes a JSON array on as one object)
+function ReadHosts($out) { @(try { Get-Content $out -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json | ForEach-Object { $_ } } catch { }) }
+# what differs between a host's lobby and this copy: probe build, the save it plays
+function HostNotes($h) {
+    $notes = @(); $myBuild = Sha8 (Join-Path $bin 'dinput8.dll')
+    if ($h.build -and $h.build -ne $myBuild) { $notes += "other probe build $($h.build), ours $myBuild" }
+    if ($h.save) {
+        $mine = Join-Path (Join-Path $pdir 'Saved Games') $h.save
+        if (-not (Test-Path $mine)) { $notes += "we have no $($h.save)" } elseif ($h.savehash -and (Sha8 $mine) -ne $h.savehash) { $notes += "our $($h.save) differs" }
+    }
+    $notes
+}
+function PickHost {
+    $out = Join-Path $runDir 'lobbies.json'; $joinFile = "$out.join"
+    $interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+    $lp = StartListing $out
     try {
         $shown = $null; $waitSaid = $false
         while ($true) {
@@ -143,20 +172,14 @@ function PickHost {
                 AppIdHint (Join-Path $runDir 'relay-list.err')
                 throw ("the lobby listing stopped: " + (Get-Content (Join-Path $runDir 'relay-list.err') -ErrorAction SilentlyContinue | Select-Object -Last 1))
             }
-            # ForEach-Object: PowerShell 5.1 passes a JSON array on as one object
-            $hosts = @(try { Get-Content $out -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json | ForEach-Object { $_ } } catch { })
+            $hosts = @(ReadHosts $out)
             $now = ($hosts | ForEach-Object { $_.lobby }) -join ','
             if ($hosts.Count -gt 0 -and $now -ne $shown) {
                 $shown = $now
                 # Write-Host: the function's output is its return value
                 Write-Host ''
                 for ($i = 0; $i -lt $hosts.Count; $i++) {
-                    $h = $hosts[$i]; $notes = @()
-                    if ($h.build -and $h.build -ne $myBuild) { $notes += "other probe build $($h.build), ours $myBuild" }
-                    if ($h.save) {
-                        $mine = Join-Path (Join-Path $pdir 'Saved Games') $h.save
-                        if (-not (Test-Path $mine)) { $notes += "we have no $($h.save)" } elseif ($h.savehash -and (Sha8 $mine) -ne $h.savehash) { $notes += "our $($h.save) differs" }
-                    }
+                    $h = $hosts[$i]; $notes = HostNotes $h
                     Write-Host ("  {0}) {1}   save {2}{3}" -f ($i + 1), $h.steam_name, $(if ($h.save) { $h.save } else { '?' }), $(if ($notes) { '   WARNING: ' + ($notes -join '; ') } else { '' }))
                 }
                 if ($hosts.Count -eq 1 -or -not $interactive) {
@@ -208,6 +231,82 @@ function PickFriend {
     }
 }
 
+# ---- menu mode: the probe's Story Mode > Cooperative rows ----
+# bin\coop_menu_state.txt (written here, read by the probe; it exists while this script runs): line 1 the status the
+# menu shows, then "<host steamid><TAB><label>" per friend's game; bin\coop_menu.txt (written by the probe, removed
+# here): host | join | pick <steamid> | cancel. The menu font has no Cyrillic, Steam names in it may show as "?".
+$menuReq = Join-Path $bin 'coop_menu.txt'; $menuStateFile = Join-Path $bin 'coop_menu_state.txt'
+function MenuState([string]$status, $hosts) {
+    $lines = @($status) + @($hosts | Where-Object { $_ } | ForEach-Object { "$($_.host)`t$($_.label)" })
+    $tmp = "$menuStateFile.tmp"
+    [IO.File]::WriteAllText($tmp, ($lines -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding $false))
+    Move-Item $tmp $menuStateFile -Force
+}
+function MenuRequest {
+    if (-not (Test-Path $menuReq)) { return }
+    $r = try { (Get-Content $menuReq -TotalCount 1 -ErrorAction Stop).Trim() } catch { return }
+    Remove-Item $menuReq -ErrorAction SilentlyContinue
+    Say "menu request: $r" | Write-Host
+    $r
+}
+# waits in the game menu until the player hosts (returns 'host') or picks a friend's game (returns 'friend:<steamid>',
+# Join Game in Steam counts while the friends' list is open); makes the joiner's copy of the host's save the newest
+function MenuPick {
+    $out = Join-Path $runDir 'lobbies.json'; $lp = $null; $hosts = @(); $shown = $null
+    MenuState ''
+    Say 'waiting for Story Mode > Cooperative in the game' | Write-Host
+    try {
+        while ($true) {
+            Guard; if ($game.HasExited) { throw 'the game exited' }
+            $r = MenuRequest; $h = $null
+            if ($r -eq 'host') { $script:menuReady = 'Lobby open: load a game'; return 'host' }
+            if ($r -eq 'join' -and -not $lp) { $lp = StartListing $out; $shown = $null; MenuState "Looking for friends' games..." }
+            if ($r -eq 'cancel') {
+                if ($lp -and -not $lp.HasExited) { Stop-Process -Id $lp.Id -Force -ErrorAction SilentlyContinue }
+                $lp = $null; MenuState ''
+            }
+            if ($r -match '^pick (\d+)$') { $sid = $Matches[1]; $h = $hosts | Where-Object { "$($_.host)" -eq $sid } | Select-Object -First 1 }
+            if ($lp -and -not $h) {
+                if (Test-Path "$out.join") {
+                    $j = Get-Content "$out.join" -Raw -Encoding UTF8 | ConvertFrom-Json
+                    Say "Steam Join Game / invite: host $($j.steam_name)" | Write-Host
+                    $h = [pscustomobject]@{ host = $j.host; steam_name = $j.steam_name; save = $null; savehash = $null }
+                    $h2 = $hosts | Where-Object { "$($_.host)" -eq "$($j.host)" } | Select-Object -First 1
+                    if ($h2) { $h = $h2 }
+                } elseif ($lp.HasExited) {
+                    AppIdHint (Join-Path $runDir 'relay-list.err')
+                    MenuState 'Steam listing stopped'; $lp = $null
+                } else {
+                    $hosts = @(ReadHosts $out)
+                    $now = ($hosts | ForEach-Object { "$($_.lobby)" }) -join ','
+                    if ($now -ne $shown -and (Test-Path $out)) {
+                        $shown = $now
+                        $rows = @($hosts | Select-Object -First 4 | ForEach-Object {
+                            $n = HostNotes $_
+                            [pscustomobject]@{ host = $_.host; label = "$($_.steam_name)$(if ($n) { ' (!)' })" } })
+                        MenuState $(if ($hosts.Count) { 'Pick a friend' } else { 'No friend is hosting yet' }) $rows
+                        foreach ($x in $hosts) { Say "friend's game: $($x.steam_name) save $($x.save) $((HostNotes $x) -join '; ')" | Write-Host }
+                    }
+                }
+            }
+            if ($h) {
+                Say "host picked: $($h.steam_name) (save $($h.save), build $($h.build))" | Write-Host
+                $notes = @(HostNotes $h)
+                if ($notes) { Say "WARNING: $($notes -join '; ')" | Write-Host }
+                $sv = if ($h.save) { Join-Path (Join-Path $pdir 'Saved Games') $h.save }
+                if ($sv -and (Test-Path $sv) -and (-not $h.savehash -or (Sha8 $sv) -eq $h.savehash)) { (Get-Item $sv).LastWriteTime = Get-Date; $script:menuReady = "Continue loads $($h.save)" }
+                elseif ($h.save) { $script:menuReady = "Load $($h.save) (warning)" }
+                else { $script:menuReady = 'Load the host''s save' }
+                # one Steam account (FC2COOP_LIST_EXTRA): our own lobby, which friend:<id> never finds - join it by id
+                if ($h.lobby -and ("$env:FC2COOP_LIST_EXTRA" -split ',') -contains "$($h.lobby)") { return "$($h.lobby)" }
+                return "friend:$($h.host)"
+            }
+            Start-Sleep -Milliseconds 300
+        }
+    }
+    finally { if ($lp -and -not $lp.HasExited) { Stop-Process -Id $lp.Id -Force -ErrorAction SilentlyContinue } }
+}
+
 try {
     foreach ($f in 'FarCry2.exe', 'Dunia.dll', 'dinput8.dll') { if (-not (Test-Path (Join-Path $bin $f))) { throw "no bin\$f in $TestDir" } }
     if (-not (Test-Path $SteamDll)) { throw "no $SteamDll" }
@@ -230,43 +329,84 @@ try {
     Remove-Item $reloadFlag -ErrorAction SilentlyContinue
     # starts the game, presses Enter until the newest save is loaded and returns the player id (also used to start it
     # again when the probe asks for a reload together with the host)
-    function StartGame {
+    function LaunchGame {
         if (Test-Path $log) { Move-Item $log (Join-Path $bin ("coop_probe.{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))) }
         Remove-Item (Join-Path $bin 'coop_cmd.lua'), (Join-Path $bin 'coop_native.txt') -ErrorAction SilentlyContinue
         $script:game = Start-Process (Join-Path $bin 'FarCry2.exe') -WorkingDirectory $bin -PassThru
         Say "game started (pid $($game.Id)), window title $title"
         $pl = WaitFor 'profile read' 60 { LogLines | Select-String 'CreateFileW .*GamerProfile\.xml' | Select-Object -First 1 }
         Say "profile: $($pl.Line -replace '^\S+ \S+ ', '')"
-        Start-Sleep 6
-        $n = 0
-        while (-not (LogLines | Select-String '\.sav ') -and $n -lt 25) { Guard; Key 0x0D; $n++; Start-Sleep 4 }
+    }
+    # after a save was opened: the player id once the probe's Lua channel answers in the world
+    function PlayerInWorld {
         $sl = LogLines | Select-String '\.sav ' | Select-Object -First 1
-        if (-not $sl) { throw 'the save was not opened after 25 Enter presses' }
         Say "save: $($sl.Line -replace '^\S+ \S+ ', '')"
         $pid_ = WaitFor 'player id' 240 { try { $v = Lua 'tostring(GetLocalPlayerId())' } catch { if ("$_" -like 'timeout*') { $v = $null } else { throw } }; if ($v -match '^\d+$' -and $v -ne '0' -and $v -ne '18446744073709551615') { $v } }
         Say "in the world, player id $pid_"
         $pid_
     }
-    $id = StartGame | Select-Object -Last 1   # the function also returns what Say printed
-    if ($PlayerId -and $PlayerId -ne $id) { Say "WARNING: expected player id $PlayerId - is it the same save on both PCs?" }
-
-    $relay = StartRelay
-    $t0 = Get-Date
-    while ($true) {
-        Start-Sleep 3; Guard
-        if ($game.HasExited) { throw 'the game exited while waiting for the relay' }
-        $rl = Get-Content (Join-Path $runDir 'relay.log') -ErrorAction SilentlyContinue
-        if ($rl | Select-String 'peer is talking|LOBBY \d+ created|entered lobby') { break }
-        if ($relay.HasExited) {
-            Say ("relay stopped: " + (($rl | Select-Object -Last 1), (Get-Content (Join-Path $runDir 'relay.err') -ErrorAction SilentlyContinue | Select-Object -Last 1) -join ' '))
-            AppIdHint (Join-Path $runDir 'relay.err')
-            if ($Role -eq 'host' -or ((Get-Date) - $t0).TotalMinutes -gt 10) { throw 'relay could not start' }
-            Say 'retrying in 10 s (the host may not have a lobby yet)'; Start-Sleep 10
-            Copy-Item (Join-Path $runDir 'relay.log') (Join-Path $runDir ("relay-try-{0:HHmmss}.log" -f (Get-Date))) -ErrorAction SilentlyContinue
-            $relay = StartRelay
-        }
+    function StartGame {
+        LaunchGame
+        Start-Sleep 6
+        $n = 0
+        # in a menu-mode copy Story Mode starts with Singleplayer, whose first row is Continue: Enter still gets there
+        while (-not (LogLines | Select-String '\.sav ') -and $n -lt 25) { Guard; Key 0x0D; $n++; Start-Sleep 4 }
+        if (-not (LogLines | Select-String '\.sav ')) { throw 'the save was not opened after 25 Enter presses' }
+        PlayerInWorld
     }
-    Say 'relay up'
+    # menu mode: "Stop co-op" while waiting sets $relayStopped and returns
+    function WaitRelay {
+        $t0 = Get-Date; $script:relayStopped = $false
+        while ($true) {
+            Start-Sleep 3; Guard
+            if ($game.HasExited) { throw 'the game exited while waiting for the relay' }
+            if ($menuMode -and (MenuRequest) -eq 'cancel') { $script:relayStopped = $true; return }
+            $rl = Get-Content (Join-Path $runDir 'relay.log') -ErrorAction SilentlyContinue
+            if ($rl | Select-String 'peer is talking|LOBBY \d+ created|entered lobby') { break }
+            if ($relay.HasExited) {
+                Say ("relay stopped: " + (($rl | Select-Object -Last 1), (Get-Content (Join-Path $runDir 'relay.err') -ErrorAction SilentlyContinue | Select-Object -Last 1) -join ' '))
+                AppIdHint (Join-Path $runDir 'relay.err')
+                if ($Role -eq 'host' -or ((Get-Date) - $t0).TotalMinutes -gt 10) { throw 'relay could not start' }
+                Say 'retrying in 10 s (the host may not have a lobby yet)'; Start-Sleep 10
+                Copy-Item (Join-Path $runDir 'relay.log') (Join-Path $runDir ("relay-try-{0:HHmmss}.log" -f (Get-Date))) -ErrorAction SilentlyContinue
+                $script:relay = StartRelay
+            }
+        }
+        Say 'relay up'
+    }
+    if ($menuMode) {
+        Remove-Item $menuReq, $menuStateFile -ErrorAction SilentlyContinue
+        LaunchGame
+        while ($true) {
+            $pick = MenuPick | Select-Object -Last 1
+            if ($pick -eq 'host') { SetRole host } else { SetRole join; $joinArg = $pick }
+            Say "menu: playing as $Role$(if ($Role -eq 'join') { " ($joinArg)" })"
+            $relay = StartRelay
+            MenuState $(if ($Role -eq 'host') { 'Opening the lobby...' } else { 'Joining the host...' })
+            WaitRelay
+            # the player loads the save with the game's own rows; "Stop co-op" in the menu goes back to the choice
+            $stopped = $relayStopped
+            if (-not $stopped) { MenuState $script:menuReady }
+            while (-not $stopped -and -not (LogLines | Select-String '\.sav ')) {
+                Guard; if ($game.HasExited) { throw 'the game exited' }
+                if ((MenuRequest) -eq 'cancel') { $stopped = $true; break }
+                Start-Sleep -Milliseconds 500
+            }
+            if (-not $stopped) { break }
+            Say 'menu: co-op stopped before loading'
+            if ($relay -and -not $relay.HasExited) { Stop-Process -Id $relay.Id -Force -ErrorAction SilentlyContinue }
+            $relay = $null
+        }
+        MenuState 'In game'
+        $id = PlayerInWorld | Select-Object -Last 1
+        # the copy's coop_flags.txt / coop_auto.txt are made for one role: the one picked in the menu wins
+        Native "npcsync $Role`r`nworldsync $Role"
+    } else {
+        $id = StartGame | Select-Object -Last 1   # the function also returns what Say printed
+        if ($PlayerId -and $PlayerId -ne $id) { Say "WARNING: expected player id $PlayerId - is it the same save on both PCs?" }
+        $relay = StartRelay
+        WaitRelay
+    }
     Native "netstart $gamePort 127.0.0.1 $relayPort $id"
     Say "probe connected to the relay (netstart $gamePort 127.0.0.1 $relayPort)"
 
@@ -315,6 +455,8 @@ try {
 }
 catch { Say "STOPPED: $_" }
 finally {
+    # the probe shows "Needs start-coop" again once the state file is gone
+    Remove-Item $menuReq, $menuStateFile -ErrorAction SilentlyContinue
     if ($relay -and -not $relay.HasExited) { Stop-Process -Id $relay.Id -Force -ErrorAction SilentlyContinue }
     if ($game -and -not $game.HasExited) { Stop-Process -Id $game.Id -Force -ErrorAction SilentlyContinue }
     if (Test-Path $log) { Copy-Item $log (Join-Path $runDir 'coop_probe.log') }
