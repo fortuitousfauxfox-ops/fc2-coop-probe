@@ -216,6 +216,14 @@ static void notice_player(const char *name_utf8, const wchar_t *what)
     t[159] = 0;
     notice_w(t);
 }
+/* Back to the main menu: the console command quitToMainMenu (registered in FUN_1065a9c0, handler FUN_10658a20) is
+ * just vf+0x20 of the game object at [0x10FDE158]. Main thread only. */
+static void quit_to_menu(const char *why)
+{
+    void *g = g_base ? *(void **)(g_base + 0xFDE158) : NULL;
+    logf_("menu: leaving for the main menu (%s)%s", why, g ? "" : " - no game object");
+    if (g) ((void (__attribute__((thiscall)) *)(void *))(*(void ***)g)[0x20 / 4])(g);
+}
 static void notice_tick(void)
 {
     typedef void *(__attribute__((thiscall)) *getw_t)(void *mgr, int which);
@@ -1087,6 +1095,9 @@ static void native_cmd(const char *ln)
         wchar_t w[160];
         if (MultiByteToWideChar(CP_UTF8, 0, ln + 7, -1, w, 160)) { w[159] = 0; notice_w(w); }
         logf_("notice: %s", ln + 7);
+    } else if (strcmp(ln, "menuquit") == 0) {
+        /* menuquit: leave for the main menu like the console's quitToMainMenu (test) */
+        quit_to_menu("menuquit command");
     } else if (strcmp(ln, "rldsend") == 0) {
         /* rldsend (host): send the reload message for the save we read last, as after a load (test) */
         g_rld_force = 1;
@@ -3710,6 +3721,28 @@ static void net_tick(void)
             left = 1;
             logf_("bye: our player has been out of the world for 2 s (menu or loading)");
             bye_send();
+        }
+        /* the joiner plays in the host's world: when the host leaves (BYE1) or goes silent, it goes back to the main
+         * menu, once per host session. It waits 3 s first: the host's own load sends a bye too and its RLD1 then
+         * restarts us with that save instead, and "Игрок <name> отключился" stays readable; packets of a new session
+         * cancel it. */
+        if (g_npc_role == 2 && g_net_rx) {
+            static DWORD kick_at;
+            static int kick_stage, kicked;
+            int gone = (g_peer_bye && (int)(g_net_lastrx - g_bye_at) < 2000) || now - g_net_lastrx > AV_SILENT_MS;
+            if (!gone) {
+                if (kick_stage) logf_("menu: the host is back - staying");
+                kick_stage = kicked = 0;
+            } else if (me && !kicked && !g_quitting) {
+                if (!kick_stage) { kick_stage = 1; kick_at = (now + 3000) | 1; logf_("menu: the host %s", g_peer_bye ? "left" : "is silent"); }
+                else if (kick_stage == 1 && (int)(now - kick_at) >= 0) {
+                    kick_stage = 2; kick_at = (now + 3000) | 1;
+                    notice_w(L"Хост отключился: выход в главное меню");
+                } else if (kick_stage == 2 && (int)(now - kick_at) >= 0) {
+                    kick_stage = 0; kicked = 1;
+                    quit_to_menu("the host left");
+                }
+            }
         }
     }
     av_tick(now);
