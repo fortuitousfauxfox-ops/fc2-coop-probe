@@ -8,8 +8,9 @@ to the other player's relay and hands what comes back to the probe.
 Transports:
   udp    the other relay is reached over UDP (default 127.0.0.1): a stand-in to test the whole
          chain with two game copies on one PC, without Steam.
-  steam  Steam (AppID 480 "Spacewar"): friends-only lobby, invite, P2P messages through Valve's
-         relay network by SteamID. No IP addresses, no port forwarding. Needs the Steam client
+  steam  Steam (--appid, default 19900 Far Cry 2; 480 "Spacewar" works for any account): friends-only
+         lobby, invite, P2P messages through Valve's relay network by SteamID. Under 19900 the account must
+         own Far Cry 2, and friends see "Far Cry 2" as the game. No IP addresses, no port forwarding. Needs the Steam client
          running and a 64-bit steam_api64.dll with the flat API (Steamworks.NET Standalone
          2025.164.1, SHA-256 eb17909a...fb75). See coop-anything playbook/networking-steam-spacewar.md.
 
@@ -19,6 +20,8 @@ Examples (game copy A host, copy B joins; probe in each copy: netstart <game por
   python fc2_relay.py --transport steam --host --steam-dll <path to steam_api64.dll> [--invite "<friend name>"]
   python fc2_relay.py --transport steam --join <lobby id> --steam-dll <path to steam_api64.dll>
   python fc2_relay.py --transport steam --join friend --steam-dll ...   (finds a friend hosting fc2coop)
+  python fc2_relay.py --transport steam --join friend:<steamid> ...     (that friend's lobby, retrying)
+  python fc2_relay.py --transport steam --list <file.json> --steam-dll ... (writes friends' fc2coop lobbies, exits)
   python fc2_relay.py --transport steam --join wait --steam-dll ...     (joins when you accept the host's Steam
                                                                           invite or click Join Game in the friends list)
 
@@ -27,6 +30,7 @@ Frames between relays: channel 0 = probe packets as they are (unreliable); chann
 """
 import argparse
 import ctypes
+import json
 import os
 import socket
 import sys
@@ -37,6 +41,7 @@ BATCH_S = 0.05      # pack game datagrams for this long into one transport messa
 BATCH_MAX = 1100    # bytes per packed message (under one network packet)
 TIMEOUT_S = 20.0
 LOBBY_KEY, LOBBY_VAL = b"fc2coop", b"1"
+LIST_WAIT_S = 4.0   # --list: how long to wait for the lobby data of friends' lobbies
 
 
 def log(msg):
@@ -98,13 +103,13 @@ class FriendGameInfo(ctypes.Structure):
 class SteamTransport:
     """Steam lobby + ISteamNetworkingMessages, flat C API through ctypes (64-bit steam_api64.dll)."""
 
-    def __init__(self, dll_path, host, join, invite):
+    def __init__(self, dll_path, host, join, invite, appid=19900, lobby_data=()):
         if ctypes.sizeof(ctypes.c_void_p) != 8:
             sys.exit("steam transport: needs 64-bit Python (steam_api64.dll)")
-        here = os.getcwd()
-        if not os.path.exists(os.path.join(here, "steam_appid.txt")):
-            with open(os.path.join(here, "steam_appid.txt"), "w") as f:
-                f.write("480")
+        # written every time: it used to be written only when missing, so a run dir made under 480 kept 480
+        with open(os.path.join(os.getcwd(), "steam_appid.txt"), "w") as f:
+            f.write(str(appid))
+        self.appid, self.lobby_data = appid, list(lobby_data)
         d = self.d = ctypes.CDLL(dll_path)
         P, U64, I32, B, S = ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int32, ctypes.c_bool, ctypes.c_char_p
 
@@ -138,6 +143,8 @@ class SteamTransport:
             "NumMembers": fn("SteamAPI_ISteamMatchmaking_GetNumLobbyMembers", I32, P, U64),
             "MemberByIndex": fn("SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex", U64, P, U64, I32),
             "InviteUserToLobby": fn("SteamAPI_ISteamMatchmaking_InviteUserToLobby", B, P, U64, U64),
+            "RequestLobbyData": fn("SteamAPI_ISteamMatchmaking_RequestLobbyData", B, P, U64),
+            "PersonaName": fn("SteamAPI_ISteamFriends_GetPersonaName", S, P),
             "SetRichPresence": fn("SteamAPI_ISteamFriends_SetRichPresence", B, P, S, S),
             "ClearRichPresence": fn("SteamAPI_ISteamFriends_ClearRichPresence", None, P),
             "InviteDialog": fn("SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog", None, P, U64),
@@ -160,16 +167,24 @@ class SteamTransport:
         err = ctypes.create_string_buffer(1024)
         r = F["InitFlat"](err)
         if r != 0:
-            sys.exit("steam transport: SteamAPI_InitFlat failed (%d): %s" % (r, err.value.decode(errors="replace")))
+            # exit code 3: start-coop tells the owner to check that the account owns the app (or to use -AppId 480)
+            print("steam transport: SteamAPI_InitFlat under AppID %d failed (%d): %s" % (
+                appid, r, err.value.decode(errors="replace")), file=sys.stderr, flush=True)
+            sys.exit(3)
         F["MD_Init"]()
         self.pipe = F["GetHSteamPipe"]()
         self.user, self.mm, self.fr, self.nm = F["User"](), F["MM"](), F["Friends"](), F["NM"]()
         self.me = F["GetSteamID"](self.user)
-        log("steam: init ok, logged on=%s, own id ...%s" % (F["BLoggedOn"](self.user), str(self.me)[-4:]))
+        log("steam: init ok (AppID %d), logged on=%s, own id ...%s" % (appid, F["BLoggedOn"](self.user), str(self.me)[-4:]))
         self.lobby, self.peer, self.host = 0, 0, host
         # the joiner looks for the friend's lobby again 5 s after a failed entry or after the host left (it used to stay
         # put: once a lobby had vanished, "could not enter lobby (response 2)" and no further try); the host checks its
         # lobby every 30 s and makes a new one if Steam no longer lists it
+        # "friend:<steamid>" = the lobby of that friend only (picked from the --list output by start-coop)
+        self.want_host = int(join.split(":", 1)[1]) if join and join.startswith("friend:") else 0
+        if self.want_host:
+            join = "friend"
+        self.lobby_seen = {}  # --list: lobby id -> LobbyDataUpdate arrived
         self.join_mode, self.rejoin_at, self.lobby_check = join, 0.0, time.time() + 30
         # session requests are accepted after the callback loop, not inside it: both relays logged the SteamNetworking
         # assert "!IsLocked()" and soon after each saw the other leave the lobby; and a peer that the lobby no longer
@@ -183,10 +198,12 @@ class SteamTransport:
         if host:
             F["CreateLobby"](self.mm, 1, 2)  # 1 = friends-only, 2 players
             log("steam: creating friends-only lobby ...")
+        elif join == "list":
+            pass  # list_lobbies() does the work
         elif join == "friend":
             lobby = self.find_friend_lobby()
             if not lobby:
-                sys.exit("steam transport: no friend is hosting an fc2coop lobby right now")
+                sys.exit("steam transport: no friend is hosting an fc2coop lobby under AppID %d right now" % appid)
             F["JoinLobby"](self.mm, lobby)
             log("steam: joining lobby %d ..." % lobby)
         elif join == "wait":
@@ -197,14 +214,46 @@ class SteamTransport:
             log("steam: joining lobby %s ..." % join)
 
     # -- helpers
-    def find_friend_lobby(self):
-        F, info = self.f, FriendGameInfo()
+    def friend_lobbies(self):
+        """(friend id, lobby id) of every friend who is in a lobby of our AppID right now."""
+        F, info, out = self.f, FriendGameInfo(), []
         for i in range(F["FriendCount"](self.fr, 4)):  # 4 = immediate friends
             fid = F["FriendByIndex"](self.fr, i, 4)
-            if F["FriendGame"](self.fr, fid, ctypes.byref(info)) and (info.game_id & 0xFFFFFF) == 480 and info.lobby:
-                log("steam: friend %s is in a Spacewar lobby" % F["FriendName"](self.fr, fid).decode(errors="replace"))
-                return info.lobby
+            if F["FriendGame"](self.fr, fid, ctypes.byref(info)) and (info.game_id & 0xFFFFFF) == self.appid and info.lobby:
+                out.append((fid, info.lobby))
+        return out
+
+    def find_friend_lobby(self):
+        for fid, lobby in self.friend_lobbies():
+            if self.want_host and fid != self.want_host:
+                continue
+            log("steam: friend %s is in a lobby (AppID %d)" % (self.f["FriendName"](self.fr, fid).decode(errors="replace"), self.appid))
+            return lobby
         return 0
+
+    def list_lobbies(self, extra=()):
+        """Friends' lobbies that are fc2coop hosts, with their lobby data (for start-coop's host picker)."""
+        F = self.f
+        cands = self.friend_lobbies() + [(0, int(x)) for x in extra]  # extra: a lobby id to test with one account
+        for _, lobby in cands:
+            self.lobby_seen[lobby] = False
+            F["RequestLobbyData"](self.mm, lobby)
+        t0 = time.time()
+        while time.time() - t0 < LIST_WAIT_S and not all(self.lobby_seen.values()):
+            self.poll()
+            time.sleep(0.05)
+        out = []
+        for fid, lobby in cands:
+            data = {k: (F["GetLobbyData"](self.mm, lobby, k.encode()) or b"").decode("utf-8", errors="replace")
+                    for k in ("fc2coop", "name", "build", "save", "savehash")}
+            if data.pop("fc2coop") != LOBBY_VAL.decode():
+                log("steam: lobby %d is not an fc2coop host (data %s)" % (lobby, "seen" if self.lobby_seen[lobby] else "not seen"))
+                continue
+            owner = fid or F["GetLobbyOwner"](self.mm, lobby)
+            name = F["FriendName"](self.fr, owner).decode("utf-8", errors="replace") if fid else data["name"]
+            out.append(dict(lobby=str(lobby), host=str(owner), steam_name=name, **data))
+        log("steam: %d friend lobbies under AppID %d, %d of them fc2coop hosts" % (len(cands), self.appid, len(out)))
+        return out
 
     def identity(self, steamid):
         ctypes.memset(self.ident, 0, len(self.ident))
@@ -270,12 +319,22 @@ class SteamTransport:
             if result == 1 and lobby and lobby != self.lobby:
                 self.lobby = lobby
                 F["SetLobbyData"](self.mm, lobby, LOBBY_KEY, LOBBY_VAL)
+                # shown in the joiner's host picker: our Steam name, the probe build and the save we play
+                F["SetLobbyData"](self.mm, lobby, b"name", F["PersonaName"](self.fr))
+                for kv in self.lobby_data:
+                    k, _, v = kv.partition("=")
+                    if k in ("build", "save", "savehash"):
+                        F["SetLobbyData"](self.mm, lobby, k.encode(), v.encode("utf-8")[:120])
                 F["SetRichPresence"](self.fr, b"connect", b"+connect_lobby %d" % lobby)
                 log("steam: LOBBY %d created (friends-only); friend joins with --join %d or --join friend" % (lobby, lobby))
                 if self.invite:
                     self.invite_friend(self.invite)
             elif result != 1:
                 log("steam: lobby creation failed, result %d" % result)
+        elif cb == 505:  # LobbyDataUpdate: lobby (u64) at 0, member (u64) at 8, success (u8) at 16
+            lobby = ctypes.c_uint64.from_address(param).value
+            if lobby in self.lobby_seen:
+                self.lobby_seen[lobby] = True
         elif cb == 504:  # LobbyEnter
             lobby, response = ctypes.c_uint64.from_address(param).value, ctypes.c_uint32.from_address(param + 16).value
             if response != 1:
@@ -390,19 +449,38 @@ class SteamTransport:
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--transport", choices=["udp", "steam"], required=True)
-    ap.add_argument("--game-port", type=int, required=True, help="the probe's local port (first netstart argument)")
-    ap.add_argument("--relay-port", type=int, required=True, help="port this relay listens on for the probe (127.0.0.1)")
+    ap.add_argument("--game-port", type=int, help="the probe's local port (first netstart argument)")
+    ap.add_argument("--relay-port", type=int, help="port this relay listens on for the probe (127.0.0.1)")
     ap.add_argument("--udp-local", type=int, help="udp: this relay's port towards the other relay")
     ap.add_argument("--udp-peer", type=int, help="udp: the other relay's port")
     ap.add_argument("--udp-host", default="127.0.0.1", help="udp: the other relay's address")
     ap.add_argument("--steam-dll", help="steam: path to steam_api64.dll")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--host", action="store_true", help="steam: create a friends-only lobby")
-    g.add_argument("--join", help="steam: lobby id, 'friend' to find a friend hosting, or 'wait' for a Steam invite / Join Game")
+    g.add_argument("--join", help="steam: lobby id, 'friend' to find a friend hosting, 'friend:<steamid>' for that friend's "
+                                  "lobby, or 'wait' for a Steam invite / Join Game")
+    g.add_argument("--list", metavar="FILE", help="steam: write friends' fc2coop host lobbies to FILE (JSON) and exit")
+    ap.add_argument("--list-extra", action="append", default=[], help=argparse.SUPPRESS)  # test: a lobby id to list too
+    ap.add_argument("--appid", type=int, default=19900, help="steam: AppID to run under (19900 Far Cry 2, 480 Spacewar)")
+    ap.add_argument("--lobby-data", action="append", default=[], metavar="KEY=VALUE",
+                    help="steam host: build=, save=, savehash= shown in the joiner's host picker")
     ap.add_argument("--invite", help="steam host: friend's Steam name to invite once the lobby exists")
     ap.add_argument("--seconds", type=float, default=0, help="stop after this many seconds (0 = run until Ctrl+C)")
     a = ap.parse_args()
 
+    if a.list:
+        if a.transport != "steam" or not a.steam_dll:
+            sys.exit("--list needs --transport steam and --steam-dll")
+        tr = SteamTransport(a.steam_dll, False, "list", None, a.appid)
+        try:
+            lobbies = tr.list_lobbies(a.list_extra)
+        finally:
+            tr.f["Shutdown"]()
+        with open(a.list, "w", encoding="utf-8") as f:
+            json.dump(lobbies, f, ensure_ascii=False)
+        return
+    if a.game_port is None or a.relay_port is None:
+        sys.exit("--game-port and --relay-port are required")
     if a.transport == "udp":
         if a.udp_local is None or a.udp_peer is None:
             sys.exit("udp transport needs --udp-local and --udp-peer")
@@ -410,7 +488,7 @@ def main():
     else:
         if not a.steam_dll or not (a.host or a.join):
             sys.exit("steam transport needs --steam-dll and --host or --join")
-        tr = SteamTransport(a.steam_dll, a.host, a.join, a.invite)
+        tr = SteamTransport(a.steam_dll, a.host, a.join, a.invite, a.appid, a.lobby_data)
 
     game = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     game.bind(("127.0.0.1", a.relay_port))
