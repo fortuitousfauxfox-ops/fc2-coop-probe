@@ -138,6 +138,11 @@ function AppIdHint($errFile) {
 function StartListing($out) {
     $wd = Join-Path $kit 'steam-run'; New-Item -ItemType Directory -Force $wd | Out-Null
     Remove-Item $out, "$out.join" -ErrorAction SilentlyContinue
+    # the menu may start several listings in one run: keep the earlier logs
+    foreach ($f in 'relay-list.log', 'relay-list.err') {
+        $p = Join-Path $runDir $f
+        if (Test-Path $p) { Move-Item $p (Join-Path $runDir ($f -replace '\.', ("-{0:HHmmss}." -f (Get-Date)))) -Force -ErrorAction SilentlyContinue }
+    }
     $largs = @('-I', '-u', "`"$relayPy`"", '--transport', 'steam', '--steam-dll', "`"$SteamDll`"", '--appid', $AppId, '--list', "`"$out`"", '--watch', '--seconds', 3600)
     # test with one Steam account: lobby ids to list besides the friends' ones (our own host lobby)
     foreach ($x in "$env:FC2COOP_LIST_EXTRA" -split ',') { if ($x -match '^\d+$') { $largs += @('--list-extra', $x) } }
@@ -233,11 +238,12 @@ function PickFriend {
 
 # ---- menu mode: the probe's Story Mode > Cooperative rows ----
 # bin\coop_menu_state.txt (written here, read by the probe; it exists while this script runs): line 1 the status the
-# menu shows, then "<host steamid><TAB><label>" per friend's game; bin\coop_menu.txt (written by the probe, removed
+# menu shows, then "<host steamid><TAB><label>" per friend's game or "@play" once a host is taken; bin\coop_menu.txt (written by the probe, removed
 # here): host | join | pick <steamid> | cancel. The menu font has no Cyrillic, Steam names in it may show as "?".
 $menuReq = Join-Path $bin 'coop_menu.txt'; $menuStateFile = Join-Path $bin 'coop_menu_state.txt'
-function MenuState([string]$status, $hosts) {
-    $lines = @($status) + @($hosts | Where-Object { $_ } | ForEach-Object { "$($_.host)`t$($_.label)" })
+# -Play: a host is taken ("@play" line), so the probe shows the load rows even when Steam Join Game picked it
+function MenuState([string]$status, $hosts, [switch]$Play) {
+    $lines = @($status) + @($hosts | Where-Object { $_ } | ForEach-Object { "$($_.host)`t$($_.label)" }) + @(if ($Play) { '@play' })
     $tmp = "$menuStateFile.tmp"
     [IO.File]::WriteAllText($tmp, ($lines -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding $false))
     Move-Item $tmp $menuStateFile -Force
@@ -330,7 +336,12 @@ try {
     # starts the game, presses Enter until the newest save is loaded and returns the player id (also used to start it
     # again when the probe asks for a reload together with the host)
     function LaunchGame {
-        if (Test-Path $log) { Move-Item $log (Join-Path $bin ("coop_probe.{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))) }
+        # right after the game exited (reload together) its process may still hold the log for a moment: the move
+        # failed with "file in use" on PC2 and ended the run, so retry for up to 15 s
+        for ($i = 0; (Test-Path $log); $i++) {
+            try { Move-Item $log (Join-Path $bin ("coop_probe.{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))) -ErrorAction Stop; break }
+            catch { if ($i -ge 30) { throw }; Start-Sleep -Milliseconds 500 }
+        }
         Remove-Item (Join-Path $bin 'coop_cmd.lua'), (Join-Path $bin 'coop_native.txt') -ErrorAction SilentlyContinue
         $script:game = Start-Process (Join-Path $bin 'FarCry2.exe') -WorkingDirectory $bin -PassThru
         Say "game started (pid $($game.Id)), window title $title"
@@ -382,11 +393,11 @@ try {
             if ($pick -eq 'host') { SetRole host } else { SetRole join; $joinArg = $pick }
             Say "menu: playing as $Role$(if ($Role -eq 'join') { " ($joinArg)" })"
             $relay = StartRelay
-            MenuState $(if ($Role -eq 'host') { 'Opening the lobby...' } else { 'Joining the host...' })
+            MenuState $(if ($Role -eq 'host') { 'Opening the lobby...' } else { 'Joining the host...' }) -Play
             WaitRelay
             # the player loads the save with the game's own rows; "Stop co-op" in the menu goes back to the choice
             $stopped = $relayStopped
-            if (-not $stopped) { MenuState $script:menuReady }
+            if (-not $stopped) { MenuState $script:menuReady -Play }
             while (-not $stopped -and -not (LogLines | Select-String '\.sav ')) {
                 Guard; if ($game.HasExited) { throw 'the game exited' }
                 if ((MenuRequest) -eq 'cancel') { $stopped = $true; break }
@@ -397,7 +408,7 @@ try {
             if ($relay -and -not $relay.HasExited) { Stop-Process -Id $relay.Id -Force -ErrorAction SilentlyContinue }
             $relay = $null
         }
-        MenuState 'In game'
+        MenuState 'In game' -Play
         $id = PlayerInWorld | Select-Object -Last 1
         # the copy's coop_flags.txt / coop_auto.txt are made for one role: the one picked in the menu wins
         Native "npcsync $Role`r`nworldsync $Role"

@@ -3883,7 +3883,8 @@ static int __cdecl h_gettop(void *L)
  * +0x74 holds the row code. Sub-pages are the list cleared and built again from the update hook (never inside the
  * action, which the clear deletes). Once the page has not updated for a second (left), it starts at the top again.
  * Bridge to start-coop.ps1 -Role menu: we write bin\coop_menu.txt (host | join | pick <steamid> | cancel), it writes
- * bin\coop_menu_state.txt (UTF-8: line 1 the status, then "<steamid>\t<label>" per friend's game found). */
+ * bin\coop_menu_state.txt (UTF-8: line 1 the status, then "<steamid>\t<label>" per friend's game found, or "@play"
+ * once a host is taken - Steam Join Game picks one without a row, so the friends page must follow the file). */
 #define SM_VT    0xEBB120
 #define SM_ROWS  0x8C9C50
 #define MM_MAXH  4
@@ -3895,6 +3896,7 @@ static volatile LONG g_mm_click = -1;
 static int g_mm_state;                   /* start-coop wrote a state file (it runs in menu mode) */
 static wchar_t g_mm_status[96];
 static int g_mm_nh;
+static int g_mm_play;                    /* the state file says "@play": a host is taken (Steam Join Game too) */
 static char g_mm_hid[MM_MAXH][24];
 static wchar_t g_mm_hl[MM_MAXH][96];
 static FILETIME g_mm_stamp;
@@ -3945,7 +3947,7 @@ static int mm_poll(int force)
     if (have) st = fa.ftLastWriteTime;
     if (!force && have == g_mm_state && CompareFileTime(&st, &g_mm_stamp) == 0) return 0;
     g_mm_state = have; g_mm_stamp = st;
-    g_mm_status[0] = 0; g_mm_nh = 0;
+    g_mm_status[0] = 0; g_mm_nh = 0; g_mm_play = 0;
     if (!have || !(f = fopen(p, "rb"))) return 1;
     n = (int)fread(buf, 1, sizeof buf - 1, f);
     fclose(f);
@@ -3956,6 +3958,7 @@ static int mm_poll(int force)
         if ((nx = strchr(ln, '\n'))) *nx++ = 0;
         if (*ln && ln[strlen(ln) - 1] == '\r') ln[strlen(ln) - 1] = 0;
         if (n == 0) { MultiByteToWideChar(CP_UTF8, 0, ln, -1, g_mm_status, 96); g_mm_status[95] = 0; continue; }
+        if (!strcmp(ln, "@play")) { g_mm_play = 1; continue; }
         if (!(tab = strchr(ln, '\t')) || tab == ln || g_mm_nh >= MM_MAXH) continue;
         *tab = 0;
         lstrcpynA(g_mm_hid[g_mm_nh], ln, 24);
@@ -4017,7 +4020,11 @@ static void __attribute__((thiscall)) mm_update(void *page, void *dt)
     if (*(int *)((BYTE *)page + 0x58)) return;
     c = InterlockedExchange(&g_mm_click, -1);
     if (c < 0) {
-        if (mm_poll(0) && g_mm_sub >= MM_COOP) mm_rebuild(page);
+        if (mm_poll(0) && g_mm_sub >= MM_COOP) {
+            /* Steam Join Game picks the host without a row: go to the load rows like a pick */
+            if (g_mm_play && g_mm_sub == MM_FRIENDS) { logf_("menu: host taken by start-coop (Steam Join Game)"); g_mm_sub = MM_PLAY; }
+            mm_rebuild(page);
+        }
         return;
     }
     logf_("menu: row %ld chosen (page %d)", c, g_mm_sub);
