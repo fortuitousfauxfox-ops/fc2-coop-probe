@@ -22,6 +22,9 @@ Examples (game copy A host, copy B joins; probe in each copy: netstart <game por
   python fc2_relay.py --transport steam --join friend --steam-dll ...   (finds a friend hosting fc2coop)
   python fc2_relay.py --transport steam --join friend:<steamid> ...     (that friend's lobby, retrying)
   python fc2_relay.py --transport steam --list <file.json> --steam-dll ... (writes friends' fc2coop lobbies, exits)
+  python fc2_relay.py --transport steam --list <file.json> --watch ...   (rewrites it every 5 s; a Steam Join Game
+                                                                          or accepted invite goes to <file.json>.join)
+  python fc2_relay.py --transport steam --friends <file.json> ...       (online friends, for start-coop -Invite pick)
   python fc2_relay.py --transport steam --join wait --steam-dll ...     (joins when you accept the host's Steam
                                                                           invite or click Join Game in the friends list)
 
@@ -185,6 +188,7 @@ class SteamTransport:
         if self.want_host:
             join = "friend"
         self.lobby_seen = {}  # --list: lobby id -> LobbyDataUpdate arrived
+        self.join_request = None  # --list --watch: (lobby, friend) from a Steam Join Game or accepted invite
         self.join_mode, self.rejoin_at, self.lobby_check = join, 0.0, time.time() + 30
         # session requests are accepted after the callback loop, not inside it: both relays logged the SteamNetworking
         # assert "!IsLocked()" and soon after each saw the other leave the lobby; and a peer that the lobby no longer
@@ -350,6 +354,9 @@ class SteamTransport:
                     return
             self.lobby = lobby
             log("steam: entered lobby %d" % lobby)
+            if not self.host and not self.want_host:
+                # joined by lobby id (--join <id>, Steam's +connect_lobby): from now on rejoin this host's lobby
+                self.want_host, self.join_mode = F["GetLobbyOwner"](self.mm, lobby), "friend"
             self.pick_peer()
         elif cb == 506:  # LobbyChatUpdate: someone joined or left
             self.pick_peer()
@@ -363,27 +370,46 @@ class SteamTransport:
         elif cb == 1252:
             log("steam: session failed")
         elif cb == 333:  # GameLobbyJoinRequested: lobby (u64) at 0, friend (u64) at 8
-            lobby = ctypes.c_uint64.from_address(param).value
+            lobby, friend = ctypes.c_uint64.from_address(param).value, ctypes.c_uint64.from_address(param + 8).value
             if lobby == self.lobby:
                 return
+            if self.join_mode == "list":
+                self.join_request = (lobby, friend)
+                return
             log("steam: invite or Join Game accepted (lobby), joining lobby %d" % lobby)
+            if not self.host:
+                self.want_host = friend  # rejoin that host's lobby from now on
             F["JoinLobby"](self.mm, lobby)
         elif cb == 337:  # GameRichPresenceJoinRequested: friend (u64) at 0, connect string (char[256]) at 8
             connect = ctypes.string_at(param + 8, 256).split(b"\0", 1)[0].decode(errors="replace")
             parts = connect.split()
             if len(parts) == 2 and parts[0] == "+connect_lobby" and parts[1].isdigit():
                 lobby = int(parts[1])
-                if lobby != self.lobby:
+                if self.join_mode == "list":
+                    self.join_request = (lobby, ctypes.c_uint64.from_address(param).value)
+                elif lobby != self.lobby:
                     log("steam: Join Game from the friends list, joining lobby %d" % lobby)
                     F["JoinLobby"](self.mm, lobby)
             else:
                 log("steam: Join Game with an unknown connect string %r, ignored" % connect)
 
+    def online_friends(self):
+        """Friends who are online (persona state > 0), the ones in our AppID first."""
+        F, info, out = self.f, FriendGameInfo(), []
+        for i in range(F["FriendCount"](self.fr, 4)):
+            fid = F["FriendByIndex"](self.fr, i, 4)
+            if F["FriendState"](self.fr, fid) > 0:
+                ingame = bool(F["FriendGame"](self.fr, fid, ctypes.byref(info)) and (info.game_id & 0xFFFFFF) == self.appid)
+                out.append(dict(id=str(fid), steam_name=F["FriendName"](self.fr, fid).decode("utf-8", errors="replace"), in_game=ingame))
+        out.sort(key=lambda x: (not x["in_game"], x["steam_name"].lower()))
+        return out
+
     def invite_friend(self, name):
         F = self.f
         for i in range(F["FriendCount"](self.fr, 4)):
             fid = F["FriendByIndex"](self.fr, i, 4)
-            if F["FriendName"](self.fr, fid).decode(errors="replace").lower() == name.lower():
+            # a SteamID (start-coop -Invite pick) or the friend's Steam name
+            if str(fid) == name or F["FriendName"](self.fr, fid).decode(errors="replace").lower() == name.lower():
                 ok = F["InviteUserToLobby"](self.mm, self.lobby, fid)
                 log("steam: invite to %s sent: %s" % (name, ok))
                 return
@@ -460,11 +486,14 @@ def main():
     g.add_argument("--join", help="steam: lobby id, 'friend' to find a friend hosting, 'friend:<steamid>' for that friend's "
                                   "lobby, or 'wait' for a Steam invite / Join Game")
     g.add_argument("--list", metavar="FILE", help="steam: write friends' fc2coop host lobbies to FILE (JSON) and exit")
+    g.add_argument("--friends", metavar="FILE", help="steam: write online friends to FILE (JSON) and exit")
+    ap.add_argument("--watch", action="store_true", help="steam --list: keep listing every 5 s until a Steam Join Game "
+                                                         "or accepted invite, written to FILE.join")
     ap.add_argument("--list-extra", action="append", default=[], help=argparse.SUPPRESS)  # test: a lobby id to list too
     ap.add_argument("--appid", type=int, default=19900, help="steam: AppID to run under (19900 Far Cry 2, 480 Spacewar)")
     ap.add_argument("--lobby-data", action="append", default=[], metavar="KEY=VALUE",
                     help="steam host: build=, save=, savehash= shown in the joiner's host picker")
-    ap.add_argument("--invite", help="steam host: friend's Steam name to invite once the lobby exists")
+    ap.add_argument("--invite", help="steam host: friend's Steam name or SteamID to invite once the lobby exists")
     ap.add_argument("--seconds", type=float, default=0, help="stop after this many seconds (0 = run until Ctrl+C)")
     a = ap.parse_args()
 
@@ -472,12 +501,38 @@ def main():
         if a.transport != "steam" or not a.steam_dll:
             sys.exit("--list needs --transport steam and --steam-dll")
         tr = SteamTransport(a.steam_dll, False, "list", None, a.appid)
+        t0 = time.time()
         try:
-            lobbies = tr.list_lobbies(a.list_extra)
+            while True:
+                lobbies = tr.list_lobbies(a.list_extra)
+                with open(a.list + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(lobbies, f, ensure_ascii=False)
+                os.replace(a.list + ".tmp", a.list)  # start-coop reads it while we write the next one
+                t_next = time.time() + 5
+                while a.watch and time.time() < t_next and not tr.join_request:
+                    tr.poll()
+                    time.sleep(0.05)
+                if tr.join_request:
+                    lobby, friend = tr.join_request
+                    log("steam: Join Game / invite for lobby %d" % lobby)
+                    with open(a.list + ".join", "w", encoding="utf-8") as f:
+                        json.dump(dict(lobby=str(lobby), host=str(friend),
+                                       steam_name=tr.f["FriendName"](tr.fr, friend).decode("utf-8", errors="replace")), f, ensure_ascii=False)
+                if not a.watch or tr.join_request or (a.seconds and time.time() - t0 > a.seconds):
+                    break
         finally:
             tr.f["Shutdown"]()
-        with open(a.list, "w", encoding="utf-8") as f:
-            json.dump(lobbies, f, ensure_ascii=False)
+        return
+    if a.friends:
+        if a.transport != "steam" or not a.steam_dll:
+            sys.exit("--friends needs --transport steam and --steam-dll")
+        tr = SteamTransport(a.steam_dll, False, "list", None, a.appid)
+        try:
+            friends = tr.online_friends()
+        finally:
+            tr.f["Shutdown"]()
+        with open(a.friends, "w", encoding="utf-8") as f:
+            json.dump(friends, f, ensure_ascii=False)
         return
     if a.game_port is None or a.relay_port is None:
         sys.exit("--game-port and --relay-port are required")

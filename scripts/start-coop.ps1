@@ -8,7 +8,8 @@ What it does: starts the patched test copy (window title A or B, kept for the wh
 probe log shows the save being opened (so do not use the keyboard until then), waits until the player id answers
 through the probe's Lua channel, starts relay\fc2_relay.py with the Steam transport under -AppId (default 19900
 Far Cry 2; host: friends-only lobby with its Steam name, probe build and save; join: before the game starts, lists
-friends hosting such a lobby and asks which one, then keeps rejoining that host's lobby), connects the probe to the relay with `netstart`, then prints
+friends hosting such a lobby and asks which one - Join Game in the Steam friends list or an accepted invite also
+picks it - then keeps rejoining that host's lobby; -Lobby <id> skips the list, see steam-launch.ps1), connects the probe to the relay with `netstart`, then prints
 the link state every 5 s. The join side also samples the avatar's and the own player's position every 2 s.
 Stop with Ctrl+C or by closing the game; the logs then go to <test copy>\coop-runs\<time>\.
 
@@ -19,6 +20,8 @@ param(
     [Parameter(Mandatory = $true)][string]$TestDir,
     [Parameter(Mandatory = $true)][string]$SteamDll,
     [string]$Python = 'python',
+    # host side: a friend's Steam name or SteamID to invite once the lobby exists, or 'pick' to choose from the
+    # online friends before the game starts
     [string]$Invite,
     # join side: 'pick' lists friends hosting a co-op lobby and lets you choose one before the game starts (one host
     # is taken at once); 'friend' takes the first friend's lobby found (retrying); 'wait' joins when you accept the
@@ -27,6 +30,8 @@ param(
     # Steam AppID the relay runs under, the same on both PCs: 19900 = Far Cry 2 (the account must own it; friends
     # see "Far Cry 2"), 480 = Spacewar (any account)
     [int]$AppId = 19900,
+    # join side: this lobby id instead of -Join (steam-launch.ps1 passes Steam's +connect_lobby here)
+    [ValidatePattern('^\d*$')][string]$Lobby,
     [string]$PlayerId,
     [int]$Seconds = 0
 )
@@ -112,52 +117,94 @@ function AppIdHint($errFile) {
         throw "Steam would not start the relay under AppID $AppId (does this Steam account own Far Cry 2?). Run both PCs with -AppId 480 (Spacewar) instead."
     }
 }
-# join side, before the game starts: asks the relay for friends hosting a co-op lobby (relay --list) and lets the
-# owner pick one; returns 'friend:<host steamid>' so the relay keeps rejoining that host's lobby
+# join side, before the game starts: a relay listing (relay --list --watch, every 5 s) shows the friends hosting a
+# co-op lobby and the owner presses a host's number; Join Game on a friend in the Steam friends list or an accepted
+# invite to the host's lobby also picks it (the listing runs under our AppID, so Steam hands those to it instead of
+# starting the real game). Returns 'friend:<host steamid>' so the relay keeps rejoining that host's lobby.
 function PickHost {
     $wd = Join-Path $kit 'steam-run'; New-Item -ItemType Directory -Force $wd | Out-Null
-    $out = Join-Path $runDir 'lobbies.json'; $myBuild = Sha8 (Join-Path $bin 'dinput8.dll')
+    $out = Join-Path $runDir 'lobbies.json'; $joinFile = "$out.join"; $myBuild = Sha8 (Join-Path $bin 'dinput8.dll')
     $interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
-    while ($true) {
-        Remove-Item $out -ErrorAction SilentlyContinue
-        $largs = @('-I', '-u', "`"$relayPy`"", '--transport', 'steam', '--steam-dll', "`"$SteamDll`"", '--appid', $AppId, '--list', "`"$out`"")
-        # test with one Steam account: lobby ids to list besides the friends' ones (our own host lobby)
-        foreach ($x in "$env:FC2COOP_LIST_EXTRA" -split ',') { if ($x -match '^\d+$') { $largs += @('--list-extra', $x) } }
-        $p = Start-Process $Python -ArgumentList $largs `
-            -WorkingDirectory $wd -WindowStyle Hidden -PassThru -Wait `
-            -RedirectStandardOutput (Join-Path $runDir 'relay-list.log') -RedirectStandardError (Join-Path $runDir 'relay-list.err')
-        AppIdHint (Join-Path $runDir 'relay-list.err')
-        # ForEach-Object: PowerShell 5.1 passes a JSON array on as one object
-        $hosts = @(if (Test-Path $out) { Get-Content $out -Raw -Encoding UTF8 | ConvertFrom-Json | ForEach-Object { $_ } })
-        if ($hosts.Count -gt 0) {
-            # Write-Host: the function's output is its return value
-            Write-Host ''
-            for ($i = 0; $i -lt $hosts.Count; $i++) {
-                $h = $hosts[$i]; $notes = @()
-                if ($h.build -and $h.build -ne $myBuild) { $notes += "other probe build $($h.build), ours $myBuild" }
-                if ($h.save) {
-                    $mine = Join-Path (Join-Path $pdir 'Saved Games') $h.save
-                    if (-not (Test-Path $mine)) { $notes += "we have no $($h.save)" } elseif ($h.savehash -and (Sha8 $mine) -ne $h.savehash) { $notes += "our $($h.save) differs" }
-                }
-                Write-Host ("  {0}) {1}   save {2}{3}" -f ($i + 1), $h.steam_name, $(if ($h.save) { $h.save } else { '?' }), $(if ($notes) { '   WARNING: ' + ($notes -join '; ') } else { '' }))
+    Remove-Item $out, $joinFile -ErrorAction SilentlyContinue
+    $largs = @('-I', '-u', "`"$relayPy`"", '--transport', 'steam', '--steam-dll', "`"$SteamDll`"", '--appid', $AppId, '--list', "`"$out`"", '--watch', '--seconds', 3600)
+    # test with one Steam account: lobby ids to list besides the friends' ones (our own host lobby)
+    foreach ($x in "$env:FC2COOP_LIST_EXTRA" -split ',') { if ($x -match '^\d+$') { $largs += @('--list-extra', $x) } }
+    $lp = Start-Process $Python -ArgumentList $largs -WorkingDirectory $wd -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $runDir 'relay-list.log') -RedirectStandardError (Join-Path $runDir 'relay-list.err')
+    try {
+        $shown = $null; $waitSaid = $false
+        while ($true) {
+            if (Test-Path $joinFile) {
+                $j = Get-Content $joinFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                Say "Steam Join Game / invite: host $($j.steam_name)" | Write-Host
+                return "friend:$($j.host)"
             }
-            $pick = -1
-            if ($hosts.Count -eq 1 -or -not $interactive) { $pick = 0; Write-Host '  -> taking 1' }
-            else {
-                while ($pick -lt 0) {
-                    $r = Read-Host "Host number (1-$($hosts.Count)), r = refresh, q = quit"
-                    if ($r -eq 'q') { throw 'no host picked' }
-                    if ($r -eq 'r') { break }
-                    $n = 0; if ([int]::TryParse($r, [ref]$n) -and $n -ge 1 -and $n -le $hosts.Count) { $pick = $n - 1 }
-                }
-                if ($pick -lt 0) { continue }
+            if ($lp.HasExited) {
+                AppIdHint (Join-Path $runDir 'relay-list.err')
+                throw ("the lobby listing stopped: " + (Get-Content (Join-Path $runDir 'relay-list.err') -ErrorAction SilentlyContinue | Select-Object -Last 1))
             }
-            $h = $hosts[$pick]
-            Say "host picked: $($h.steam_name) (save $($h.save), build $($h.build))" | Write-Host
-            return "friend:$($h.host)"
+            # ForEach-Object: PowerShell 5.1 passes a JSON array on as one object
+            $hosts = @(try { Get-Content $out -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json | ForEach-Object { $_ } } catch { })
+            $now = ($hosts | ForEach-Object { $_.lobby }) -join ','
+            if ($hosts.Count -gt 0 -and $now -ne $shown) {
+                $shown = $now
+                # Write-Host: the function's output is its return value
+                Write-Host ''
+                for ($i = 0; $i -lt $hosts.Count; $i++) {
+                    $h = $hosts[$i]; $notes = @()
+                    if ($h.build -and $h.build -ne $myBuild) { $notes += "other probe build $($h.build), ours $myBuild" }
+                    if ($h.save) {
+                        $mine = Join-Path (Join-Path $pdir 'Saved Games') $h.save
+                        if (-not (Test-Path $mine)) { $notes += "we have no $($h.save)" } elseif ($h.savehash -and (Sha8 $mine) -ne $h.savehash) { $notes += "our $($h.save) differs" }
+                    }
+                    Write-Host ("  {0}) {1}   save {2}{3}" -f ($i + 1), $h.steam_name, $(if ($h.save) { $h.save } else { '?' }), $(if ($notes) { '   WARNING: ' + ($notes -join '; ') } else { '' }))
+                }
+                if ($hosts.Count -eq 1 -or -not $interactive) {
+                    Write-Host '  -> taking 1'; $h = $hosts[0]
+                    Say "host picked: $($h.steam_name) (save $($h.save), build $($h.build))" | Write-Host
+                    return "friend:$($h.host)"
+                }
+                Write-Host "Press the host's number (1-$([Math]::Min(9, $hosts.Count))), q = quit; Join Game in Steam works too"
+            }
+            if ($hosts.Count -eq 0 -and -not $waitSaid -and (Test-Path $out)) {
+                $waitSaid = $true; $shown = $null
+                Say "no friend is hosting a co-op lobby under AppID $AppId yet; waiting (or use Join Game on the host in the Steam friends list; Ctrl+C to stop)" | Write-Host
+            }
+            if ($hosts.Count -gt 0) { $waitSaid = $false }
+            if ($interactive -and [Console]::KeyAvailable) {
+                $k = [Console]::ReadKey($true).KeyChar
+                if ($k -eq 'q') { throw 'no host picked' }
+                $n = [int][char]$k - [int][char]'0'
+                if ($n -ge 1 -and $n -le $hosts.Count) {
+                    $h = $hosts[$n - 1]
+                    Say "host picked: $($h.steam_name) (save $($h.save), build $($h.build))" | Write-Host
+                    return "friend:$($h.host)"
+                }
+            }
+            Start-Sleep -Milliseconds 200
         }
-        Say "no friend is hosting a co-op lobby under AppID $AppId yet; looking again in 5 s (Ctrl+C to stop)" | Write-Host
-        Start-Sleep 5
+    }
+    finally { if (-not $lp.HasExited) { Stop-Process -Id $lp.Id -Force -ErrorAction SilentlyContinue } }
+}
+# host side, before the game starts (-Invite pick): online friends from the relay (--friends), the ones playing Far
+# Cry 2 first; returns the picked friend's SteamID for relay --invite, or nothing
+function PickFriend {
+    $wd = Join-Path $kit 'steam-run'; New-Item -ItemType Directory -Force $wd | Out-Null
+    $out = Join-Path $runDir 'friends.json'
+    Start-Process $Python -ArgumentList @('-I', '-u', "`"$relayPy`"", '--transport', 'steam', '--steam-dll', "`"$SteamDll`"", '--appid', $AppId, '--friends', "`"$out`"") `
+        -WorkingDirectory $wd -WindowStyle Hidden -PassThru -Wait `
+        -RedirectStandardOutput (Join-Path $runDir 'relay-friends.log') -RedirectStandardError (Join-Path $runDir 'relay-friends.err') | Out-Null
+    AppIdHint (Join-Path $runDir 'relay-friends.err')
+    $fr = @(if (Test-Path $out) { Get-Content $out -Raw -Encoding UTF8 | ConvertFrom-Json | ForEach-Object { $_ } })
+    if ($fr.Count -eq 0) { Say 'no friend is online: no invite (the friend can still use Join Game on you in Steam)' | Write-Host; return }
+    Write-Host ''
+    for ($i = 0; $i -lt $fr.Count; $i++) { Write-Host ("  {0}) {1}{2}" -f ($i + 1), $fr[$i].steam_name, $(if ($fr[$i].in_game) { '   (in Far Cry 2)' } else { '' })) }
+    if (-not ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected)) { Say 'no console: no invite' | Write-Host; return }
+    $r = Read-Host "Friend to invite once the lobby is up (1-$($fr.Count), Enter = nobody)"
+    $n = 0
+    if ([int]::TryParse($r, [ref]$n) -and $n -ge 1 -and $n -le $fr.Count) {
+        Say "will invite $($fr[$n - 1].steam_name)" | Write-Host
+        return $fr[$n - 1].id
     }
 }
 
@@ -176,7 +223,9 @@ try {
     if (-not (Get-ChildItem (Join-Path $pdir 'Saved Games') -Filter *.sav -ErrorAction SilentlyContinue)) { throw "no .sav in $pdir\Saved Games: Story Mode would offer only New Story" }
     Say "copy uses its own profile and save list: $pdir"
     if (Get-Process FarCry2 -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$bin\*" }) { throw 'this test copy is already running' }
-    if ($Role -eq 'join' -and $Join -eq 'pick') { $joinArg = PickHost | Select-Object -Last 1 }
+    if ($Role -eq 'join' -and $Lobby) { $joinArg = $Lobby; Say "joining lobby $Lobby (Steam Join Game / invite)" }
+    elseif ($Role -eq 'join' -and $Join -eq 'pick') { $joinArg = PickHost | Select-Object -Last 1 }
+    if ($Role -eq 'host' -and $Invite -eq 'pick') { $Invite = PickFriend | Select-Object -Last 1 }
     $reloadFlag = Join-Path $bin 'coop_reload.txt'
     Remove-Item $reloadFlag -ErrorAction SilentlyContinue
     # starts the game, presses Enter until the newest save is loaded and returns the player id (also used to start it
