@@ -481,7 +481,7 @@ def main():
                 last_ka = now
             # the other player's name for the probe's on-screen notice ("Игрок <name> подключается"): NAM1 + UTF-8,
             # every 3 s while the peer is up (the probe shows it once per session)
-            if peer_alive and now - last_name >= 3:
+            if peer_alive and now - last_name >= 3 and tr.peer_name and not str(tr.peer_name).startswith("("):
                 last_name = now
                 try:
                     game.sendto(b"NAM1" + str(tr.peer_name).encode("utf-8")[:60], game_addr)

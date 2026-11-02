@@ -3608,7 +3608,9 @@ static void net_tick(void)
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NSHT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_shot_apply((const NpcHitPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NHIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_hit_apply((const NpcHitPkt *)&rb); continue; }
         if (r > 4 && r < 68 && rb.magic == NAM_MAGIC) {
-            if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) {
+            /* only while the peer's game is really there: after it left, its relay keeps sending the name for ~20 s and
+             * every one of them showed "подключается" / "отключился" again */
+            if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr && !g_peer_bye && g_net_rx && GetTickCount() - g_net_lastrx < 2000) {
                 char nm[64];
                 memcpy(nm, (char *)&rb + 4, r - 4);
                 nm[r - 4] = 0;
@@ -3689,6 +3691,25 @@ static void net_tick(void)
             *(float *)(g_bodymat + 0x30) = x; *(float *)(g_bodymat + 0x34) = y; *(float *)(g_bodymat + 0x38) = z;
             if (me) { *(float *)(me + 0x60) = x; *(float *)(me + 0x64) = y; *(float *)(me + 0x68) = z; }
             tx = x; ty = y; moved = now; g_join_tp++;
+        }
+    }
+    {
+        /* our player gone from the world for 2 s (back in the main menu, or loading): tell the peer we left, as on
+         * quitting - leaving for the menu showed no "отключился" on the other PC. Back in the world, the packets
+         * start a new session there ("подключается"). */
+        static DWORD gone_since;
+        static int left;
+        void *hd = NULL;
+        BYTE *me = g_net_id ? entity_obj(g_net_id, &hd) : NULL;
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        if (me) {
+            gone_since = 0;
+            if (left) { left = 0; logf_("bye: our player is back in the world"); }
+        } else if (!gone_since) gone_since = now | 1;
+        else if (!left && now - gone_since > 2000) {
+            left = 1;
+            logf_("bye: our player has been out of the world for 2 s (menu or loading)");
+            bye_send();
         }
     }
     av_tick(now);
