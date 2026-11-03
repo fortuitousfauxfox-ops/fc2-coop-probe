@@ -5,6 +5,7 @@
  * UDP socket (research prototype; see README.md). MIT licence, see LICENSE.
  * Addresses (RVAs) below are for Dunia.dll SHA-256 6353936a...2765 only.
  */
+#include <stddef.h>
 #include <winsock2.h>
 #include <windows.h>
 #include <stdio.h>
@@ -348,6 +349,7 @@ static Target g_targets[] = {
 #define NT (sizeof g_targets / sizeof g_targets[0])
 
 static int g_npc_role;            /* npcsync: 1 host, 2 join (declared here for coop_flags.txt) */
+static int g_vehsync;              /* vehsync 0|1 (defined with the vehicle sync) */
 static int patch_iat(HMODULE m)
 {
     BYTE *base = (BYTE *)m;
@@ -802,9 +804,104 @@ static int pawn_give_weapon(BYTE *obj, const char *arch, const char *who)
     return 1;
 }
 
+/* A u64 entry of a pawn's blackboard (pawn component vf+0x7C, read with FUN_1008e610): CurrentVehicleID 0xFD1BA782 =
+ * the vehicle the pawn sits in, 0x1BAA9B71 = the vehicle it asked for. ~0 when unset or no pawn. */
+static unsigned long long pawn_bb_u64(unsigned long long id, unsigned key)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    typedef void *(__attribute__((thiscall)) *bb_t)(void *pawn);
+    typedef void (__attribute__((thiscall)) *bbget_t)(void *bb, const unsigned *key, unsigned long long *out);
+    unsigned long long v = ~0ULL;
+    void *hd = NULL, *pawn, *bb;
+    BYTE *obj = entity_obj(id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!obj || !(pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C))) || IsBadReadPtr(*(void **)pawn, 0x80)) return v;
+    if (!(bb = ((bb_t)(*(void ***)pawn)[0x7C / 4])(pawn))) return v;
+    ((bbget_t)(g_base + 0x8E610))(bb, &key, &v);
+    return v;
+}
+/* set an existing u64 blackboard entry (FUN_1008e310); 0 when there is no pawn or blackboard */
+static int pawn_bb_set_u64(unsigned long long id, unsigned key, unsigned long long v)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    typedef void *(__attribute__((thiscall)) *bb_t)(void *pawn);
+    typedef void (__attribute__((thiscall)) *bbset_t)(void *bb, const unsigned *key, const unsigned long long *val);
+    void *hd = NULL, *pawn, *bb;
+    BYTE *obj = entity_obj(id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!obj || !(pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C))) || IsBadReadPtr(*(void **)pawn, 0x80)) return 0;
+    if (!(bb = ((bb_t)(*(void ***)pawn)[0x7C / 4])(pawn))) return 0;
+    ((bbset_t)(g_base + 0x8E310))(bb, &key, &v);
+    return 1;
+}
+
+/* ---- vehicles: CVehicle component FDF990, its impl at +0x10 holds the seats (impl +0xC, stride 0x50, count +0x10;
+ * seat +0x10 type 1 driver / 2 gunner / 3 passenger, +0x28 user id, +0x30 state 2 = taken). Engine calls, all
+ * thiscall on the impl: E1810(pawn comp) = accept a user (picks a free seat, driver first), D8050(seat, pawn comp, 0,
+ * -1) = put the pawn in that seat (pawn side 151D50: vehicle pose), E4E70(pawn comp, 0) = get out. ---- */
+#define VEH_SEAT_STRIDE 0x50
+static BYTE *veh_impl(unsigned long long id)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    void *hd = NULL;
+    BYTE *obj = entity_obj(id, &hd), *vc, *im;
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!obj || !(vc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDF990))) || IsBadReadPtr(vc, 0x14)) return NULL;
+    im = *(BYTE **)(vc + 0x10);
+    return im && !IsBadReadPtr(im, 0x14) && *(unsigned *)(im + 0x10) <= 16 ? im : NULL;
+}
+static BYTE *pawn_comp_of(unsigned long long id)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    void *hd = NULL;
+    BYTE *obj = entity_obj(id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    return obj ? ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)) : NULL;
+}
+static unsigned g_veh_faults;
+/* how: 0 = accept (engine picks the seat), 1 = the given seat, 2 = get out, 3 = the pawn's own "enter vehicle" (AI
+ * path CDFC60: approach data into its blackboard + the named event; needs the target vehicle 0x1BAA9B71 set first).
+ * Fault-safe like enc_safe. */
+static int __attribute__((noinline)) veh_seat_call(int how, BYTE *im, int seat, BYTE *pawn)
+{
+    DWORD seh;
+    __asm__ volatile("movl %%fs:0, %0" : "=r"(seh));
+    g_enc_seh = seh; g_enc_tid = GetCurrentThreadId();
+    if (__builtin_setjmp(g_enc_jb)) {
+        g_enc_guard = 0;
+        if (++g_veh_faults <= 20) logf_("veh: fault in the seat call %d (%u so far)", how, g_veh_faults);
+        return 0;
+    }
+    g_enc_guard = 1;
+    if (how == 3) ((void (__cdecl *)(void *))(g_base + 0xCDFC60))(pawn);
+    else if (how == 0) ((void (__attribute__((thiscall)) *)(void *, void *))(g_base + 0xE1810))(im, pawn);
+    else if (how == 1) {
+        /* as E1810 does after picking the seat: seat the pawn, then switch its state machine to the in-vehicle state
+         * (pawn vf+0x78(state hash [10F932AC]) returns a request object that FUN_1029da10 completes) */
+        void *rq;
+        ((void (__attribute__((thiscall)) *)(void *, void *, void *, int, int))(g_base + 0xD8050))(im, *(BYTE **)(im + 0xC) + seat * VEH_SEAT_STRIDE, pawn, 0, -1);
+        rq = ((void *(__attribute__((thiscall)) *)(void *, unsigned))(*(void ***)pawn)[0x78 / 4])(pawn, *(unsigned *)(g_base + 0xF932AC));
+        if (rq) ((void (__attribute__((thiscall)) *)(void *))(g_base + 0x29DA10))(rq);
+    }
+    else ((void (__attribute__((thiscall)) *)(void *, void *, int))(g_base + 0xE4E70))(im, pawn, 0);
+    g_enc_guard = 0;
+    return 1;
+}
+/* seat index of a pawn in a vehicle, or -1 */
+static int veh_seat_of(BYTE *im, unsigned long long pawn_id)
+{
+    unsigned i, n = *(unsigned *)(im + 0x10);
+    BYTE *s = *(BYTE **)(im + 0xC);
+    if (!s || IsBadReadPtr(s, n * VEH_SEAT_STRIDE)) return -1;
+    for (i = 0; i < n; i++) if (*(unsigned long long *)(s + i * VEH_SEAT_STRIDE + 0x28) == pawn_id) return (int)i;
+    return -1;
+}
+
+#define NANM_VARS 0x70
+static unsigned *npc_animvars(BYTE *obj);
 static void native_cmd(const char *ln)
 {
-    unsigned long long id;
+    unsigned long long id, k0x;
     unsigned long a, pv, k0, k1;
     float fx, fy, fz;
     int n;
@@ -1190,6 +1287,19 @@ static void native_cmd(const char *ln)
         sscanf(ln, "npslot %*x %*x %*x %x", &k2);
         if (!obj) logf_("npslot: no avatar");
         else np_slot(obj, (int)a, (unsigned)pv, (unsigned)k0, k2);
+    } else if (sscanf(ln, "beautprof %llu %lx", &id, &a) == 2) {
+        /* beautprof <id> <profile hash>: set the pawn's beautifier profile (FUN_100e97c0: the repository then picks the
+         * main beautifier for {k0, profile, pose}); e.g. 1b80e486 vehicle, c83da229 vehiclepassenger, standard */
+        void *holder = NULL, *bc;
+        BYTE *obj = entity_obj(id, &holder);
+        unsigned h = (unsigned)a;
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        bc = obj ? ((void *(__attribute__((thiscall)) *)(void *, void *))(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4)) : NULL;
+        if (!bc) { logf_("beautprof: no beautifier component"); return; }
+        ((void (__attribute__((thiscall)) *)(void *, unsigned *))(g_base + 0xE97C0))(bc, &h);
+        logf_("beautprof %llu %08x: main %p (vt %08x) base %p (vt %08x)", id, h, *(void **)((BYTE *)bc + 0x28),
+              *(void **)((BYTE *)bc + 0x28) ? **(unsigned **)((BYTE *)bc + 0x28) : 0, *(void **)((BYTE *)bc + 0x2C),
+              *(void **)((BYTE *)bc + 0x2C) ? **(unsigned **)((BYTE *)bc + 0x2C) : 0);
     } else if (strncmp(ln, "avmode", 6) == 0) {
         /* avmode np [archetype] [yaw offset] [offset x] [offset y] | avmode body: how the network avatar is shown */
         char arch[96] = "";
@@ -1394,6 +1504,51 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "poke %lx %lx", &a, &pv) == 2) {
         if (IsBadWritePtr((void *)a, 4)) logf_("poke %lx: not writable", a);
         else { *(unsigned long *)a = pv; logf_("poke %lx = %08lx", a, pv); }
+    } else if (sscanf(ln, "vehme %llu", &id) == 1) {
+        /* vehme <pawn id>: the vehicle the pawn sits in (blackboard CurrentVehicleID) and the one it asked for */
+        logf_("vehme %llu: current %llx, target %llx", id, pawn_bb_u64(id, 0xFD1BA782u), pawn_bb_u64(id, 0x1BAA9B71u));
+    } else if (sscanf(ln, "vehseat %llu %llu %d", &id, &k0x, &n) == 3 || sscanf(ln, "vehexit %llu %llu", &id, &k0x) == 2) {
+        /* vehseat <pawn> <vehicle> <seat index | -1 = engine picks>; vehexit <pawn> <vehicle> */
+        BYTE *im = veh_impl(k0x), *pw = pawn_comp_of(id);
+        int ex = ln[3] == 'e';
+        if (!im || !pw) { logf_("%s: vehicle impl %p pawn %p", ex ? "vehexit" : "vehseat", im, pw); return; }
+        if (!ex && n >= (int)*(unsigned *)(im + 0x10)) { logf_("vehseat: seat %d of %u", n, *(unsigned *)(im + 0x10)); return; }
+        logf_("%s %llu %llu %d: call ok %d, seat now %d, pawn current vehicle %llx", ex ? "vehexit" : "vehseat", id, k0x, n,
+              veh_seat_call(ex ? 2 : n < 0 ? 0 : 1, im, n, pw), veh_seat_of(im, id), pawn_bb_u64(id, 0xFD1BA782u));
+    } else if (sscanf(ln, "vehenter %llu %llu", &id, &k0x) == 2) {
+        /* vehenter <pawn> <vehicle>: target vehicle into the pawn's blackboard, then its own enter-vehicle request */
+        BYTE *pw = pawn_comp_of(id);
+        int ok = pw && pawn_bb_set_u64(id, 0x1BAA9B71u, k0x);
+        logf_("vehenter %llu %llu: target set %d (reads %llx), call ok %d", id, k0x, ok, pawn_bb_u64(id, 0x1BAA9B71u),
+              ok ? veh_seat_call(3, NULL, 0, pw) : 0);
+    } else if (sscanf(ln, "animvars %llu", &id) == 1) {
+        /* animvars <id>: the anim graph variables v00-v6F (anim comp FDF190 +0x1C -> +0x10), 16 per line */
+        void *hd = NULL;
+        BYTE *obj = entity_obj(id, &hd);
+        unsigned *v;
+        int i;
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        if (!(v = npc_animvars(obj))) { logf_("animvars %llu: none", id); return; }
+        for (i = 0; i < NANM_VARS; i += 16)
+            logf_("animvars %llu v%02X: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", id, i, v[i], v[i + 1], v[i + 2],
+                  v[i + 3], v[i + 4], v[i + 5], v[i + 6], v[i + 7], v[i + 8], v[i + 9], v[i + 10], v[i + 11], v[i + 12], v[i + 13], v[i + 14], v[i + 15]);
+    } else if (sscanf(ln, "vehsync %d", &n) == 1) {
+        g_vehsync = n;
+        logf_("vehsync %s", n ? "on" : "off");
+    } else if (sscanf(ln, "vehseats %llu", &id) == 1) {
+        /* vehseats <vehicle id>: CVehicle component, its impl (+0x10) and the seats (impl +0xC, stride 0x50, count +0x10) */
+        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+        void *hd = NULL;
+        BYTE *obj = entity_obj(id, &hd), *vc, *im;
+        unsigned i, n;
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        if (!obj) { logf_("vehseats %llu: no entity", id); return; }
+        vc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDF990));
+        if (!vc || IsBadReadPtr(vc, 0x20) || IsBadReadPtr(im = *(BYTE **)(vc + 0x10), 0x20)) { logf_("vehseats %llu: no CVehicle", id); return; }
+        n = *(unsigned *)(im + 0x10);
+        logf_("vehseats %llu: comp %p impl %p seats %u at %p", id, vc, im, n, *(void **)(im + 0xC));
+        hexdump_(im, 0x40);
+        for (i = 0; i < n && i < 8; i++) if (!IsBadReadPtr(*(BYTE **)(im + 0xC) + i * 0x50, 0x50)) hexdump_(*(BYTE **)(im + 0xC) + i * 0x50, 0x50);
     } else if (sscanf(ln, "vcall %lx %lx", &a, &pv) == 2 || sscanf(ln, "vcallp %lx %lx", &a, &pv) == 2) {
         /* vcall <obj> <vtable byte offset> [f1 f2 f3 f4]: thiscall obj->vf(f1..f4 by value); vcallp passes a pointer
          * to f1..f4 instead (vector setters) and logs what the callee left there. Logs eax. RE only. */
@@ -2457,12 +2612,13 @@ static int g_np_n;
  * full pass at once took ~280 ms, a visible hitch); returns 1 when a pass has just been completed. The AI manager's
  * array (*(DAT_11607408 + 0xC) +0x68/+0x6C, what EnableScriptedAIMode walks) holds other objects (vtable EC40D0, no
  * agent pointers in their first 0x300 bytes), so this stays a memory scan. */
-typedef struct { BYTE *p, *c; int busy; } IncScan;
+/* vt / hoff: object vtable RVA and the offset of its entity holder pointer (0 = CPawnAgent EC5078, +4) */
+typedef struct { BYTE *p, *c; int busy; unsigned vt, hoff; } IncScan;
 static int npc_scan_step(IncScan *s, size_t budget, void (*cb)(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx), void *ctx)
 {
     static BYTE chunk[0x10000];
     MEMORY_BASIC_INFORMATION mbi;
-    unsigned vt = (unsigned)(g_base + 0xEC5078);
+    unsigned vt = (unsigned)(g_base + (s->vt ? s->vt : 0xEC5078)), ho = s->hoff ? s->hoff : 4;
     size_t done = 0;
     if (!s->busy) { s->busy = 1; s->p = NULL; s->c = NULL; }
     while (done < budget) {
@@ -2475,10 +2631,10 @@ static int npc_scan_step(IncScan *s, size_t budget, void (*cb)(unsigned long lon
                 size_t n = (size_t)(rend - s->c), k;
                 if (n > sizeof chunk) n = sizeof chunk;
                 if (safe_read(s->c, chunk, n))
-                    for (k = 0; k + 8 <= n; k += 4) {
+                    for (k = 0; k + ho + 4 <= n; k += 4) {
                         BYTE *holder, *obj;
                         if (*(unsigned *)(chunk + k) != vt) continue;
-                        holder = *(BYTE **)(chunk + k + 4);
+                        holder = *(BYTE **)(chunk + k + ho);
                         if (!holder || IsBadReadPtr(holder, 16) || !(obj = *(BYTE **)(holder + 0xC)) || IsBadReadPtr(obj, 0xA4)) continue;
                         cb(*(unsigned long long *)holder, obj, s->c + k, ctx);
                     }
@@ -3568,6 +3724,303 @@ static void hp_tick(DWORD now)
     if (prev >= 0 && fabsf(hp - prev) >= 1.0f) logf_("health: %.0f -> %.0f of %.0f", prev, hp, mx);
     prev = hp;
 }
+/* ---- vehicle sync (VEH1) ----
+ * World vehicles keep their save ids, so both sides know them by id. The driver owns a vehicle: each side sends the
+ * vehicle its own player drives (and the seat its player sits in, driver or not); the host also sends the vehicles
+ * moving near either player that the joiner does not drive (AI drivers, pushed or rolling cars). The receiver turns
+ * those into puppets: the Havok body gets velocities that steer it onto the sender's pose (teleport when far off), so
+ * wheels and collisions stay physical. Body = vehicle phys comp FDE25C +0x60 [0] +0x30 (rigid body wrapper, vtable
+ * E67390): +0x20 get / +0x50 set linear vel, +0x28 / +0x54 angular, +0x48 set position, +0x4C set rotation (x y z w).
+ * The other player's seat goes to the avatar: engine seat call D8050 + beautifier profile "vehicle" (its NetPlayer
+ * already follows the seat position from the player packets). */
+#define VEH_MAGIC 0x31484556u      /* "VEH1" */
+#define VEH_MAX 12
+#define VF_DRIVE 1                 /* the sender's player drives it: its pose is authoritative */
+#define VF_SEAT 2                  /* the sender's player sits in seat `seat` */
+#define VF_HOST 4                  /* host-run (no player in it): authoritative unless we drive it */
+typedef struct { unsigned long long id; float pos[3], q[4], vel[3], avel[3]; unsigned char flags, seat, pad[2]; } VehEnt;
+typedef struct { unsigned magic, seq, count; VehEnt e[VEH_MAX]; } VehPkt;
+static int g_vehsync = 1;          /* vehsync 0|1 */
+static unsigned g_veh_rx, g_veh_tx, g_veh_snaps, g_veh_unknown;
+static struct { unsigned long long id; VehEnt e; DWORD t; int snapped; } g_vp[VEH_MAX];         /* puppets */
+static struct { unsigned long long id; float pos[3]; DWORD moving, sent; } g_vh[32];             /* host's nearby list */
+static int g_vh_n;
+static unsigned long long g_vh_build[32];
+static int g_vh_bn;
+static unsigned long long g_peer_veh = ~0ULL, g_av_veh = ~0ULL;   /* the peer's player vehicle (packets) / where our avatar sits */
+static int g_peer_seat = -1, g_av_seat = -1;
+static DWORD g_peer_veh_t;
+static unsigned long long g_peer_drives[VEH_MAX];
+static DWORD g_peer_drives_t[VEH_MAX];
+
+static BYTE *veh_body(unsigned long long id)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    void *hd = NULL;
+    BYTE *obj = entity_obj(id, &hd), *pc, *arr, *po, *w;
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!obj || !(pc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE25C))) || IsBadReadPtr(pc, 0x68)) return NULL;
+    if (*(int *)(pc + 0x64) < 1 || !(arr = *(BYTE **)(pc + 0x60)) || IsBadReadPtr(arr, 4) || !(po = *(BYTE **)arr) || IsBadReadPtr(po, 0x34)) return NULL;
+    w = *(BYTE **)(po + 0x30);
+    return w && !IsBadReadPtr(w, 0x70) && *(unsigned *)w == (unsigned)(g_base + 0xE67390) && *(void **)(w + 0x68) ? w : NULL;
+}
+typedef void (__attribute__((thiscall)) *vbody_t)(void *w, float *v);
+/* the body calls read and write the vector with MOVAPS: it must be 16-byte aligned (a stack array crashed B) */
+static void vb(BYTE *w, int off, float *v)
+{
+    static float t[4] __attribute__((aligned(16)));   /* main thread only; gcc does not realign the stack */
+    memcpy(t, v, sizeof t);
+    ((vbody_t)(*(void ***)w)[off / 4])(w, t);
+    memcpy(v, t, 3 * sizeof(float));
+    if (off == 0x4C) v[3] = t[3];
+}
+/* rotation of an entity matrix (rows +0x30/+0x40/+0x50 = local x/y/z axes in world) as a quaternion x y z w */
+static void veh_m2q(const BYTE *o, float *q)
+{
+    const float *X = (const float *)(o + 0x30), *Y = (const float *)(o + 0x40), *Z = (const float *)(o + 0x50);
+    /* R columns = axes: R[r][c] = axis_c[r] */
+    float m00 = X[0], m11 = Y[1], m22 = Z[2], t = m00 + m11 + m22, s;
+    if (t > 0) { s = sqrtf(t + 1.0f) * 2; q[3] = 0.25f * s; q[0] = (Y[2] - Z[1]) / s; q[1] = (Z[0] - X[2]) / s; q[2] = (X[1] - Y[0]) / s; }
+    else if (m00 > m11 && m00 > m22) { s = sqrtf(1.0f + m00 - m11 - m22) * 2; q[3] = (Y[2] - Z[1]) / s; q[0] = 0.25f * s; q[1] = (Y[0] + X[1]) / s; q[2] = (Z[0] + X[2]) / s; }
+    else if (m11 > m22) { s = sqrtf(1.0f + m11 - m00 - m22) * 2; q[3] = (Z[0] - X[2]) / s; q[0] = (Y[0] + X[1]) / s; q[1] = 0.25f * s; q[2] = (Z[1] + Y[2]) / s; }
+    else { s = sqrtf(1.0f + m22 - m00 - m11) * 2; q[3] = (X[1] - Y[0]) / s; q[0] = (Z[0] + X[2]) / s; q[1] = (Z[1] + Y[2]) / s; q[2] = 0.25f * s; }
+}
+/* rotation taking a to b as angle * axis (world), for steering by angular velocity */
+static void veh_qerr(const float *a, const float *b, float *out)
+{
+    /* e = b * conj(a) */
+    float ax = -a[0], ay = -a[1], az = -a[2], aw = a[3];
+    float ex = b[3] * ax + b[0] * aw + b[1] * az - b[2] * ay;
+    float ey = b[3] * ay - b[0] * az + b[1] * aw + b[2] * ax;
+    float ez = b[3] * az + b[0] * ay - b[1] * ax + b[2] * aw;
+    float ew = b[3] * aw - b[0] * ax - b[1] * ay - b[2] * az, sn, ang;
+    if (ew < 0) { ex = -ex; ey = -ey; ez = -ez; ew = -ew; }
+    sn = sqrtf(ex * ex + ey * ey + ez * ez);
+    if (sn < 1e-5f) { out[0] = out[1] = out[2] = 0; return; }
+    ang = 2.0f * atan2f(sn, ew);
+    out[0] = ex / sn * ang; out[1] = ey / sn * ang; out[2] = ez / sn * ang;
+}
+/* fill an entry from our world; 0 when the vehicle or its body is not there */
+static int veh_fill(unsigned long long id, VehEnt *e)
+{
+    void *hd = NULL;
+    BYTE *obj = entity_obj(id, &hd), *w = veh_body(id);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!obj || !w) return 0;
+    memset(e, 0, sizeof *e);
+    e->id = id;
+    memcpy(e->pos, obj + 0x60, sizeof e->pos);
+    veh_m2q(obj, e->q);
+    { float t[4] = { 0, 0, 0, 0 }; vb(w, 0x20, t); memcpy(e->vel, t, sizeof e->vel); vb(w, 0x28, t); memcpy(e->avel, t, sizeof e->avel); }
+    return 1;
+}
+static int veh_peer_drives(unsigned long long id, DWORD now)
+{
+    int i;
+    for (i = 0; i < VEH_MAX; i++) if (g_peer_drives[i] == id && now - g_peer_drives_t[i] < 1000) return 1;
+    return 0;
+}
+static void veh_scan_cb(unsigned long long id, BYTE *obj, BYTE *comp, void *ctx)
+{
+    const float *mp = (const float *)ctx;
+    float dx = *(float *)(obj + 0x60) - mp[0], dy = *(float *)(obj + 0x64) - mp[1], ex = *(float *)(obj + 0x60) - mp[2], ey = *(float *)(obj + 0x64) - mp[3];
+    (void)comp;
+    if (g_vh_bn < 32 && (dx * dx + dy * dy < 150.0f * 150.0f || ex * ex + ey * ey < 150.0f * 150.0f)) g_vh_build[g_vh_bn++] = id;
+}
+/* our player's vehicle and seat (~0 / -1 when on foot), and whether that seat is the driver's */
+static unsigned long long veh_mine(int *seat, int *drive)
+{
+    unsigned long long v = pawn_bb_u64(g_net_id, 0xFD1BA782u);
+    BYTE *im = v != ~0ULL ? veh_impl(v) : NULL;
+    int s = im ? veh_seat_of(im, g_net_id) : -1;
+    *seat = s; *drive = s >= 0 && *(int *)(*(BYTE **)(im + 0xC) + s * VEH_SEAT_STRIDE + 0x10) == 1;
+    return im ? v : ~0ULL;
+}
+static void veh_send_tick(DWORD now)
+{
+    static DWORD last_send, last_scan;
+    static unsigned seq;
+    static IncScan vs;
+    static float mp[4];
+    VehPkt pk;
+    unsigned long long mine;
+    int i, n = 0, mydrive, myseat;
+    if (!g_vehsync || g_ns == INVALID_SOCKET || !player_ready(g_net_id)) return;
+    /* host: re-pick the vehicles within 150 m of us or the avatar, a pass every 10 s spread over frames */
+    if (g_npc_role == 1) {
+        if (!vs.busy && (!last_scan || now - last_scan > 10000)) {
+            void *hd = NULL;
+            BYTE *me = entity_obj(g_net_id, &hd), *av;
+            if (hd) { (*(int *)((BYTE *)hd + 8))--; hd = NULL; }
+            memset(mp, 0, sizeof mp);
+            if (me) memcpy(mp, me + 0x60, 2 * sizeof(float));
+            av = g_av_id ? entity_obj(g_av_id, &hd) : NULL;
+            if (hd) (*(int *)((BYTE *)hd + 8))--;
+            if (av) memcpy(mp + 2, av + 0x60, 2 * sizeof(float)); else { mp[2] = mp[0]; mp[3] = mp[1]; }
+            g_vh_bn = 0; last_scan = now; vs.busy = 0; vs.vt = 0xE1A790; vs.hoff = 8;
+            npc_scan_step(&vs, 0, veh_scan_cb, mp);
+        }
+        if (vs.busy && npc_scan_step(&vs, 16u << 20, veh_scan_cb, mp)) {
+            int j, k, old = g_vh_n;
+            for (j = 0; j < g_vh_bn; j++) {
+                for (k = 0; k < g_vh_n && g_vh[k].id != g_vh_build[j]; k++) ;
+                if (k == g_vh_n && g_vh_n < 32) { memset(&g_vh[g_vh_n], 0, sizeof g_vh[0]); g_vh[g_vh_n++].id = g_vh_build[j]; }
+            }
+            for (k = 0; k < g_vh_n; k++) {   /* drop the ones no longer near */
+                for (j = 0; j < g_vh_bn && g_vh_build[j] != g_vh[k].id; j++) ;
+                if (j == g_vh_bn) g_vh[k--] = g_vh[--g_vh_n];
+            }
+            if (g_vh_n != old) logf_("vehsync host: %d vehicles within 150 m of us or the avatar (pass %lu ms)", g_vh_n, GetTickCount() - last_scan);
+        }
+    }
+    mine = veh_mine(&myseat, &mydrive);
+    /* 20 Hz while we drive, 10 Hz otherwise */
+    if (now - last_send < (mydrive ? 50u : 100u)) return;
+    last_send = now;
+    memset(&pk, 0, sizeof pk);
+    if (mine != ~0ULL && veh_fill(mine, &pk.e[n])) {
+        pk.e[n].flags = VF_SEAT | (mydrive ? VF_DRIVE : 0);
+        pk.e[n].seat = (unsigned char)(myseat < 0 ? 0 : myseat);
+        n++;
+    }
+    if (g_npc_role == 1)
+        for (i = 0; i < g_vh_n && n < VEH_MAX; i++) {
+            VehEnt *e = &pk.e[n];
+            float sp, dx, dy, dz;
+            if (g_vh[i].id == mine || veh_peer_drives(g_vh[i].id, now) || !veh_fill(g_vh[i].id, e)) continue;
+            sp = e->vel[0] * e->vel[0] + e->vel[1] * e->vel[1] + e->vel[2] * e->vel[2] + e->avel[0] * e->avel[0] + e->avel[1] * e->avel[1] + e->avel[2] * e->avel[2];
+            dx = e->pos[0] - g_vh[i].pos[0]; dy = e->pos[1] - g_vh[i].pos[1]; dz = e->pos[2] - g_vh[i].pos[2];
+            if (sp > 0.04f || dx * dx + dy * dy + dz * dz > 0.01f) g_vh[i].moving = now;
+            memcpy(g_vh[i].pos, e->pos, sizeof g_vh[i].pos);
+            /* moving, or up to 2 s after it stopped so the resting pose arrives; still ones every 5 s */
+            if (now - g_vh[i].moving > 2000 && now - g_vh[i].sent < 5000) continue;
+            e->flags = VF_HOST; g_vh[i].sent = now; n++;
+        }
+    if (!n) return;
+    pk.magic = VEH_MAGIC; pk.seq = ++seq; pk.count = n;
+    sendto(g_ns, (char *)&pk, (int)(offsetof(VehPkt, e) + n * sizeof(VehEnt)), 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+    g_veh_tx++;
+}
+static void veh_rx(const VehPkt *pk, int len)
+{
+    DWORD now = GetTickCount();
+    unsigned i, n = pk->count;
+    if (!g_vehsync || n > VEH_MAX || len != (int)(offsetof(VehPkt, e) + n * sizeof(VehEnt))) return;
+    g_veh_rx++;
+    for (i = 0; i < n; i++) {
+        const VehEnt *e = &pk->e[i];
+        int j, f = -1;
+        if (e->flags & VF_SEAT) { g_peer_veh = e->id; g_peer_seat = e->seat; g_peer_veh_t = now; }
+        if (e->flags & VF_DRIVE) {
+            for (j = 0; j < VEH_MAX && g_peer_drives[j] != e->id && now - g_peer_drives_t[j] < 1000; j++) ;
+            if (j < VEH_MAX) { g_peer_drives[j] = e->id; g_peer_drives_t[j] = now; }
+        }
+        if (!(e->flags & (VF_DRIVE | VF_HOST))) continue;
+        if (!veh_body(e->id)) {
+            if (++g_veh_unknown <= 20) logf_("vehsync: vehicle %llx from the peer is not in our world (or has no body)", e->id);
+            continue;
+        }
+        for (j = 0; j < VEH_MAX; j++) if (g_vp[j].id == e->id) { f = j; break; }
+        if (f < 0) for (j = 0; j < VEH_MAX; j++) if (!g_vp[j].id || now - g_vp[j].t > 3000) { f = j; break; }
+        if (f < 0) continue;
+        if (g_vp[f].id != e->id) { memset(&g_vp[f], 0, sizeof g_vp[f]); g_vp[f].id = e->id; logf_("vehsync: puppet for vehicle %llx", e->id); }
+        g_vp[f].e = *e; g_vp[f].t = now;
+    }
+}
+/* steer the puppets every frame */
+static void veh_puppet_tick(DWORD now)
+{
+    int i, myseat, mydrive;
+    unsigned long long mine = veh_mine(&myseat, &mydrive);
+    for (i = 0; i < VEH_MAX; i++) {
+        const VehEnt *e = &g_vp[i].e;
+        void *hd = NULL;
+        BYTE *obj, *w;
+        float dt, tp[3], err[3], d2, cq[4], re[3], v[4], av[4], ang2;
+        int k;
+        if (!g_vp[i].id || now - g_vp[i].t > 1500) continue;
+        if (g_vp[i].id == mine && mydrive) continue;   /* we drive it ourselves: ours wins, the peer gets our state */
+        obj = entity_obj(g_vp[i].id, &hd);
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        if (!obj || !(w = veh_body(g_vp[i].id))) continue;
+        dt = (now - g_vp[i].t) / 1000.0f;
+        if (dt > 0.3f) dt = 0.3f;
+        for (k = 0; k < 3; k++) { tp[k] = e->pos[k] + e->vel[k] * dt; err[k] = tp[k] - *(float *)(obj + 0x60 + 4 * k); }
+        d2 = err[0] * err[0] + err[1] * err[1] + err[2] * err[2];
+        veh_m2q(obj, cq);
+        veh_qerr(cq, e->q, re);
+        ang2 = re[0] * re[0] + re[1] * re[1] + re[2] * re[2];
+        if (!g_vp[i].snapped || d2 > 16.0f || ang2 > 0.8f * 0.8f) {
+            float p[4] = { tp[0], tp[1], tp[2], 0 }, q[4];
+            memcpy(q, e->q, sizeof q);
+            vb(w, 0x48, p); vb(w, 0x4C, q);
+            g_vp[i].snapped = 1;
+            if (++g_veh_snaps <= 40) logf_("vehsync: puppet %llx placed (off %.1f m, %.0f deg)", g_vp[i].id, sqrtf(d2), sqrtf(ang2) * 57.3f);
+        }
+        /* resting and in place: leave the body alone so it can sleep */
+        if (d2 < 0.0025f && ang2 < 0.0004f && e->vel[0] * e->vel[0] + e->vel[1] * e->vel[1] + e->vel[2] * e->vel[2] < 0.0025f &&
+            e->avel[0] * e->avel[0] + e->avel[1] * e->avel[1] + e->avel[2] * e->avel[2] < 0.0025f) continue;
+        for (k = 0; k < 3; k++) { v[k] = e->vel[k] + 4.0f * err[k]; av[k] = e->avel[k] + 4.0f * re[k]; }
+        v[3] = av[3] = 0;
+        vb(w, 0x50, v); vb(w, 0x54, av);
+    }
+}
+/* the other player's seat on our avatar */
+static void veh_avatar_tick(void)
+{
+    unsigned long long want = g_peer_veh;
+    BYTE *pw, *im, *obj;
+    void *hd = NULL, *bc;
+    unsigned prof;
+    if (!g_av_id) { g_av_veh = ~0ULL; g_av_seat = -1; return; }
+    if (want == g_av_veh && (want == ~0ULL || g_peer_seat == g_av_seat)) return;
+    if (!(pw = pawn_comp_of(g_av_id))) return;
+    if (g_av_veh != ~0ULL && (im = veh_impl(g_av_veh)) && g_av_seat >= 0) {
+        /* the engine's exit (E4E70) runs the pawn's get-out sequence, which our avatar doesn't have, and left the seat
+         * taken (the host could not drive that car again): free the seat by hand and take the seat out of the anim
+         * graph (v2A seat type, v53 seat index, as 151D50 set them) */
+        BYTE *st = *(BYTE **)(im + 0xC) + g_av_seat * VEH_SEAT_STRIDE;
+        unsigned *v;
+        if (*(unsigned long long *)(st + 0x28) == g_av_id) { *(unsigned long long *)(st + 0x28) = ~0ULL; *(int *)(st + 0x30) = 0; *(int *)(st + 0x24) = -1; st[0x21] = 0; }
+        obj = entity_obj(g_av_id, &hd);
+        if (hd) { (*(int *)((BYTE *)hd + 8))--; hd = NULL; }
+        if ((v = npc_animvars(obj))) { v[0x2A] = 0; v[0x53] = 0; }
+        logf_("vehsync: avatar leaves vehicle %llx (seat %d)", g_av_veh, g_av_seat);
+    }
+    g_av_veh = ~0ULL; g_av_seat = -1;
+    prof = 0x10F7D787u;   /* "standard" */
+    if (want != ~0ULL && (im = veh_impl(want)) && g_peer_seat >= 0 && g_peer_seat < (int)*(unsigned *)(im + 0x10)) {
+        int type = *(int *)(*(BYTE **)(im + 0xC) + g_peer_seat * VEH_SEAT_STRIDE + 0x10);
+        veh_seat_call(1, im, g_peer_seat, pw);
+        /* a seated user has seat state 4 (D8050 leaves 2 = getting in; the engine's own sequence moves it on) */
+        if (veh_seat_of(im, g_av_id) == g_peer_seat) *(int *)(*(BYTE **)(im + 0xC) + g_peer_seat * VEH_SEAT_STRIDE + 0x30) = 4;
+        g_av_veh = want; g_av_seat = g_peer_seat;
+        prof = type == 1 ? 0x1B80E486u : type == 2 ? 0xCE7A971Cu : 0xC83DA229u;   /* vehicle / mountedweapon / vehiclepassenger */
+        logf_("vehsync: avatar sits in vehicle %llx seat %d (type %d), seat user now %d", want, g_av_seat, type, veh_seat_of(im, g_av_id));
+    } else if (want != ~0ULL) { g_av_veh = want; g_av_seat = -1; logf_("vehsync: the peer's vehicle %llx is not in our world", want); return; }
+    obj = entity_obj(g_av_id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    bc = obj ? ((void *(__attribute__((thiscall)) *)(void *, void *))(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4)) : NULL;
+    if (bc) ((void (__attribute__((thiscall)) *)(void *, unsigned *))(g_base + 0xE97C0))(bc, &prof);
+}
+static void veh_tick(DWORD now)
+{
+    static DWORD last_log;
+    if (!g_vehsync) return;
+    /* a seated player's side sends its seat at 10-20 Hz; a joiner on foot sends no VEH1 at all, so the timeout is
+     * checked here: no seat entry for 0.6 s = its player got out */
+    if (g_peer_veh != ~0ULL && now - g_peer_veh_t > 600) g_peer_veh = ~0ULL;
+    veh_send_tick(now);
+    veh_puppet_tick(now);
+    veh_avatar_tick();
+    if (now - last_log > 5000 && (g_veh_rx || g_veh_tx)) {
+        int i, np = 0;
+        last_log = now;
+        for (i = 0; i < VEH_MAX; i++) if (g_vp[i].id && now - g_vp[i].t < 1500) np++;
+        logf_("vehsync: tx %u rx %u, %d live puppets, peer in %llx seat %d, avatar in %llx", g_veh_tx, g_veh_rx, np, g_peer_veh, g_peer_seat, g_av_veh);
+    }
+}
+
 static void net_tick(void)
 {
     DWORD now;
@@ -3670,6 +4123,7 @@ static void net_tick(void)
         if (r == 16 && rb.magic == BYE_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) { if (!g_peer_bye) logf_("bye: the peer is leaving"); g_peer_bye = 1; g_bye_at = GetTickCount(); } continue; }
         if (r == (int)sizeof(RldPkt) && rb.magic == RLD_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) rld_rx((const RldPkt *)&rb); continue; }
         if (r == (int)sizeof(HitPkt) && rb.magic == HIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) hit_apply((const HitPkt *)&rb); continue; }
+        if (r >= (int)offsetof(VehPkt, e) && rb.magic == VEH_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) veh_rx((const VehPkt *)&rb, r); continue; }
         if (r >= 12 && rb.magic == NPC_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_rx(&rb, r); continue; }
         if (r > (int)sizeof q4) { g_net_drop++; continue; }
         memcpy(&q4, &rb, r);
@@ -3788,6 +4242,7 @@ static void net_tick(void)
     hit_tick(now);
     dumpd_tick(now);
     npc_join_tick(now);
+    veh_tick(now);
     /* send at 20 Hz */
     if ((g_bodymat || g_net_id) && now - g_net_lastsend >= 50 && player_ready(g_net_id)) {
         NetPktX4 q4;
