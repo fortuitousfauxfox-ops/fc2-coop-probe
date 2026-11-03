@@ -1643,6 +1643,43 @@ static void native_cmd(const char *ln)
         logf_("vehseats %llu: comp %p impl %p seats %u at %p", id, vc, im, n, *(void **)(im + 0xC));
         hexdump_(im, 0x40);
         for (i = 0; i < n && i < 8; i++) if (!IsBadReadPtr(*(BYTE **)(im + 0xC) + i * 0x50, 0x50)) hexdump_(*(BYTE **)(im + 0xC) + i * 0x50, 0x50);
+    } else if (sscanf(ln, "avtake %llu", &id) == 1) {
+        /* avtake <gadget entity>: bind it to the avatar's hand animation with its gadget comp FUN_10156b40(pawn comp)
+         * and show it (Lua SetVisibility), as av_compass does for the GPS. RE only. */
+        typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+        typedef void (__attribute__((thiscall)) *take_t)(void *gadget, void *pawn);
+        void *h1 = NULL, *h2 = NULL, *pawn = NULL, *gc = NULL;
+        BYTE *ao = g_av_id ? entity_obj(g_av_id, &h1) : NULL, *go = entity_obj(id, &h2);
+        char code[96], out[32];
+        if (h1) (*(int *)((BYTE *)h1 + 8))--;
+        if (h2) (*(int *)((BYTE *)h2 + 8))--;
+        if (ao) pawn = ((gcomp_t)(g_base + 0x4E2CC0))(ao, (void *)(g_base + 0xFDE39C));
+        if (go) gc = ((gcomp_t)(g_base + 0x4E2CC0))(go, (void *)(g_base + 0xFDFFB4));
+        if (!pawn || !gc) { logf_("avtake %llu: pawn %p gadget %p", id, pawn, gc); return; }
+        ((take_t)(g_base + 0x156B40))(gc, pawn);
+        snprintf(code, sizeof code, "SetVisibility('%llu', true) __out = 'ok'", id);
+        lua_eval(code, out, sizeof out);
+        logf_("avtake %llu: bound to the avatar's hands", id);
+    } else if (strncmp(ln, "attach ", 7) == 0) {
+        /* attach <child id> <parent id> <bone hash hex> qx qy qz qw x y z: FUN_104e11b0(parent, child handle, &bone, 0, 0),
+         * then local rotation FUN_104df660 and position FUN_104e01b0 (see av_compass). RE only. */
+        typedef void (__attribute__((thiscall)) *attach_t)(void *parent, void *child, const unsigned *bone, int a, int b);
+        typedef void (__attribute__((thiscall)) *lrot_t)(void *ent, const float *q, int f);
+        typedef void (__attribute__((thiscall)) *lpos_t)(void *ent, float x, float y, float z);
+        static float q[4] __attribute__((aligned(16)));
+        unsigned long long cid, pid;
+        unsigned bone;
+        float x, y, z;
+        void *ch = NULL, *ph = NULL;
+        BYTE *co, *po;
+        if (sscanf(ln + 7, "%llu %llu %x %f %f %f %f %f %f %f", &cid, &pid, &bone, &q[0], &q[1], &q[2], &q[3], &x, &y, &z) != 10) { logf_("attach: bad arguments"); return; }
+        co = entity_obj(cid, &ch); po = entity_obj(pid, &ph);
+        if (ph) (*(int *)((BYTE *)ph + 8))--;
+        if (!co || !po || !ch) { if (ch) (*(int *)((BYTE *)ch + 8))--; logf_("attach: no entity (%p %p)", co, po); return; }
+        ((attach_t)(g_base + 0x4E11B0))(po, ch, &bone, 0, 0);   /* releases the reference entity_obj took on ch */
+        ((lrot_t)(g_base + 0x4DF660))(co, q, 0);
+        ((lpos_t)(g_base + 0x4E01B0))(co, x, y, z);
+        logf_("attach: %llu to %llu bone %08x rot %.3f %.3f %.3f %.3f pos %.3f %.3f %.3f", cid, pid, bone, q[0], q[1], q[2], q[3], x, y, z);
     } else if (sscanf(ln, "vcall1 %lx %lx %d", &a, &pv, &n) == 3) {
         /* vcall1 <obj> <vtable byte offset> <int>: thiscall obj->vf(int) for one-argument methods (RET 4). RE only. */
         if (IsBadReadPtr((void *)a, 4) || IsBadReadPtr(*(void **)a, pv + 4)) { logf_("vcall1 %lx: bad object", a); return; }
