@@ -3091,6 +3091,25 @@ static void av_tick(DWORD now)
             return;
         }
     }
+    {
+        /* the avatar walks (NetPlayer), it can't follow a teleport: the host spawned it where the joiner stood after
+         * loading the save, the joiner was then moved next to the host (~150 m) and the avatar stayed at the old spot
+         * (two-PC test 2026-11-02). More than 30 m from the peer for 2 s: spawn it again where the peer is. */
+        static DWORD far_since;
+        void *hd = NULL;
+        BYTE *o = entity_obj(g_av_id, &hd);
+        float dx = 0, dy = 0;
+        if (o) { dx = g_remote.pos[0] + g_av_off[0] - *(float *)(o + 0x60); dy = g_remote.pos[1] + g_av_off[1] - *(float *)(o + 0x64); }
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        if (!o || g_av_fake || dx * dx + dy * dy < 30.0f * 30.0f) far_since = 0;
+        else if (!far_since) far_since = now | 1;
+        else if (now - far_since > 2000 && now - g_av_lastspawn > 5000) {
+            logf_("avatar %llu is %.0f m from the peer (a teleport?): spawning it again there", g_av_id, sqrtf(dx * dx + dy * dy));
+            far_since = 0;
+            av_remove();
+            return;
+        }
+    }
     if (g_av_np) {
         /* give the new entity a moment to finish spawning, then set it up once */
         if (!g_av_mem) {
