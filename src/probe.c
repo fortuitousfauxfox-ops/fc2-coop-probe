@@ -745,6 +745,30 @@ static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, con
  * the old weapon of that category FUN_10129de0 -> FUN_1012e3e0(old, 0) and its entity removed, FUN_101289f0(weapon),
  * then select it like SelectWeapon (FUN_1012ce80 -> FUN_1012b9b0: inventory weapon mode +0x78 = 1, current weapon) */
 static int pawn_give_weapon(BYTE *obj, const char *arch, const char *who);
+static void *g_last_gadget;          /* gadget component pawn_give_weapon added last */
+static void *g_av_mapcomp;           /* the avatar's map gadget component while its GPS is in the hand */
+/* The GPS in the other hand while the map is out: the map's UseStrategy (gadget comp +0x10, vtable E99EC0) owns a
+ * compass entity (gadgets.Equipped.CompassSingle, handle at +0x108). Its open method (vf slot 15) puts it in the hand
+ * with FUN_106edcc0(strategy, handle, pawn comp), close (slot 16) back on the belt with FUN_106ec850 - only for a
+ * player who uses the map, so the avatar's map comes without it. Both thiscall, RET 8, take a reference on the
+ * handle. in_hand 0 also forgets the map. */
+static void av_compass(int in_hand)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    typedef void (__attribute__((thiscall)) *att_t)(void *strat, void *handle, void *pawn);
+    void *hd = NULL, *pawn;
+    BYTE *obj = g_av_id ? entity_obj(g_av_id, &hd) : NULL, *st, *h;
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    st = g_av_mapcomp && !IsBadReadPtr(g_av_mapcomp, 0x14) ? *(BYTE **)((BYTE *)g_av_mapcomp + 0x10) : NULL;
+    if (!in_hand) g_av_mapcomp = NULL;
+    if (!obj || !st || IsBadReadPtr(st, 0x10C) || *(unsigned *)st != (unsigned)(g_base + 0xE99EC0)) { logf_("avgps: no map strategy (%p)", st); return; }
+    h = *(BYTE **)(st + 0x108);
+    pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
+    if (!pawn || !h || IsBadReadPtr(h, 0x10) || !*(void **)(h + 0xC)) { logf_("avgps: strategy %p has no compass (%p)", st, h); return; }
+    (*(int *)(h + 8))++;
+    ((att_t)(g_base + (in_hand ? 0x6EDCC0 : 0x6EC850)))(st, h, pawn);
+    logf_("avgps: compass %llu %s (strategy %p)", *(unsigned long long *)h, in_hand ? "in the hand" : "on the belt", st);
+}
 /* holster what a pawn holds (FUN_1012b340 on its inventory, what the Lua HolsterWeapon does for the player); a gadget
  * in the hands (map / GPS: inventory impl +0x74 = 2) is put away with FUN_1012b350 */
 static void pawn_holster(BYTE *obj)
@@ -810,6 +834,7 @@ static int pawn_give_weapon(BYTE *obj, const char *arch, const char *who)
         ((inv1_t)(g_base + 0x128A00))(inv, wc);
         cat = IsBadReadPtr((void *)slot, 4) ? 0 : *(unsigned *)slot;
         if (cat) ((sel_t)(g_base + 0x12E410))(inv, &cat);
+        g_last_gadget = wc;
         logf_("%s: gadget %s entity %llu comp %p category %08x -> inventory %p (old %p), hands %d", who, arch, wid, wc, cat, inv, old,
               *(int *)(*(BYTE **)((BYTE *)inv + 4) + 0x74));
         return 1;
@@ -2388,7 +2413,7 @@ static BYTE *g_st_obj[2];   /* defined with the stim hooks below */
 static void av_forget(void)
 {
     g_st_obj[0] = NULL;
-    g_av_id = 0; g_av_body = g_av_mat = NULL; g_av_have = 0;
+    g_av_id = 0; g_av_body = g_av_mat = NULL; g_av_have = 0; g_av_mapcomp = NULL;
     g_av_mem = NULL; g_av_comp = NULL; g_av_npstate = 0; g_av_weap[0] = 0; g_av_lastseq = 0; g_av_smhave = 0;
 }
 
@@ -3356,6 +3381,7 @@ static void av_tick(DWORD now)
         /* the peer changed the weapon in its hands: give the avatar the same one (a failed try is retried after 2 s) */
         if (strcmp(g_rx_weap, g_av_weap) && now - g_av_weap_try > 2000) {
             g_av_weap_try = now;
+            if (g_av_mapcomp) av_compass(0);   /* the map goes away: its GPS back to the belt first */
             /* empty hands, or a stationary gun (weapons.MountedWeapons.*, given as a hand weapon it hung at the avatar's
              * side): holster; using the mounted gun itself is not replicated yet */
             if (!g_rx_weap[0] || !strncmp(g_rx_weap, "weapons.MountedWeapons.", 23)) {
@@ -3367,7 +3393,10 @@ static void av_tick(DWORD now)
                 strcpy(g_av_weap, g_rx_weap);
                 g_av_weap_try = 0;
             }
-            else if (av_give_weapon(g_rx_weap)) { strcpy(g_av_weap, g_rx_weap); g_av_weap_try = 0; }
+            else if (av_give_weapon(g_rx_weap)) {
+                strcpy(g_av_weap, g_rx_weap); g_av_weap_try = 0;
+                if (!strcmp(g_rx_weap, "gadgets.Equipped.Map")) { g_av_mapcomp = g_last_gadget; av_compass(1); }
+            }
         }
         return;
     }
