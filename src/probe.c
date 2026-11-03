@@ -351,6 +351,10 @@ static Target g_targets[] = {
 static int g_npc_role;            /* npcsync: 1 host, 2 join (declared here for coop_flags.txt) */
 static int g_noautodraw;          /* coop_flags.txt "noautodraw": leave our player's inventory bAutoDraw as loaded */
 static int g_vehsync;              /* vehsync 0|1 (defined with the vehicle sync) */
+static int g_siglog, g_sigsync;     /* siglog 0|1|2, sigsync 0|1 (defined with the state signals) */
+static unsigned g_sig_deny[32];
+static int g_sig_ndeny;
+static int sig_denied(unsigned h);
 static int patch_iat(HMODULE m)
 {
     BYTE *base = (BYTE *)m;
@@ -1594,6 +1598,15 @@ static void native_cmd(const char *ln)
         if (!ex && n >= (int)*(unsigned *)(im + 0x10)) { logf_("vehseat: seat %d of %u", n, *(unsigned *)(im + 0x10)); return; }
         logf_("%s %llu %llu %d: call ok %d, seat now %d, pawn current vehicle %llx", ex ? "vehexit" : "vehseat", id, k0x, n,
               veh_seat_call(ex ? 2 : n < 0 ? 0 : 1, im, n, pw), veh_seat_of(im, id), pawn_bb_u64(id, 0xFD1BA782u));
+    } else if (sscanf(ln, "siglog %d", &n) == 1) {
+        /* siglog 0|1|2|3: log state signals of our player and the avatar (2 also other pawns, first 400; 3 all) */
+        g_siglog = n; logf_("siglog %d", n);
+    } else if (sscanf(ln, "sigsync %d", &n) == 1) {
+        g_sigsync = n; logf_("sigsync %d (%d denied)", n, g_sig_ndeny);
+    } else if (sscanf(ln, "sigdeny %lx", &a) == 1) {
+        /* sigdeny <crc32>: never send this signal (ones the avatar gets from NetPlayer / vehicle sync anyway) */
+        if (!sig_denied((unsigned)a) && g_sig_ndeny < 32) g_sig_deny[g_sig_ndeny++] = (unsigned)a;
+        logf_("sigdeny %08lx (%d denied)", a, g_sig_ndeny);
     } else if (sscanf(ln, "pawnsig %llu %lx", &id, &a) == 2) {
         /* pawnsig <id> <signal crc32>: a signal for the pawn's GO state machine (e.g. b2b02045 entervehicle_new) */
         BYTE *pw = pawn_comp_of(id);
@@ -4256,6 +4269,105 @@ static void veh_tick(DWORD now)
     }
 }
 
+/* ---- state machine signals (SIG1). FUN_1029da10(driver, hash) passes a signal (CRC32 of its name) to every GO state
+ * machine of a pawn (driver = pawn comp vf+0x78). 255 call sites: interactions (doors, healing, pickups), vehicles,
+ * weapons, reactions. The detour records the signals our own player's driver gets (any thread, lock-free ring); the
+ * main thread sends them to the peer, whose probe passes them to the avatar's driver the same way. ---- */
+#define SIG_MAGIC 0x31474953u      /* "SIG1" */
+#define SIG_N 8
+typedef struct { unsigned magic, seq, n, hash[SIG_N]; } SigPkt;   /* hash[i] has seq - n + 1 + i */
+static void *g_sig_orig;
+static void *volatile g_sig_mydrv, *volatile g_sig_avdrv;
+static volatile LONG g_sig_w;
+static LONG g_sig_r;
+static struct { unsigned hash, caller; void *drv; } g_sig_ring[128];
+static unsigned g_sig_seq, g_sig_hist[SIG_N], g_sig_rx_seq, g_sig_tx, g_sig_rx;
+static DWORD g_sig_new_t, g_sig_sent_t;
+static void __attribute__((thiscall)) sig_hook(void *drv, unsigned hash)
+{
+    if (drv && (drv == g_sig_mydrv || g_siglog >= 2 || (g_siglog && drv == g_sig_avdrv))) {
+        LONG i = InterlockedIncrement(&g_sig_w) - 1;
+        g_sig_ring[i & 127].hash = hash; g_sig_ring[i & 127].drv = drv;
+        g_sig_ring[i & 127].caller = (unsigned)__builtin_return_address(0) - (unsigned)g_base;
+    }
+    ((void (__attribute__((thiscall)) *)(void *, unsigned))g_sig_orig)(drv, hash);
+}
+static void sig_install(void)
+{
+    /* 29DA10: mov eax,[esp+4]; cmp eax,[10E2C55C] (10 bytes, both position independent), then push edi */
+    static const BYTE pro[10] = { 0x8B, 0x44, 0x24, 0x04, 0x3B, 0x05, 0x5C, 0xC5, 0xE2, 0x10 };
+    if (g_sig_orig) return;
+    if (memcmp(g_base + 0x29DA10, pro, sizeof pro)) { logf_("sig: unexpected bytes at 29DA10, no signal hook"); return; }
+    g_sig_orig = make_detour(g_base + 0x29DA10, 10, (void *)sig_hook, 1);
+    logf_("sig: signal hook on 29DA10 installed");
+}
+static void *pawn_driver(unsigned long long id)
+{
+    BYTE *pw = id ? pawn_comp_of(id) : NULL;
+    return pw ? ((void *(__attribute__((thiscall)) *)(void *))(*(void ***)pw)[0x78 / 4])(pw) : NULL;
+}
+static int sig_denied(unsigned h)
+{
+    int i;
+    for (i = 0; i < g_sig_ndeny; i++) if (g_sig_deny[i] == h) return 1;
+    return 0;
+}
+static void sig_send(void)
+{
+    SigPkt k;
+    k.magic = SIG_MAGIC; k.seq = g_sig_seq; k.n = g_sig_seq < SIG_N ? g_sig_seq : SIG_N;
+    memcpy(k.hash, g_sig_hist + (SIG_N - k.n), k.n * 4);
+    memset(k.hash + k.n, 0, (SIG_N - k.n) * 4);
+    sendto(g_ns, (char *)&k, sizeof k, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+    g_sig_tx++;
+}
+static void sig_rx(const SigPkt *k)
+{
+    unsigned i, s0;
+    BYTE *pw;
+    if (k->n > SIG_N || k->seq < k->n) return;
+    if (k->seq < g_sig_rx_seq) g_sig_rx_seq = 0;          /* the peer's probe restarted */
+    if (k->seq == g_sig_rx_seq) return;
+    pw = g_av_id ? pawn_comp_of(g_av_id) : NULL;
+    s0 = k->seq - k->n + 1;
+    for (i = 0; i < k->n; i++) {
+        if (s0 + i <= g_sig_rx_seq) continue;
+        g_sig_rx++;
+        if (g_siglog) logf_("sig: avatar <- %08x (seq %u)%s", k->hash[i], s0 + i, pw ? "" : ", no avatar");
+        if (pw) pawn_state_event(pw, k->hash[i]);
+    }
+    g_sig_rx_seq = k->seq;
+}
+static void sig_tick(DWORD now)
+{
+    static DWORD drv_t;
+    if (!g_sig_orig) sig_install();
+    if (now - drv_t > 500) {
+        drv_t = now;
+        g_sig_mydrv = player_ready(g_net_id) ? pawn_driver(g_net_id) : NULL;
+        g_sig_avdrv = g_av_id ? pawn_driver(g_av_id) : NULL;
+    }
+    while (g_sig_r != g_sig_w) {
+        unsigned h = g_sig_ring[g_sig_r & 127].hash, c = g_sig_ring[g_sig_r & 127].caller;
+        void *d = g_sig_ring[g_sig_r & 127].drv;
+        int mine = d == g_sig_mydrv, tx = mine && g_sigsync && !sig_denied(h);
+        g_sig_r++;
+        if (g_siglog && (mine || d == g_sig_avdrv || g_siglog >= 3))
+            logf_("sig: %s %08x from D+%X%s", mine ? "me" : d == g_sig_avdrv ? "avatar" : "other", h, c, tx ? " -> peer" : "");
+        else if (g_siglog >= 2 && !mine) {
+            static unsigned nother;
+            if (++nother <= 400) logf_("sig: other %p %08x from D+%X", d, h, c);
+        }
+        if (tx) {
+            memmove(g_sig_hist, g_sig_hist + 1, (SIG_N - 1) * 4);
+            g_sig_hist[SIG_N - 1] = h; g_sig_seq++; g_sig_new_t = now;
+            sig_send(); g_sig_sent_t = now;
+        }
+    }
+    /* UDP can drop one: repeat the last packet twice, 100 ms apart */
+    if (g_sig_seq && now - g_sig_new_t < 250 && now - g_sig_sent_t >= 100) { sig_send(); g_sig_sent_t = now; }
+}
+
 static void net_tick(void)
 {
     DWORD now;
@@ -4359,6 +4471,7 @@ static void net_tick(void)
         if (r == (int)sizeof(RldPkt) && rb.magic == RLD_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) rld_rx((const RldPkt *)&rb); continue; }
         if (r == (int)sizeof(HitPkt) && rb.magic == HIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) hit_apply((const HitPkt *)&rb); continue; }
         if (r >= (int)offsetof(VehPkt, e) && rb.magic == VEH_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) veh_rx((const VehPkt *)&rb, r); continue; }
+        if (r == (int)sizeof(SigPkt) && rb.magic == SIG_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) sig_rx((const SigPkt *)&rb); continue; }
         if (r >= 12 && rb.magic == NPC_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_rx(&rb, r); continue; }
         if (r > (int)sizeof q4) { g_net_drop++; continue; }
         memcpy(&q4, &rb, r);
@@ -4478,6 +4591,7 @@ static void net_tick(void)
     dumpd_tick(now);
     npc_join_tick(now);
     veh_tick(now);
+    sig_tick(now);
     /* send at 20 Hz */
     if ((g_bodymat || g_net_id) && now - g_net_lastsend >= 50 && player_ready(g_net_id)) {
         NetPktX4 q4;
