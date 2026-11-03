@@ -1394,6 +1394,20 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "poke %lx %lx", &a, &pv) == 2) {
         if (IsBadWritePtr((void *)a, 4)) logf_("poke %lx: not writable", a);
         else { *(unsigned long *)a = pv; logf_("poke %lx = %08lx", a, pv); }
+    } else if (sscanf(ln, "vcall %lx %lx", &a, &pv) == 2 || sscanf(ln, "vcallp %lx %lx", &a, &pv) == 2) {
+        /* vcall <obj> <vtable byte offset> [f1 f2 f3 f4]: thiscall obj->vf(f1..f4 by value); vcallp passes a pointer
+         * to f1..f4 instead (vector setters) and logs what the callee left there. Logs eax. RE only. */
+        typedef unsigned (__attribute__((thiscall)) *vc_t)(void *, float, float, float, float);
+        typedef unsigned (__attribute__((thiscall)) *vcp_t)(void *, float *);
+        static float f[4];
+        int byptr = ln[5] == 'p';
+        unsigned r;
+        f[0] = f[1] = f[2] = f[3] = 0;
+        sscanf(ln + 5 + byptr, " %*x %*x %f %f %f %f", &f[0], &f[1], &f[2], &f[3]);
+        if (IsBadReadPtr((void *)a, 4) || IsBadReadPtr(*(void **)a, pv + 4)) { logf_("vcall %lx: bad object", a); return; }
+        r = byptr ? ((vcp_t)(*(void ***)a)[pv / 4])((void *)a, f)
+                  : ((vc_t)(*(void ***)a)[pv / 4])((void *)a, f[0], f[1], f[2], f[3]);
+        logf_("vcall %lx +%lx (%p) -> %08x, vec %.3f %.3f %.3f %.3f", a, pv, (*(void ***)a)[pv / 4], r, f[0], f[1], f[2], f[3]);
     } else logf_("native: unknown command: %s", ln);
 }
 
