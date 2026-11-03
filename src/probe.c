@@ -746,28 +746,46 @@ static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, con
  * then select it like SelectWeapon (FUN_1012ce80 -> FUN_1012b9b0: inventory weapon mode +0x78 = 1, current weapon) */
 static int pawn_give_weapon(BYTE *obj, const char *arch, const char *who);
 static void *g_last_gadget;          /* gadget component pawn_give_weapon added last */
-static void *g_av_mapcomp;           /* the avatar's map gadget component while its GPS is in the hand */
-/* The GPS in the other hand while the map is out: the map's UseStrategy (gadget comp +0x10, vtable E99EC0) owns a
- * compass entity (gadgets.Equipped.CompassSingle, handle at +0x108). Its open method (vf slot 15) puts it in the hand
- * with FUN_106edcc0(strategy, handle, pawn comp), close (slot 16) back on the belt with FUN_106ec850 - only for a
- * player who uses the map, so the avatar's map comes without it. Both thiscall, RET 8, take a reference on the
- * handle. in_hand 0 also forgets the map. */
+static void *g_av_mapcomp;           /* the avatar's map gadget component while it holds the map */
+static unsigned long long g_av_gps;  /* the avatar's own GPS entity while it holds the map (0 none) */
+/* The GPS in the other hand while the map is out. The map's UseStrategy (gadget comp +0x10, vtable E99EC0) owns a
+ * compass (gadgets.Equipped.CompassSingle, handle at +0x108) that its open method (vf slot 15, FUN_106edcc0) puts in
+ * the hand - only for a player who uses the map. That compass stays invisible on the avatar even when taken into its
+ * hand and shown, while a freshly spawned CompassSingle is drawn once the Lua SetVisibility shows it. So the avatar
+ * gets its own: spawned, bound to the pawn's hand animation by its gadget comp FUN_10156b40(pawn comp) (what
+ * FUN_106edcc0 does), shown; removed when the map goes away (in_hand 0, which also forgets the map). */
 static void av_compass(int in_hand)
 {
     typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
-    typedef void (__attribute__((thiscall)) *att_t)(void *strat, void *handle, void *pawn);
-    void *hd = NULL, *pawn;
-    BYTE *obj = g_av_id ? entity_obj(g_av_id, &hd) : NULL, *st, *h;
+    typedef void (__attribute__((thiscall)) *take_t)(void *gadget, void *pawn);
+    char code[200], out[64];
+    void *hd = NULL, *gh = NULL, *pawn, *gc;
+    BYTE *obj, *gobj;
+    if (!in_hand) {
+        g_av_mapcomp = NULL;
+        if (g_av_gps && !g_quitting) { snprintf(code, sizeof code, "RemoveEntity('%llu') __out = 'ok'", g_av_gps); lua_eval(code, out, sizeof out); logf_("avgps: GPS %llu removed", g_av_gps); }
+        g_av_gps = 0;
+        return;
+    }
+    obj = g_av_id ? entity_obj(g_av_id, &hd) : NULL;
     if (hd) (*(int *)((BYTE *)hd + 8))--;
-    st = g_av_mapcomp && !IsBadReadPtr(g_av_mapcomp, 0x14) ? *(BYTE **)((BYTE *)g_av_mapcomp + 0x10) : NULL;
-    if (!in_hand) g_av_mapcomp = NULL;
-    if (!obj || !st || IsBadReadPtr(st, 0x10C) || *(unsigned *)st != (unsigned)(g_base + 0xE99EC0)) { logf_("avgps: no map strategy (%p)", st); return; }
-    h = *(BYTE **)(st + 0x108);
-    pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
-    if (!pawn || !h || IsBadReadPtr(h, 0x10) || !*(void **)(h + 0xC)) { logf_("avgps: strategy %p has no compass (%p)", st, h); return; }
-    (*(int *)(h + 8))++;
-    ((att_t)(g_base + (in_hand ? 0x6EDCC0 : 0x6EC850)))(st, h, pawn);
-    logf_("avgps: compass %llu %s (strategy %p)", *(unsigned long long *)h, in_hand ? "in the hand" : "on the belt", st);
+    pawn = obj ? ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)) : NULL;
+    if (!pawn) return;
+    if (!g_av_gps) {
+        snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('gadgets.Equipped.CompassSingle', %.3f, %.3f, %.3f, 0, 0, 0))",
+                 *(float *)(obj + 0x60), *(float *)(obj + 0x64), *(float *)(obj + 0x68) + 1.2f);
+        lua_eval(code, out, sizeof out);
+        g_av_gps = strtoull(out, NULL, 10);
+        if (g_av_gps == 0xFFFFFFFFFFFFFFFFull) g_av_gps = 0;
+    }
+    gobj = g_av_gps ? entity_obj(g_av_gps, &gh) : NULL;
+    if (gh) (*(int *)((BYTE *)gh + 8))--;
+    gc = gobj ? ((gcomp_t)(g_base + 0x4E2CC0))(gobj, (void *)(g_base + 0xFDFFB4)) : NULL;
+    if (!gc) { logf_("avgps: GPS spawn failed (%s, entity %p)", out, gobj); return; }
+    ((take_t)(g_base + 0x156B40))(gc, pawn);
+    snprintf(code, sizeof code, "SetVisibility('%llu', true) __out = 'ok'", g_av_gps);
+    lua_eval(code, out, sizeof out);
+    logf_("avgps: GPS %llu in the avatar's hand, shown", g_av_gps);
 }
 /* holster what a pawn holds (FUN_1012b340 on its inventory, what the Lua HolsterWeapon does for the player); a gadget
  * in the hands (map / GPS: inventory impl +0x74 = 2) is put away with FUN_1012b350 */
@@ -1625,6 +1643,11 @@ static void native_cmd(const char *ln)
         logf_("vehseats %llu: comp %p impl %p seats %u at %p", id, vc, im, n, *(void **)(im + 0xC));
         hexdump_(im, 0x40);
         for (i = 0; i < n && i < 8; i++) if (!IsBadReadPtr(*(BYTE **)(im + 0xC) + i * 0x50, 0x50)) hexdump_(*(BYTE **)(im + 0xC) + i * 0x50, 0x50);
+    } else if (sscanf(ln, "vcall1 %lx %lx %d", &a, &pv, &n) == 3) {
+        /* vcall1 <obj> <vtable byte offset> <int>: thiscall obj->vf(int) for one-argument methods (RET 4). RE only. */
+        if (IsBadReadPtr((void *)a, 4) || IsBadReadPtr(*(void **)a, pv + 4)) { logf_("vcall1 %lx: bad object", a); return; }
+        logf_("vcall1 %lx +%lx (%p) -> %08x", a, pv, (*(void ***)a)[pv / 4],
+              ((unsigned (__attribute__((thiscall)) *)(void *, int))(*(void ***)a)[pv / 4])((void *)a, n));
     } else if (sscanf(ln, "vcall %lx %lx", &a, &pv) == 2 || sscanf(ln, "vcallp %lx %lx", &a, &pv) == 2) {
         /* vcall <obj> <vtable byte offset> [f1 f2 f3 f4]: thiscall obj->vf(f1..f4 by value); vcallp passes a pointer
          * to f1..f4 instead (vector setters) and logs what the callee left there. Logs eax. RE only. */
@@ -2413,7 +2436,7 @@ static BYTE *g_st_obj[2];   /* defined with the stim hooks below */
 static void av_forget(void)
 {
     g_st_obj[0] = NULL;
-    g_av_id = 0; g_av_body = g_av_mat = NULL; g_av_have = 0; g_av_mapcomp = NULL;
+    g_av_id = 0; g_av_body = g_av_mat = NULL; g_av_have = 0; av_compass(0);
     g_av_mem = NULL; g_av_comp = NULL; g_av_npstate = 0; g_av_weap[0] = 0; g_av_lastseq = 0; g_av_smhave = 0;
 }
 
@@ -3381,7 +3404,7 @@ static void av_tick(DWORD now)
         /* the peer changed the weapon in its hands: give the avatar the same one (a failed try is retried after 2 s) */
         if (strcmp(g_rx_weap, g_av_weap) && now - g_av_weap_try > 2000) {
             g_av_weap_try = now;
-            if (g_av_mapcomp) av_compass(0);   /* the map goes away: its GPS back to the belt first */
+            if (g_av_mapcomp) av_compass(0);   /* the map goes away: remove its GPS */
             /* empty hands, or a stationary gun (weapons.MountedWeapons.*, given as a hand weapon it hung at the avatar's
              * side): holster; using the mounted gun itself is not replicated yet */
             if (!g_rx_weap[0] || !strncmp(g_rx_weap, "weapons.MountedWeapons.", 23)) {
