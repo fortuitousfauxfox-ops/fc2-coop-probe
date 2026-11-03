@@ -349,6 +349,7 @@ static Target g_targets[] = {
 #define NT (sizeof g_targets / sizeof g_targets[0])
 
 static int g_npc_role;            /* npcsync: 1 host, 2 join (declared here for coop_flags.txt) */
+static int g_noautodraw;          /* coop_flags.txt "noautodraw": leave our player's inventory bAutoDraw as loaded */
 static int g_vehsync;              /* vehsync 0|1 (defined with the vehicle sync) */
 static int patch_iat(HMODULE m)
 {
@@ -373,6 +374,7 @@ static int patch_iat(HMODULE m)
          * while the world loads and the session connects (they started idle actions the host never saw) */
         if (strstr(flags, "npchost")) g_npc_role = 1;
         if (strstr(flags, "npcjoin")) g_npc_role = 2;
+        if (strstr(flags, "noautodraw")) g_noautodraw = 1;
     }
     for (i = 0; i < NT; i++) {
         HMODULE h = GetModuleHandleA(g_targets[i].dll);
@@ -743,7 +745,8 @@ static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, con
  * the old weapon of that category FUN_10129de0 -> FUN_1012e3e0(old, 0) and its entity removed, FUN_101289f0(weapon),
  * then select it like SelectWeapon (FUN_1012ce80 -> FUN_1012b9b0: inventory weapon mode +0x78 = 1, current weapon) */
 static int pawn_give_weapon(BYTE *obj, const char *arch, const char *who);
-/* holster what a pawn holds (FUN_1012b340 on its inventory, what the Lua HolsterWeapon does for the player) */
+/* holster what a pawn holds (FUN_1012b340 on its inventory, what the Lua HolsterWeapon does for the player); a gadget
+ * in the hands (map / GPS: inventory impl +0x74 = 2) is put away with FUN_1012b350 */
 static void pawn_holster(BYTE *obj)
 {
     typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
@@ -751,7 +754,11 @@ static void pawn_holster(BYTE *obj)
     typedef int (__attribute__((thiscall)) *iget_t)(void *inv);
     typedef void (__attribute__((thiscall)) *inv0_t)(void *inv);
     void *pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)), *inv;
-    if (pawn && (inv = ((inv_t)(g_base + 0x7E140))(pawn)) && ((iget_t)(g_base + 0x125F40))(inv) == 1) ((inv0_t)(g_base + 0x12B340))(inv);
+    BYTE *impl;
+    if (!pawn || !(inv = ((inv_t)(g_base + 0x7E140))(pawn))) return;
+    impl = *(BYTE **)((BYTE *)inv + 4);
+    if (impl && *(int *)(impl + 0x74) == 2) ((inv0_t)(g_base + 0x12B350))(inv);
+    if (((iget_t)(g_base + 0x125F40))(inv) == 1) ((inv0_t)(g_base + 0x12B340))(inv);
 }
 static int av_give_weapon(const char *arch)
 {
@@ -785,6 +792,28 @@ static int pawn_give_weapon(BYTE *obj, const char *arch, const char *who)
     if (!wobj) { logf_("%s: spawn of %s failed (%s)", who, arch, out); return 0; }
     pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
     wc = ((gcomp_t)(g_base + 0x4E2CC0))(wobj, (void *)(g_base + 0xFE01F8));
+    if (pawn && !wc && (wc = ((gcomp_t)(g_base + 0x4E2CC0))(wobj, (void *)(g_base + 0xFDFFB4)))) {
+        /* a gadget (map / GPS), added like the Lua AddGadget handler (LAB_109f9460) does: slot = vf+0x8C, the old
+         * gadget of that slot FUN_10129df0 -> FUN_1012e3f0, FUN_10149ec0(3), FUN_10128a00; then taken into the hands
+         * by category (FUN_1012e410 -> FUN_1012d730: holsters the weapon, impl +0x24 / +0x78 = 2, draws the gadget) */
+        typedef void *(__attribute__((thiscall)) *gslot_t)(void *inv, void *slot);
+        typedef void (__attribute__((thiscall)) *inv1_t)(void *inv, void *p);
+        typedef int (__attribute__((thiscall)) *cnt_t)(void *gadget, int n);
+        typedef void (__attribute__((thiscall)) *sel_t)(void *inv, unsigned *cat);
+        unsigned cat;
+        slot = ((slot_t)(*(void ***)wc)[0x8C / 4])(wc);
+        inv = ((inv_t)(g_base + 0x7E140))(pawn);
+        if (!inv) { logf_("%s: pawn has no inventory", who); return 0; }
+        old = ((gslot_t)(g_base + 0x129DF0))(inv, (void *)slot);
+        if (old) { void *oh = *(void **)((BYTE *)old + 8); ((inv1_t)(g_base + 0x12E3F0))(inv, old); if (oh) { snprintf(code, sizeof code, "RemoveEntity('%llu') __out = 'ok'", *(unsigned long long *)oh); lua_eval(code, out, sizeof out); } }
+        ((cnt_t)(g_base + 0x149EC0))(wc, 3);
+        ((inv1_t)(g_base + 0x128A00))(inv, wc);
+        cat = IsBadReadPtr((void *)slot, 4) ? 0 : *(unsigned *)slot;
+        if (cat) ((sel_t)(g_base + 0x12E410))(inv, &cat);
+        logf_("%s: gadget %s entity %llu comp %p category %08x -> inventory %p (old %p), hands %d", who, arch, wid, wc, cat, inv, old,
+              *(int *)(*(BYTE **)((BYTE *)inv + 4) + 0x74));
+        return 1;
+    }
     if (!pawn || !wc) { logf_("%s: pawn %p weapon comp %p (weapon entity %llu)", who, pawn, wc, wid); return 0; }
     slot = ((slot_t)(*(void ***)wc)[0x8C / 4])(wc);
     inv = ((inv_t)(g_base + 0x7E140))(pawn);
@@ -1964,10 +1993,21 @@ static void tx_encode(BYTE *obj, NetPktX *p, DWORD now)
         typedef void *(__fastcall *inv_t)(void *pawn);
         typedef int (__attribute__((thiscall)) *iget_t)(void *inv);
         typedef void *(__attribute__((thiscall)) *cur_t)(void *inv);
+        typedef void *(__fastcall *gcur_t)(void *impl);
         void *inv = ((inv_t)(g_base + 0x7E140))(pawn), *cur = NULL;
+        BYTE *impl = inv ? *(BYTE **)((BYTE *)inv + 4) : NULL;
         if (inv && ((iget_t)(g_base + 0x125F40))(inv) == 1) cur = ((cur_t)(g_base + 0x127DA0))(inv);
         lx_hook_weapon(cur);
+        /* bAutoDraw (inventory impl +0x4E, archetype setting 1 for the player) comes back 0 from the saves: then the
+         * weapon graph's "try auto-draw" (inventory request 18) never takes the weapon back after a grenade, a door
+         * or a vehicle - the same without the probe. Set it back unless coop_flags.txt says noautodraw. */
+        if (impl && !g_noautodraw && !impl[0x4E]) { impl[0x4E] = 1; logf_("tx: our inventory %p had bAutoDraw 0, set to 1", impl); }
+        /* a gadget in the hands (impl +0x74 = 2: the map with the GPS) is sent like a weapon, by its archetype name;
+         * FUN_10129090(impl) = the gadget component in the hands. Only gadgets.Equipped.*: grenades and molotovs are
+         * gadgets too (gadgets.Grenades.*) and stay "" (a burning molotov given to the avatar is not wanted) */
+        if (!cur && impl && *(int *)(impl + 0x74) == 2) cur = ((gcur_t)(g_base + 0x129090))(impl);
         if (cur != g_tx_wcur) {
+            int gadget = impl && *(int *)(impl + 0x74) == 2 && cur;
             char code[96];
             void *wh = cur ? *(void **)((BYTE *)cur + 8) : NULL;
             g_tx_wcur = cur; g_tx_weap[0] = 0;
@@ -1976,6 +2016,7 @@ static void tx_encode(BYTE *obj, NetPktX *p, DWORD now)
                 lua_eval(code, g_tx_weap, sizeof g_tx_weap);
                 if (!strcmp(g_tx_weap, "nil")) g_tx_weap[0] = 0;
             }
+            if (gadget && strncmp(g_tx_weap, "gadgets.Equipped.", 17)) { logf_("tx: gadget '%s' in hands, sent as none", g_tx_weap); g_tx_weap[0] = 0; }
             logf_("tx: weapon in hands now '%s' (%p)", g_tx_weap, cur);
         }
     }
@@ -3312,7 +3353,7 @@ static void av_tick(DWORD now)
             return;
         }
         np_tick(now);
-        /* the peer changed the weapon in its hands: give the avatar the same one (retry at most every 2 s) */
+        /* the peer changed the weapon in its hands: give the avatar the same one (a failed try is retried after 2 s) */
         if (strcmp(g_rx_weap, g_av_weap) && now - g_av_weap_try > 2000) {
             g_av_weap_try = now;
             /* empty hands, or a stationary gun (weapons.MountedWeapons.*, given as a hand weapon it hung at the avatar's
@@ -3324,8 +3365,9 @@ static void av_tick(DWORD now)
                 if (ao) pawn_holster(ao);
                 logf_("avweapon: peer holds '%s' -> avatar holsters", g_rx_weap);
                 strcpy(g_av_weap, g_rx_weap);
+                g_av_weap_try = 0;
             }
-            else if (av_give_weapon(g_rx_weap)) strcpy(g_av_weap, g_rx_weap);
+            else if (av_give_weapon(g_rx_weap)) { strcpy(g_av_weap, g_rx_weap); g_av_weap_try = 0; }
         }
         return;
     }
