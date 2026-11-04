@@ -541,7 +541,7 @@ static void npc_stat(void);
 static int player_ready(unsigned long long me);
 static void npc_join_tick(DWORD now);
 static int g_hitsync = 1, g_st_verbose, g_npcev_left;
-static int g_npcanim = 1;           /* npcanim: puppets take the host NPCs' animation graph inputs */
+static int g_npcanim = 2;           /* npcanim 0|1|2: puppets take the host NPCs' animation graph inputs (2: the pose too) */
 static int g_join_tp;              /* the joiner was put next to the host once */
 static int g_npcrespawn;            /* npcrespawn 1: replace puppets that run an action of their own (off: replacements are
                                      * spawned from the generic archetype and look different, and actions still differed) */
@@ -1360,8 +1360,8 @@ static void native_cmd(const char *ln)
         g_npcrespawn = atoi(ln + 11) != 0;
         logf_("npcrespawn: %s", g_npcrespawn ? "on" : "off");
     } else if (strncmp(ln, "npcanim ", 8) == 0) {
-        g_npcanim = atoi(ln + 8) != 0;
-        logf_("npcanim: NPC animation graph inputs %s", g_npcanim ? "follow the host" : "are the puppets' own");
+        g_npcanim = atoi(ln + 8);
+        logf_("npcanim %d: NPC animation graph inputs %s", g_npcanim, g_npcanim == 2 ? "all follow the host" : g_npcanim ? "follow the host" : "are the puppets' own");
     } else if (strncmp(ln, "npcev ", 6) == 0) {
         g_npcev_left = atoi(ln + 6);
         logf_("npcev: logging the next %d events on synced NPCs", g_npcev_left);
@@ -2979,7 +2979,7 @@ typedef struct { unsigned magic; unsigned long long id; unsigned v[NANM_VARS]; }
 static const unsigned char g_anim_own[] = { 0x00, 0x01, 0x02, 0x07, 0x08, 0x0b, 0x14, 0x1d, 0x1f, 0x20, 0x25, 0x26, 0x33, 0x34, 0x38, 0x40,
                                             0x5c, 0x5d, 0x5e, 0x5f, 0x62, 0x65, 0x66 };
 /* the animation graph's three layers (MoveLayer 0..2): what the AI and the GO states ask each layer to play ends up
- * as a move state id at +0x220 + layer * 4 of the same block (FUN_1051f500(layer, id, flag, blend) on the anim
+ * as a move state id at +0x220 + layer * 4 of the same block (FUN_1051f500(id, layer, flag, blend) on the anim
  * component writes it through FUN_1027c4f0: id, flag byte +0x274, dirty byte +0x284; FUN_1051f4e0(layer) reads it).
  * mslog 1 logs every change for host NPCs and puppets. */
 static int g_mslog;
@@ -3004,10 +3004,10 @@ static void ms_watch(const char *tag, unsigned long long id, const unsigned *v)
  * game's own request FUN_1051f500. ---- */
 #define NMS_MAGIC 0x31534D4Eu      /* "NMS1" */
 typedef struct { unsigned magic; unsigned long long id; int ms[3]; } NpcMsPkt;
-/* off: requests through FUN_1051f500 crash the joiner within seconds (Dunia+282D52 missing clip, then with the guard
- * +CF7D63, +286F82, +28462D: bad layer node pointers): the host's AI loads what a move state needs, the puppet's
- * does not, and a bare request does not either */
-static int g_nmssync = 0;          /* nmssync 0|1 */
+/* the first tries passed (layer, id): the id went in as a layer index and overwrote the block (+CF7D63, +286F82,
+ * +28462D crashes); the AI calls it as (id, layer from FUN_1051f5f0(id), 0, 0.0). Checked on A/B 2026-11-04 with
+ * npcanim 2 (owner: puppets calm like the host's and repeat their moves; smart terrain sitting still does not start) */
+static int g_nmssync = 1;          /* nmssync 0|1 */
 static unsigned g_nms_tx, g_nms_rx, g_nms_set;
 static struct { unsigned long long id; int ms[3]; DWORD sent; } g_nms_h[128];    /* host: last sent */
 static struct { unsigned long long id; int ms[3], done[3]; int ok; } g_nms_j[128];   /* joiner: last from the host, last requested */
@@ -3039,7 +3039,7 @@ static void nms_rx(const NpcMsPkt *k)
 static void nms_apply(unsigned long long id, BYTE *obj, const unsigned *v)
 {
     typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
-    typedef void (__attribute__((thiscall)) *req_t)(void *ac, int layer, int ms, int flag, float blend);
+    typedef void (__attribute__((thiscall)) *req_t)(void *ac, int ms, int layer, int flag, float blend);
     const int *cur = (const int *)((const BYTE *)v - 0x10 + 0x220);
     BYTE *ac;
     int i, l;
@@ -3055,7 +3055,7 @@ static void nms_apply(unsigned long long id, BYTE *obj, const unsigned *v)
         if (cur[l] != g_nms_j[i].ms[l] && g_nms_j[i].done[l] != g_nms_j[i].ms[l]) {
             g_nms_j[i].done[l] = g_nms_j[i].ms[l];
             if (++g_nms_set <= 300 || g_mslog) logf_("nms: puppet %llu layer %d: %x -> host's %x", id, l, cur[l], g_nms_j[i].ms[l]);
-            ((req_t)(g_base + 0x51F500))(ac, l, g_nms_j[i].ms[l], 0, 0.0f);
+            ((req_t)(g_base + 0x51F500))(ac, g_nms_j[i].ms[l], l, 0, 0.0f);
         }
 }
 /* a layer whose move state has no animation loaded here (the host's AI streamed it in for the NPC, the puppet's did
@@ -3221,7 +3221,7 @@ static void npc_host_tick(DWORD now)
              * and these datagrams were ~43 of the host's ~67 a second through the relay */
             {
                 unsigned key = (a.v[0x58] * 31u + a.v[0x42]) * 31u + ((a.v[0x11] * 31u + a.v[0x12]) * 31u + a.v[0x48]);
-                if (key == g_nh[i].animhash && now - g_nh[i].animsent < 2000) continue;
+                if (key == g_nh[i].animhash && now - g_nh[i].animsent < (g_npcanim == 2 ? 200u : 2000u)) continue;
                 g_nh[i].animhash = key; g_nh[i].animsent = now;
             }
             a.magic = NANM_MAGIC; a.id = g_nh[i].id;
@@ -3374,12 +3374,13 @@ static void npc_anim_rx(const NpcAnimPkt *a)
 /* called after a remote-driven main beautifier's update (mf_call) */
 static void npc_anim_apply(BYTE *mb)
 {
-    static unsigned char own[NANM_VARS];
+    static unsigned char own[NANM_VARS], move[NANM_VARS];
+    static const unsigned char movev[8] = { 0x00, 0x01, 0x02, 0x0b, 0x1d, 0x34, 0x38, 0x5f };
     static int init;
     unsigned *v;
     int j, k;
     if (g_npc_role != 2 || !g_npcanim) return;
-    if (!init) { for (k = 0; k < (int)sizeof g_anim_own; k++) own[g_anim_own[k]] = 1; init = 1; }
+    if (!init) { for (k = 0; k < (int)sizeof g_anim_own; k++) own[g_anim_own[k]] = 1; for (k = 0; k < 8; k++) move[movev[k]] = 1; init = 1; }
     for (j = 0; j < g_np_n; j++)
         if (g_np[j].mb == mb) {
             void *hd3 = NULL;
@@ -3395,7 +3396,10 @@ static void npc_anim_apply(BYTE *mb)
                           (int)g_np[j].av[0x58], (int)v[0x58], v[0x42], g_np[j].av[0x42]);
                     g_np[j].lastact = g_np[j].av[0x58];
                 }
-                for (k = 0; k < NANM_VARS; k++) if (!own[k]) v[k] = g_np[j].av[k];
+                /* npcanim 2: also the 15 of those 23 that hold the pose (the MP beautifier keeps puppets combat-ready,
+                 * owner: host NPCs calm, puppets weapon up); the 8 that change every frame with the movement stay the
+                 * puppet's own (all 23 from the host: puppets walked on the spot) */
+                for (k = 0; k < NANM_VARS; k++) if (!own[k] || (g_npcanim == 2 && !move[k])) v[k] = g_np[j].av[k];
             }
             return;
         }
