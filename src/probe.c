@@ -351,10 +351,12 @@ static Target g_targets[] = {
 static int g_npc_role;            /* npcsync: 1 host, 2 join (declared here for coop_flags.txt) */
 static int g_noautodraw;          /* coop_flags.txt "noautodraw": leave our player's inventory bAutoDraw as loaded */
 static int g_vehsync;              /* vehsync 0|1 (defined with the vehicle sync) */
-static int g_siglog, g_sigsync;     /* siglog 0|1|2, sigsync 0|1 (defined with the state signals) */
-static unsigned g_sig_deny[32];
-static int g_sig_ndeny;
-static int sig_denied(unsigned h);
+static int g_siglog, g_sigsync = 1; /* siglog 0|1|2|3, sigsync 0 off | 1 allow list | 2 all but denied (RE) */
+static unsigned g_sig_deny[32], g_sig_allow[32] = {
+    0x328D8D10u, 0x9D3BCA58u,      /* throw_grenade, throw_player: the avatar throws (its weapon sync gives empty hands) */
+};
+static int g_sig_ndeny, g_sig_nallow = 2;
+static int sig_listed(const unsigned *l, int n, unsigned h);
 static int patch_iat(HMODULE m)
 {
     BYTE *base = (BYTE *)m;
@@ -1602,11 +1604,14 @@ static void native_cmd(const char *ln)
         /* siglog 0|1|2|3: log state signals of our player and the avatar (2 also other pawns, first 400; 3 all) */
         g_siglog = n; logf_("siglog %d", n);
     } else if (sscanf(ln, "sigsync %d", &n) == 1) {
-        g_sigsync = n; logf_("sigsync %d (%d denied)", n, g_sig_ndeny);
-    } else if (sscanf(ln, "sigdeny %lx", &a) == 1) {
-        /* sigdeny <crc32>: never send this signal (ones the avatar gets from NetPlayer / vehicle sync anyway) */
-        if (!sig_denied((unsigned)a) && g_sig_ndeny < 32) g_sig_deny[g_sig_ndeny++] = (unsigned)a;
-        logf_("sigdeny %08lx (%d denied)", a, g_sig_ndeny);
+        g_sigsync = n; logf_("sigsync %d (%d allowed, %d denied)", n, g_sig_nallow, g_sig_ndeny);
+    } else if (sscanf(ln, "sigallow %lx", &a) == 1 || sscanf(ln, "sigdeny %lx", &a) == 1) {
+        /* sigallow <crc32>: send this signal too (sigsync 1); sigdeny <crc32>: never send it (sigsync 2) */
+        int al = ln[3] == 'a';
+        unsigned *l = al ? g_sig_allow : g_sig_deny;
+        int *nl = al ? &g_sig_nallow : &g_sig_ndeny;
+        if (!sig_listed(l, *nl, (unsigned)a) && *nl < 32) l[(*nl)++] = (unsigned)a;
+        logf_("%s %08lx (%d listed)", al ? "sigallow" : "sigdeny", a, *nl);
     } else if (sscanf(ln, "pawnsig %llu %lx", &id, &a) == 2) {
         /* pawnsig <id> <signal crc32>: a signal for the pawn's GO state machine (e.g. b2b02045 entervehicle_new) */
         BYTE *pw = pawn_comp_of(id);
@@ -4306,10 +4311,10 @@ static void *pawn_driver(unsigned long long id)
     BYTE *pw = id ? pawn_comp_of(id) : NULL;
     return pw ? ((void *(__attribute__((thiscall)) *)(void *))(*(void ***)pw)[0x78 / 4])(pw) : NULL;
 }
-static int sig_denied(unsigned h)
+static int sig_listed(const unsigned *l, int n, unsigned h)
 {
     int i;
-    for (i = 0; i < g_sig_ndeny; i++) if (g_sig_deny[i] == h) return 1;
+    for (i = 0; i < n; i++) if (l[i] == h) return 1;
     return 0;
 }
 static void sig_send(void)
@@ -4347,10 +4352,28 @@ static void sig_tick(DWORD now)
         g_sig_mydrv = player_ready(g_net_id) ? pawn_driver(g_net_id) : NULL;
         g_sig_avdrv = g_av_id ? pawn_driver(g_av_id) : NULL;
     }
+    if (g_siglog && g_av_id) {
+        /* which beautifiers drive the avatar (main +0x28, base +0x2C = NetPlayer): logged when they change */
+        static unsigned last_m, last_b;
+        void *hd = NULL, *bc;
+        BYTE *obj = entity_obj(g_av_id, &hd);
+        unsigned m = 0, b = 0;
+        if (hd) (*(int *)((BYTE *)hd + 8))--;
+        bc = obj ? ((void *(__attribute__((thiscall)) *)(void *, void *))(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4)) : NULL;
+        if (bc) {
+            if (*(BYTE **)((BYTE *)bc + 0x28)) m = **(unsigned **)((BYTE *)bc + 0x28) - (unsigned)g_base;
+            if (*(BYTE **)((BYTE *)bc + 0x2C)) b = **(unsigned **)((BYTE *)bc + 0x2C) - (unsigned)g_base;
+        }
+        if (m != last_m || b != last_b) { logf_("sig: avatar beautifiers main vt D+%X base vt D+%X", m, b); last_m = m; last_b = b; }
+    }
     while (g_sig_r != g_sig_w) {
         unsigned h = g_sig_ring[g_sig_r & 127].hash, c = g_sig_ring[g_sig_r & 127].caller;
         void *d = g_sig_ring[g_sig_r & 127].drv;
-        int mine = d == g_sig_mydrv, tx = mine && g_sigsync && !sig_denied(h);
+        /* only listed signals: weapon ones (switch, select_*, drawweapon_now, shooting, reload) doubled what the weapon
+         * sync already does and the avatar lost its weapon; door / heal graphs are first-person (arm-only animation,
+         * cinematic beautifier, "Use Door" on the player's own target) and broke the avatar */
+        int mine = d == g_sig_mydrv, tx = mine && (g_sigsync == 1 ? sig_listed(g_sig_allow, g_sig_nallow, h) :
+                                                   g_sigsync == 2 && !sig_listed(g_sig_deny, g_sig_ndeny, h));
         g_sig_r++;
         if (g_siglog && (mine || d == g_sig_avdrv || g_siglog >= 3))
             logf_("sig: %s %08x from D+%X%s", mine ? "me" : d == g_sig_avdrv ? "avatar" : "other", h, c, tx ? " -> peer" : "");
