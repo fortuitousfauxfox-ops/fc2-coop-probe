@@ -352,6 +352,15 @@ static int g_npc_role;            /* npcsync: 1 host, 2 join (declared here for 
 static int g_noautodraw;          /* coop_flags.txt "noautodraw": leave our player's inventory bAutoDraw as loaded */
 static int g_vehsync;              /* vehsync 0|1 (defined with the vehicle sync) */
 static int g_doorsync;              /* doorsync 0|1 (defined with the doors) */
+static int g_nresync;               /* nresync 0|1 (defined with the NPC reactions) */
+static int g_nsgsync;               /* nsgsync 0|1 (defined with the NPC behaviour signals) */
+static int g_plyfind;                /* plyfind 1: the player lookup answers a fake player for the avatar */
+static int g_plylog;                 /* plylog 1: plycallers every 2 s */
+static void ply_add(void);
+static void ply_del(const char *why);
+static void ply_install(void);
+static void ply_callers(void);
+static void ply_show(void);
 static int g_siglog, g_sigsync = 1; /* siglog 0|1|2|3, sigsync 0 off | 1 allow list | 2 all but denied (RE) */
 static unsigned g_sig_deny[32], g_sig_allow[32] = {
     0x328D8D10u, 0x9D3BCA58u,      /* throw_grenade, throw_player: the avatar throws (its weapon sync gives empty hands) */
@@ -534,6 +543,7 @@ static int g_join_tp;              /* the joiner was put next to the host once *
 static int g_npcrespawn;            /* npcrespawn 1: replace puppets that run an action of their own (off: replacements are
                                      * spawned from the generic archetype and look different, and actions still differed) */
 static void npc_anim_apply(BYTE *mb);
+static DWORD g_np_react[64];     /* joiner: the puppet plays its own reaction until then (NRE1): host anim vars wait */
 static unsigned long long g_dd_id;   /* dumpd: NPC whose desired-state block is logged */
 static DWORD g_dd_until;  /* hit sync on by default; stimlog turns on event logging */
 static void av_remove(void);
@@ -1652,6 +1662,23 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "siglog %d", &n) == 1) {
         /* siglog 0|1|2|3: log state signals of our player and the avatar (2 also other pawns, first 400; 3 all) */
         g_siglog = n; logf_("siglog %d", n);
+    } else if (strcmp(ln, "plyadd") == 0) {
+        ply_add();
+    } else if (strcmp(ln, "plydel") == 0) {
+        ply_del("command");
+    } else if (strcmp(ln, "plyshow") == 0) {
+        ply_show();
+    } else if (sscanf(ln, "plyfind %d", &n) == 1) {
+        /* plyfind 1: FUN_104f3430 (player of an entity id) answers our fake player for the avatar */
+        ply_install(); g_plyfind = n; logf_("plyfind %d", n);
+    } else if (sscanf(ln, "plylog %d", &n) == 1) {
+        ply_install(); g_plylog = n; logf_("plylog %d", n);
+    } else if (strcmp(ln, "plycallers") == 0) {
+        ply_install(); ply_callers();
+    } else if (sscanf(ln, "nsgsync %d", &n) == 1) {
+        g_nsgsync = n; logf_("nsgsync %d", n);
+    } else if (sscanf(ln, "nresync %d", &n) == 1) {
+        g_nresync = n; logf_("nresync %d", n);
     } else if (sscanf(ln, "doorsync %d", &n) == 1) {
         g_doorsync = n; logf_("doorsync %d", n);
     } else if (sscanf(ln, "sigsync %d", &n) == 1) {
@@ -2556,6 +2583,7 @@ static void av_forget(void)
     g_st_obj[0] = NULL;
     g_av_id = 0; g_av_body = g_av_mat = NULL; g_av_have = 0; av_compass(0);
     memset(g_av_wc, 0, sizeof g_av_wc);
+    ply_del("avatar forgotten");
     g_av_mem = NULL; g_av_comp = NULL; g_av_npstate = 0; g_av_weap[0] = 0; g_av_lastseq = 0; g_av_smhave = 0;
 }
 
@@ -2888,6 +2916,8 @@ static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; B
 static int g_nb_n;
 static unsigned long long g_nx[64];  /* ids never synced (buddies) */
 static int g_nx_n;
+static struct { unsigned long long id; BYTE *agent; void *drv; } g_nagent[64];   /* host: AI agent of a synced NPC and its
+                                                                                * state driver (agent vf+0x118; NRE1, NSG1) */
 static void npc_host_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx)
 {
     /* ctx: our player's and the avatar's ground positions; an NPC near either of them is synced */
@@ -2908,6 +2938,13 @@ static void npc_host_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx
     }
     memset(&g_nb[g_nb_n], 0, sizeof g_nb[0]);
     g_nb[g_nb_n].id = id; g_nb[g_nb_n].obj = obj; g_nb_n++;
+    {
+        int k, free_k = -1;
+        for (k = 0; k < 64; k++) { if (g_nagent[k].id == id) break; if (!g_nagent[k].id && free_k < 0) free_k = k; }
+        if (k == 64) k = free_k >= 0 ? free_k : (int)(id % 64);
+        g_nagent[k].id = id; g_nagent[k].agent = agent;
+        g_nagent[k].drv = ((void *(__attribute__((thiscall)) *)(void *))(*(void ***)agent)[0x118 / 4])(agent);
+    }
 }
 static float npc_hp(BYTE *obj, float *hpmax)
 {
@@ -3234,6 +3271,7 @@ static void npc_anim_apply(BYTE *mb)
             BYTE *o3 = entity_obj(g_np[j].lid ? g_np[j].lid : g_np[j].id, &hd3);
             if (hd3) (*(int *)((BYTE *)hd3 + 8))--;
             if (o3 != g_np[j].obj) return;   /* the puppet left the world: its cached entity pointer is stale */
+            if (g_np_react[j] && (int)(g_np_react[j] - GetTickCount()) > 0) return;
             if (g_np[j].avok && (v = npc_animvars(o3))) {
                 if (!g_np[j].lastact && !g_np[j].lid && (v[0x58] != g_np[j].av[0x58] || v[0x42] != g_np[j].av[0x42])) g_np[j].ownact = 1;
                 if (g_np[j].av[0x58] != g_np[j].lastact) {
@@ -3424,6 +3462,198 @@ static void npc_join_tick(DWORD now)
     }
 }
 
+/* ---- the avatar as a second player (RE). The player manager [11645578] (vtable E6CC68): +4 array of players, +8
+ * count, +0xC capacity (64). A player is 8 bytes {vtable E6CF9C, view}; the view (vtable E6CF7C, ctor 4FEC50) holds the
+ * player's entity handle at +8 (FUN_105d9910) and its camera: +0x18 position, +0x30 near / +0x34 far, +0x38.. fov,
+ * +0x58 forward, +0x64 up, +0x70 right, +0x7C pitch, +0x80 roll, +0x84 yaw. AI code asks the manager "the player of
+ * this entity id" (FUN_104f3430, 0 if none) and "player #i" (FUN_104f3550; the NPC push handler 973C60 uses #0).
+ * plyadd puts the avatar in the list as player #1: that broke the host's mouse look (input runs for every player), so
+ * plyfind 1 instead only makes the id lookup answer the fake player. The game does not update the fake view:
+ * ply_tick writes the avatar's camera from its memento aim every frame. ---- */
+static BYTE *g_ply_p, *g_ply_v;
+static int g_ply_on;                 /* the fake player is in the manager's list (plyadd) */
+static unsigned long long g_ply_for;
+static BYTE **ply_arr(void)
+{
+    BYTE *mgr = *(BYTE **)(g_base + 0x1645578);
+    return mgr && !IsBadReadPtr(mgr, 0x10) && *(unsigned *)(mgr + 8) ? *(BYTE ***)(mgr + 4) : NULL;
+}
+/* build the fake player {vtable E6CF9C, view copied from ours with the avatar's handle at +8}; 0 without an avatar */
+static int ply_prepare(void)
+{
+    BYTE **arr = ply_arr(), *ao, *v0;
+    void *hd = NULL;
+    if (g_ply_v && g_ply_for == g_av_id) return 1;
+    ao = arr && g_av_id ? entity_obj(g_av_id, &hd) : NULL;
+    if (!ao || !hd) return 0;
+    v0 = *(BYTE **)(arr[0] + 4);
+    if (!g_ply_v) { g_ply_v = (BYTE *)calloc(1, 0x400); g_ply_p = (BYTE *)calloc(1, 16); }
+    memcpy(g_ply_v, v0, 0x200);
+    *(void **)(g_ply_v + 8) = hd;            /* keeps the reference entity_obj took */
+    *(void **)g_ply_p = *(void **)arr[0]; *(BYTE **)(g_ply_p + 4) = g_ply_v;
+    g_ply_for = g_av_id;
+    logf_("ply: fake player %p (view %p copied from %p) for avatar %llu, holder %p", g_ply_p, g_ply_v, v0, g_av_id, hd);
+    return 1;
+}
+static void ply_add(void)
+{
+    BYTE *mgr = *(BYTE **)(g_base + 0x1645578), **arr = ply_arr();
+    if (g_ply_on) { logf_("plyadd: already in"); return; }
+    if (!arr || *(unsigned *)(mgr + 8) != 1) { logf_("plyadd: no player manager or not one player"); return; }
+    if (!ply_prepare()) { logf_("plyadd: no avatar"); return; }
+    arr[1] = g_ply_p; *(unsigned *)(mgr + 8) = 2; g_ply_on = 1;
+    logf_("plyadd: avatar %llu is player #1", g_av_id);
+}
+static void ply_del(const char *why)
+{
+    BYTE *mgr = *(BYTE **)(g_base + 0x1645578), **arr = ply_arr();
+    if (!g_ply_on) return;
+    if (arr && *(unsigned *)(mgr + 8) == 2 && arr[1] == g_ply_p) { *(unsigned *)(mgr + 8) = 1; arr[1] = NULL; }
+    g_ply_on = 0;
+    logf_("plydel (%s): the avatar is no player any more", why);
+}
+static void ply_show(void)
+{
+    BYTE *mgr = *(BYTE **)(g_base + 0x1645578), **arr = ply_arr();
+    unsigned i, cnt = arr ? *(unsigned *)(mgr + 8) : 0;
+    logf_("plyshow: %u players, fake %p view %p", cnt, g_ply_p, g_ply_v);
+    for (i = 0; i < cnt && i < 4; i++) { logf_("player #%u %p view %p", i, arr[i], *(BYTE **)(arr[i] + 4)); hexdump_(*(BYTE **)(arr[i] + 4), 0x90); }
+    if (g_ply_v && !g_ply_on) hexdump_(g_ply_v, 0x90);
+}
+static void ply_tick(void)
+{
+    void *hd = NULL;
+    BYTE *ao, *v;
+    float pitch, yaw, sp, cp, sy, cy;
+    if (!g_ply_on && !g_plyfind) return;
+    if (!g_av_mem || !ply_prepare()) return;
+    v = g_ply_v;
+    ao = entity_obj(g_av_id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!ao) return;
+    pitch = np_dq(g_av_mem + 0xAC, 360); yaw = np_dq(g_av_mem + 0xC0, 360);
+    sp = sinf(pitch); cp = cosf(pitch); sy = sinf(yaw); cy = cosf(yaw);
+    *(float *)(v + 0x18) = *(float *)(ao + 0x60); *(float *)(v + 0x1C) = *(float *)(ao + 0x64); *(float *)(v + 0x20) = *(float *)(ao + 0x68) + 1.65f;
+    *(float *)(v + 0x58) = -sy * cp; *(float *)(v + 0x5C) = cy * cp; *(float *)(v + 0x60) = sp;
+    *(float *)(v + 0x64) = sy * sp;  *(float *)(v + 0x68) = -cy * sp; *(float *)(v + 0x6C) = cp;
+    *(float *)(v + 0x70) = cy;       *(float *)(v + 0x74) = sy;       *(float *)(v + 0x78) = 0;
+    *(float *)(v + 0x7C) = pitch;    *(float *)(v + 0x80) = 0;        *(float *)(v + 0x84) = yaw;
+}
+/* who asks the player manager: callers of FUN_104f3430 / FUN_104f3550 are counted (plycallers prints and resets) */
+static void *g_pfind_orig, *g_pidx_orig;
+static struct { volatile LONG rva, n; } g_pcall[2][128];
+static void ply_count(int k, unsigned rva)
+{
+    int i;
+    for (i = 0; i < 128; i++) {
+        if (g_pcall[k][i].rva == (LONG)rva) { InterlockedIncrement(&g_pcall[k][i].n); return; }
+        if (!g_pcall[k][i].rva && InterlockedCompareExchange(&g_pcall[k][i].rva, (LONG)rva, 0) == 0) { InterlockedIncrement(&g_pcall[k][i].n); return; }
+        if (g_pcall[k][i].rva == (LONG)rva) { InterlockedIncrement(&g_pcall[k][i].n); return; }
+    }
+}
+static void *__attribute__((thiscall)) pfind_hook(void *mgr, unsigned lo, unsigned hi)
+{
+    void *r = ((void *(__attribute__((thiscall)) *)(void *, unsigned, unsigned))g_pfind_orig)(mgr, lo, hi);
+    ply_count(0, (unsigned)__builtin_return_address(0) - (unsigned)g_base);
+    if (!r && g_plyfind && g_ply_p && g_ply_for == g_av_id && g_av_id && lo == (unsigned)g_av_id && hi == (unsigned)(g_av_id >> 32)) r = g_ply_p;
+    return r;
+}
+/* NPC AI asks for "player #0" in its behaviour conditions (FUN_10a07220, a switch over condition types) and in its
+ * event handler (FUN_10973c60: the shove handler pushes player #0 and sends it player_pushed). While one of them runs
+ * (the agent kept in a TLS slot), player #0 is whichever of us and the avatar is nearer to that agent. */
+static DWORD g_ai_tls = TLS_OUT_OF_INDEXES;
+static void *g_cond_orig, *g_aiev_orig;
+static volatile LONG g_ai_swaps, g_ai_asks;
+static void *volatile g_ai_vt;     /* agent vtable seen in 973C60: only agents with it get a position query */
+static void *__attribute__((thiscall)) pidx_hook(void *mgr, void *out, unsigned i)
+{
+    BYTE *agent;
+    ply_count(1, (unsigned)__builtin_return_address(0) - (unsigned)g_base);
+    if (i == 0 && g_plyfind && g_ply_v && g_ply_for == g_av_id && g_ai_tls != TLS_OUT_OF_INDEXES &&
+        (agent = (BYTE *)TlsGetValue(g_ai_tls)) && g_ai_vt && *(void **)agent == g_ai_vt && *(BYTE **)(g_ply_v + 8)) {
+        BYTE **arr = *(BYTE ***)((BYTE *)mgr + 4), *h0, *o0, *ah = *(BYTE **)(g_ply_v + 8), *ao;
+        float buf[16] __attribute__((aligned(16))), *ap;
+        InterlockedIncrement(&g_ai_asks);
+        h0 = arr && arr[0] ? *(BYTE **)(*(BYTE **)(arr[0] + 4) + 8) : NULL;
+        o0 = h0 ? *(BYTE **)(h0 + 0xC) : NULL;
+        ao = *(BYTE **)(ah + 0xC);
+        ap = ((float *(__attribute__((thiscall)) *)(void *, void *))(*(void ***)agent)[0x78 / 4])(agent, buf);
+        if (o0 && ao && ap) {
+            float d0 = 0, d1 = 0;
+            int k;
+            for (k = 0; k < 3; k++) {
+                d0 += (*(float *)(o0 + 0x60 + 4 * k) - ap[k]) * (*(float *)(o0 + 0x60 + 4 * k) - ap[k]);
+                d1 += (*(float *)(ao + 0x60 + 4 * k) - ap[k]) * (*(float *)(ao + 0x60 + 4 * k) - ap[k]);
+            }
+            if (d1 < d0) {
+                *(BYTE **)out = ah; (*(int *)(ah + 8))++;
+                InterlockedIncrement(&g_ai_swaps);
+                return out;
+            }
+        }
+    }
+    return ((void *(__attribute__((thiscall)) *)(void *, void *, unsigned))g_pidx_orig)(mgr, out, i);
+}
+static int __attribute__((thiscall)) cond_hook(BYTE *self, void *a2, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8)
+{
+    void *prev = TlsGetValue(g_ai_tls);
+    int r;
+    {
+        static int logged;
+        if (!logged && *(BYTE **)(self + 4)) { logged = 1; logf_("ply: condition owner vtable D+%X", **(unsigned **)(self + 4) - (unsigned)g_base); }
+    }
+    TlsSetValue(g_ai_tls, *(void **)(self + 4));
+    r = ((int (__attribute__((thiscall)) *)(void *, void *, void *, void *, void *, void *, void *, void *))g_cond_orig)(self, a2, a3, a4, a5, a6, a7, a8);
+    TlsSetValue(g_ai_tls, prev);
+    return r;
+}
+static void __attribute__((thiscall)) aiev_hook(BYTE *agent, void *ev)
+{
+    void *prev = TlsGetValue(g_ai_tls);
+    if (!g_ai_vt) { g_ai_vt = *(void **)agent; logf_("ply: AI agent vtable D+%X", (unsigned)g_ai_vt - (unsigned)g_base); }
+    TlsSetValue(g_ai_tls, agent);
+    ((void (__attribute__((thiscall)) *)(void *, void *))g_aiev_orig)(agent, ev);
+    TlsSetValue(g_ai_tls, prev);
+}
+static void ply_install(void)
+{
+    /* 4F3430: sub esp,8; push ebx; push ebp; mov ebp,ecx; mov eax,[ebp+8] (10 bytes)
+     * 4F3550: mov eax,[ecx+8]; mov edx,[esp+8]; cmp edx,eax (9 bytes) */
+    static const BYTE p1[10] = { 0x83, 0xEC, 0x08, 0x53, 0x55, 0x8B, 0xE9, 0x8B, 0x45, 0x08 };
+    static const BYTE p2[9] = { 0x8B, 0x41, 0x08, 0x8B, 0x54, 0x24, 0x08, 0x3B, 0xD0 };
+    if (g_pfind_orig) return;
+    if (memcmp(g_base + 0x4F3430, p1, sizeof p1) || memcmp(g_base + 0x4F3550, p2, sizeof p2)) { logf_("ply: unexpected bytes, no player hooks"); g_pfind_orig = (void *)1; return; }
+    g_pfind_orig = make_detour(g_base + 0x4F3430, 10, (void *)pfind_hook, 1);
+    g_pidx_orig = make_detour(g_base + 0x4F3550, 9, (void *)pidx_hook, 1);
+    logf_("ply: player lookup hooks on 4F3430 / 4F3550 installed");
+    {
+        /* A07220: sub esp,2Ch; mov eax,[esp+30h]; mov eax,[eax] (9 bytes); 973C60: sub esp,45Ch; push ebx/ebp/esi/edi (10) */
+        static const BYTE c1[9] = { 0x83, 0xEC, 0x2C, 0x8B, 0x44, 0x24, 0x30, 0x8B, 0x00 };
+        static const BYTE c2[10] = { 0x81, 0xEC, 0x5C, 0x04, 0x00, 0x00, 0x53, 0x55, 0x56, 0x57 };
+        if (memcmp(g_base + 0xA07220, c1, sizeof c1) || memcmp(g_base + 0x973C60, c2, sizeof c2)) { logf_("ply: unexpected bytes, no AI context hooks"); return; }
+        g_ai_tls = TlsAlloc();
+        g_cond_orig = make_detour(g_base + 0xA07220, 9, (void *)cond_hook, 1);
+        g_aiev_orig = make_detour(g_base + 0x973C60, 10, (void *)aiev_hook, 1);
+        logf_("ply: AI context hooks on A07220 / 973C60 installed (tls %lu)", g_ai_tls);
+    }
+}
+static void ply_callers(void)
+{
+    int k, i;
+    for (k = 0; k < 2; k++) {
+        char line[1200];
+        size_t o = 0;
+        line[0] = 0;
+        for (i = 0; i < 128 && g_pcall[k][i].rva; i++) {
+            if (g_pcall[k][i].n && o < 1100) o += snprintf(line + o, sizeof line - o, " %lX:%ld", (unsigned long)g_pcall[k][i].rva, (long)g_pcall[k][i].n);
+            g_pcall[k][i].n = 0;
+        }
+        logf_("plycallers %s:%s", k ? "index" : "find", line);
+    }
+    logf_("plycallers: AI asked for player #0 %ld times, got the avatar %ld times", (long)g_ai_asks, (long)g_ai_swaps);
+    g_ai_asks = g_ai_swaps = 0;
+}
+
 static void av_tick(DWORD now)
 {
     av_init_ptr();
@@ -3520,6 +3750,7 @@ static void av_tick(DWORD now)
             return;
         }
         np_tick(now);
+        ply_tick();
         /* the peer changed the weapon in its hands: give the avatar the same one (a failed try is retried after 2 s) */
         if (strcmp(g_rx_weap, g_av_weap) && now - g_av_weap_try > 2000) {
             g_av_weap_try = now;
@@ -4351,15 +4582,36 @@ static void *g_sig_orig;
 static void *volatile g_sig_mydrv, *volatile g_sig_avdrv;
 static volatile LONG g_sig_w;
 static LONG g_sig_r;
-static struct { unsigned hash, caller; void *drv; } g_sig_ring[128];
+static struct { unsigned hash, caller; void *drv; } g_sig_ring[512];
 static unsigned g_sig_seq, g_sig_hist[SIG_N], g_sig_rx_seq, g_sig_tx, g_sig_rx;
 static DWORD g_sig_new_t, g_sig_sent_t;
+/* NPC reaction signals (Social graph c4dfa7f1), logged for any pawn with siglog 1: start_aimedat, stop_aimedat,
+ * shove_player, start_shoved, player_pushed, start_charged, kill_gesture */
+static const unsigned g_sig_watch[] = { 0x6699A29Cu, 0x3183E869u, 0x050EEBF3u, 0x3E95BCC4u, 0x79C9FA4Au, 0x49F9890Eu, 0xCAEAB4BEu };
+static int sig_watched(unsigned h)
+{
+    unsigned i;
+    for (i = 0; i < sizeof g_sig_watch / sizeof g_sig_watch[0]; i++) if (g_sig_watch[i] == h) return 1;
+    return 0;
+}
+/* host: is this the state driver of a synced NPC's agent (NSG1)? */
+/* off by default: a relayed loop_smart_terrain_layer (2E50267D) crashed the joiner 47 ms later (Dunia+282D52 reads a
+ * null argument): the puppet's paused AI has no smart terrain data for the state the signal starts */
+static int g_nsgsync = 0;          /* nsgsync 0|1 */
+static int nsg_npc_drv(void *drv)
+{
+    int i;
+    if (g_npc_role != 1 || !g_nsgsync) return 0;
+    for (i = 0; i < 64; i++) if (g_nagent[i].drv == drv && g_nagent[i].id) return 1;
+    return 0;
+}
 static void __attribute__((thiscall)) sig_hook(void *drv, unsigned hash)
 {
-    if (drv && (drv == g_sig_mydrv || g_siglog >= 2 || (g_siglog && drv == g_sig_avdrv))) {
+    if (drv && (drv == g_sig_mydrv || g_siglog >= 2 || (g_siglog && drv == g_sig_avdrv) ||
+                ((g_siglog || (g_nresync && g_npc_role == 2)) && sig_watched(hash)) || nsg_npc_drv(drv))) {
         LONG i = InterlockedIncrement(&g_sig_w) - 1;
-        g_sig_ring[i & 127].hash = hash; g_sig_ring[i & 127].drv = drv;
-        g_sig_ring[i & 127].caller = (unsigned)__builtin_return_address(0) - (unsigned)g_base;
+        g_sig_ring[i & 511].hash = hash; g_sig_ring[i & 511].drv = drv;
+        g_sig_ring[i & 511].caller = (unsigned)__builtin_return_address(0) - (unsigned)g_base;
     }
     ((void (__attribute__((thiscall)) *)(void *, unsigned))g_sig_orig)(drv, hash);
 }
@@ -4409,6 +4661,111 @@ static void sig_rx(const SigPkt *k)
     }
     g_sig_rx_seq = k->seq;
 }
+/* ---- NPC reactions (NRE1). The host's NPCs react only to the host's player: bump and aim detection never ran for
+ * the avatar. The joiner's puppets still run that part of their AI against the joiner's own player (start_aimedat:
+ * hands up, start_shoved / shove_player, the player gets player_pushed). So the joiner forwards those signals of a
+ * puppet to the host, which passes them to the real NPC; its animation then comes back to the joiner with NANM. ---- */
+#define NRE_MAGIC 0x3145524Eu      /* "NRE1" */
+typedef struct { unsigned magic, seq; unsigned long long id; unsigned hash, pad; } NpcReactPkt;
+static unsigned g_nre_seq, g_nre_rx_seq, g_nre_tx, g_nre_rx;
+static int g_nresync = 1;
+static struct { unsigned long long id; DWORD aimed; } g_nre_aim[16];
+static int nre_forwarded(unsigned h)
+{
+    /* start_aimedat, stop_aimedat, shove_player, start_shoved, start_charged */
+    return h == 0x6699A29Cu || h == 0x3183E869u || h == 0x050EEBF3u || h == 0x3E95BCC4u || h == 0x49F9890Eu;
+}
+static void nre_send(unsigned long long id, unsigned h)
+{
+    NpcReactPkt k = { NRE_MAGIC, ++g_nre_seq, id, h, 0 };
+    int i;
+    for (i = 0; i < 2; i++) sendto(g_ns, (char *)&k, sizeof k, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+    g_nre_tx++;
+}
+/* ---- NPC behaviour signals (NSG1): every signal the host's AI gives a synced NPC's agent (smart terrain: sitting,
+ * drinking, smoking - start_smart_terrain / loop_ / stop_ ...; gestures; talks) goes to the joiner, which gives it to
+ * its puppet's agent the same way (FUN_109ff990). Reactions to players (NRE1 set) are left out: the joiner's own
+ * puppet AI makes those for its player. ---- */
+#define NSG_MAGIC 0x3147534Eu      /* "NSG1" */
+typedef struct { unsigned magic, seq; unsigned long long id; unsigned hash, pad; } NpcSigPkt;
+static unsigned g_nsg_seq, g_nsg_rx_seq, g_nsg_tx, g_nsg_rx;
+static void nsg_host_signal(void *drv, unsigned h)
+{
+    int i;
+    NpcSigPkt k;
+    if (!nsg_npc_drv(drv) || nre_forwarded(h) || h == 0xCAEAB4BEu) return;
+    for (i = 0; i < 64; i++) if (g_nagent[i].drv == drv && g_nagent[i].id) break;
+    if (i == 64) return;
+    k.magic = NSG_MAGIC; k.seq = ++g_nsg_seq; k.id = g_nagent[i].id; k.hash = h; k.pad = 0;
+    sendto(g_ns, (char *)&k, sizeof k, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+    sendto(g_ns, (char *)&k, sizeof k, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+    if (++g_nsg_tx <= 300 || g_siglog) logf_("nsg: NPC %llu got %08x from our AI -> joiner", k.id, h);
+}
+static void nsg_rx(const NpcSigPkt *k)
+{
+    int j;
+    BYTE *ag = NULL;
+    if (k->seq < g_nsg_rx_seq) g_nsg_rx_seq = 0;
+    if (k->seq == g_nsg_rx_seq) return;
+    g_nsg_rx_seq = k->seq;
+    if (!g_nsgsync || g_npc_role != 2) return;
+    g_nsg_rx++;
+    for (j = 0; j < g_np_n; j++)
+        if (g_np[j].id == k->id && g_np[j].agent && !IsBadReadPtr(g_np[j].agent, 8) && *(unsigned *)g_np[j].agent == (unsigned)(g_base + 0xEC5078)) {
+            ag = g_np[j].agent; break;
+        }
+    if (ag) { unsigned h = k->hash; ((void (__attribute__((thiscall)) *)(void *, unsigned *))(g_base + 0x9FF990))(ag, &h); }
+    if (g_nsg_rx <= 300 || g_siglog) logf_("nsg: host NPC %llu got %08x -> %s", k->id, k->hash, ag ? "our puppet's agent" : "no puppet agent here");
+}
+/* joiner: a puppet got a reaction signal from its own AI */
+static void nre_puppet_signal(void *drv, unsigned h)
+{
+    int j, k, slot = -1;
+    if (!g_nresync || g_npc_role != 2 || !nre_forwarded(h)) return;
+    for (j = 0; j < g_np_n; j++) {
+        BYTE *pc = g_np[j].id ? pawn_comp_of(g_np[j].lid ? g_np[j].lid : g_np[j].id) : NULL;
+        if (pc && ((void *(__attribute__((thiscall)) *)(void *))(*(void ***)pc)[0x78 / 4])(pc) == drv) break;
+    }
+    if (j == g_np_n) return;
+    /* stop_aimedat comes for every NPC all the time: only after a start_aimedat we sent */
+    for (k = 0; k < 16; k++) if (g_nre_aim[k].id == g_np[j].id) break;
+    if (h == 0x3183E869u && (k == 16 || !g_nre_aim[k].aimed)) return;
+    if (h == 0x6699A29Cu || h == 0x3183E869u) {
+        if (k == 16) for (k = 0; k < 16; k++) if (!g_nre_aim[k].aimed) { slot = k; break; }
+        if (k == 16) k = slot;
+        if (k >= 0 && k < 16) { g_nre_aim[k].id = g_np[j].id; g_nre_aim[k].aimed = h == 0x6699A29Cu ? GetTickCount() | 1 : 0; }
+    }
+    /* the puppet's own reaction would be overwritten by the host's anim vars every frame: hold them back meanwhile
+     * (hands up until stop_aimedat, at most 15 s; a shove 2.5 s) */
+    if (j < 64) g_np_react[j] = h == 0x3183E869u ? 0 : (GetTickCount() + (h == 0x6699A29Cu ? 15000 : 2500)) | 1;
+    logf_("nre: puppet %llu got %08x from its AI -> host", g_np[j].id, h);
+    nre_send(g_np[j].id, h);
+}
+/* host: the joiner's player provoked our NPC */
+static void nre_rx(const NpcReactPkt *k)
+{
+    BYTE *pc;
+    if (k->seq < g_nre_rx_seq) g_nre_rx_seq = 0;
+    if (k->seq == g_nre_rx_seq) return;
+    g_nre_rx_seq = k->seq;
+    if (!g_nresync || g_npc_role != 1 || !nre_forwarded(k->hash)) return;
+    g_nre_rx++;
+    /* the Social graph runs on the agent's state driver (agent vf+0x118, what its own AI signals go to through
+     * FUN_109ff990), not on the pawn's (vf+0x78): sent to the pawn, nothing moved */
+    {
+        int i;
+        BYTE *ag = NULL;
+        for (i = 0; i < 64; i++)
+            if (g_nagent[i].id == k->id && g_nagent[i].agent && !IsBadReadPtr(g_nagent[i].agent, 8) &&
+                *(unsigned *)g_nagent[i].agent == (unsigned)(g_base + 0xEC5078) && !IsBadReadPtr(*(BYTE **)(g_nagent[i].agent + 4), 16) &&
+                **(unsigned long long **)(g_nagent[i].agent + 4) == k->id) { ag = g_nagent[i].agent; break; }
+        if (ag) { unsigned h = k->hash; ((void (__attribute__((thiscall)) *)(void *, unsigned *))(g_base + 0x9FF990))(ag, &h); }
+        else if ((pc = pawn_comp_of(k->id))) pawn_state_event(pc, k->hash);
+        else pc = NULL;
+        logf_("nre: the joiner provoked NPC %llu: %08x %s", k->id, k->hash, ag ? "-> its agent" : pc ? "-> its pawn (no agent known)" : "(no such NPC here)");
+    }
+}
+
 static void sig_tick(DWORD now)
 {
     static DWORD drv_t;
@@ -4432,17 +4789,23 @@ static void sig_tick(DWORD now)
         }
         if (m != last_m || b != last_b) { logf_("sig: avatar beautifiers main vt D+%X base vt D+%X", m, b); last_m = m; last_b = b; }
     }
+    {
+        static DWORD pl_t;
+        if (g_plylog && now - pl_t >= 2000) { pl_t = now; ply_callers(); }
+    }
     while (g_sig_r != g_sig_w) {
-        unsigned h = g_sig_ring[g_sig_r & 127].hash, c = g_sig_ring[g_sig_r & 127].caller;
-        void *d = g_sig_ring[g_sig_r & 127].drv;
+        unsigned h = g_sig_ring[g_sig_r & 511].hash, c = g_sig_ring[g_sig_r & 511].caller;
+        void *d = g_sig_ring[g_sig_r & 511].drv;
         /* only listed signals: weapon ones (switch, select_*, drawweapon_now, shooting, reload) doubled what the weapon
          * sync already does and the avatar lost its weapon; door / heal graphs are first-person (arm-only animation,
          * cinematic beautifier, "Use Door" on the player's own target) and broke the avatar */
-        int mine = d == g_sig_mydrv, tx = mine && (g_sigsync == 1 ? sig_listed(g_sig_allow, g_sig_nallow, h) :
+        int mine = d == g_sig_mydrv, tx;
+        if (!mine && d != g_sig_avdrv) { nre_puppet_signal(d, h); nsg_host_signal(d, h); }
+        tx = mine && (g_sigsync == 1 ? sig_listed(g_sig_allow, g_sig_nallow, h) :
                                                    g_sigsync == 2 && !sig_listed(g_sig_deny, g_sig_ndeny, h));
         g_sig_r++;
-        if (g_siglog && (mine || d == g_sig_avdrv || g_siglog >= 3))
-            logf_("sig: %s %08x from D+%X%s", mine ? "me" : d == g_sig_avdrv ? "avatar" : "other", h, c, tx ? " -> peer" : "");
+        if (g_siglog && (mine || d == g_sig_avdrv || g_siglog >= 3 || sig_watched(h)))
+            logf_("sig: %s %08x from D+%X%s", mine ? "me" : d == g_sig_avdrv ? "avatar" : "npc", h, c, tx ? " -> peer" : "");
         else if (g_siglog >= 2 && !mine) {
             static unsigned nother;
             if (++nother <= 400) logf_("sig: other %p %08x from D+%X", d, h, c);
@@ -4641,6 +5004,8 @@ static void net_tick(void)
         if (r == (int)sizeof(RldPkt) && rb.magic == RLD_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) rld_rx((const RldPkt *)&rb); continue; }
         if (r == (int)sizeof(HitPkt) && rb.magic == HIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) hit_apply((const HitPkt *)&rb); continue; }
         if (r >= (int)offsetof(VehPkt, e) && rb.magic == VEH_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) veh_rx((const VehPkt *)&rb, r); continue; }
+        if (r == (int)sizeof(NpcSigPkt) && rb.magic == NSG_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) nsg_rx((const NpcSigPkt *)&rb); continue; }
+        if (r == (int)sizeof(NpcReactPkt) && rb.magic == NRE_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) nre_rx((const NpcReactPkt *)&rb); continue; }
         if (r == (int)sizeof(DoorPkt) && rb.magic == DOR_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) door_rx((const DoorPkt *)&rb); continue; }
         if (r == (int)sizeof(SigPkt) && rb.magic == SIG_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) sig_rx((const SigPkt *)&rb); continue; }
         if (r >= 12 && rb.magic == NPC_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_rx(&rb, r); continue; }
