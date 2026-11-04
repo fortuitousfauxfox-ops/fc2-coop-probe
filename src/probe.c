@@ -358,6 +358,7 @@ static int g_nmssync;               /* nmssync 0|1 (defined with the NPC move st
 static unsigned g_nms_tx, g_nms_rx, g_nms_set;
 static volatile LONG g_ms_skips;
 static int g_nmslayers;
+static int g_npcface;
 static unsigned g_ndp_tx, g_ndp_rx, g_ndp_add, g_ndp_del;
 static int g_nsgsync;               /* nsgsync 0|1 (defined with the NPC behaviour signals) */
 static int g_plyfind;                /* plyfind 1: the player lookup answers a fake player for the avatar */
@@ -1737,6 +1738,8 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "nmssync %d", &n) == 1) {
         g_nmssync = n; logf_("nmssync %d (sent %u, got %u, set %u, guard skips %ld; ndp sent %u, got %u, added %u, removed %u)", n, g_nms_tx, g_nms_rx,
               g_nms_set, g_ms_skips, g_ndp_tx, g_ndp_rx, g_ndp_add, g_ndp_del);
+    } else if (sscanf(ln, "npcface %d", &n) == 1) {
+        g_npcface = n; logf_("npcface %d", n);
     } else if (sscanf(ln, "nmslayers %d", &n) == 1) {
         g_nmslayers = n < 0 ? 0 : n > 3 ? 3 : n; logf_("nmslayers %d", g_nmslayers);
     } else if (sscanf(ln, "mslog %d", &n) == 1) {
@@ -3557,6 +3560,36 @@ static void npc_anim_rx(const NpcAnimPkt *a)
     if (g_npc_role != 2) return;
     for (j = 0; j < g_np_n; j++) if (g_np[j].id == a->id) { memcpy(g_np[j].av, a->v, sizeof g_np[j].av); g_np[j].avok = 1; return; }
 }
+/* facing: the host's body yaw arrives in the memento's second aim pair (+0xE8, it matches the host entity's row 0),
+ * but a puppet standing still never turned to it (A/B 2026-11-04: most puppets 15-160 degrees off, for good). After
+ * the puppet's update its entity matrix gets that yaw, eased in (rows (c,s,0) (-s,c,0) (0,0,1) as for the avatar).
+ * npcface 0 turns it off. */
+static int g_npcface = 1;
+static float g_np_face[NPC_MAX][2];
+/* the host NPC stands: its synced velocity (memento +0x70 / +0x84) under 0.25 m/s */
+static int npc_standing(int j)
+{
+    BYTE *m = g_np[j].mem;
+    float vx, vy;
+    if (!m || IsBadReadPtr(m + 0x70, 0x28)) return 0;
+    vx = np_dq(m + 0x70, 15); vy = np_dq(m + 0x84, 15);
+    return vx * vx + vy * vy < 0.25f * 0.25f;
+}
+/* only while it stands: walking, the puppet turns itself and the forced yaw made the walk jerky (owner, A/B) */
+static void npc_face(int j, BYTE *obj)
+{
+    BYTE *m = g_np[j].mem;
+    float yaw, dx, dy, *f = g_np_face[j], *r, n;
+    if (!g_npcface || !m || IsBadReadPtr(m + 0xE8, 0x14) || IsBadWritePtr(obj + 0x30, 0x30)) return;
+    if (!npc_standing(j)) { f[0] = *(float *)(obj + 0x30); f[1] = *(float *)(obj + 0x34); return; }
+    yaw = np_dq(m + 0xE8, 360); dx = cosf(yaw); dy = sinf(yaw);
+    if (f[0] * dx + f[1] * dy < -0.9f || (f[0] == 0 && f[1] == 0)) { f[0] = dx; f[1] = dy; }
+    else { f[0] += (dx - f[0]) * 0.2f; f[1] += (dy - f[1]) * 0.2f; n = sqrtf(f[0] * f[0] + f[1] * f[1]); if (n < 1e-3f) { f[0] = dx; f[1] = dy; } else { f[0] /= n; f[1] /= n; } }
+    r = (float *)(obj + 0x30);
+    r[0] = f[0]; r[1] = f[1]; r[2] = 0;
+    r[4] = -f[1]; r[5] = f[0]; r[6] = 0;
+    r[8] = 0; r[9] = 0; r[10] = 1;
+}
 /* called after a remote-driven main beautifier's update (mf_call) */
 static void npc_anim_apply(BYTE *mb)
 {
@@ -3574,6 +3607,7 @@ static void npc_anim_apply(BYTE *mb)
             if (hd3) (*(int *)((BYTE *)hd3 + 8))--;
             if (o3 != g_np[j].obj) return;   /* the puppet left the world: its cached entity pointer is stale */
             if ((v = npc_animvars(o3))) { nms_apply(g_np[j].id, o3, v); ms_watch("puppet", g_np[j].id, v); }
+            npc_face(j, o3);
             if (g_np_react[j] && (int)(g_np_react[j] - GetTickCount()) > 0) return;
             if (g_np[j].avok && (v = npc_animvars(o3))) {
                 if (!g_np[j].lastact && !g_np[j].lid && (v[0x58] != g_np[j].av[0x58] || v[0x42] != g_np[j].av[0x42])) g_np[j].ownact = 1;
@@ -3586,6 +3620,9 @@ static void npc_anim_apply(BYTE *mb)
                  * owner: host NPCs calm, puppets weapon up); the 8 that change every frame with the movement stay the
                  * puppet's own (all 23 from the host: puppets walked on the spot) */
                 for (k = 0; k < NANM_VARS; k++) if (!own[k] || (g_npcanim == 2 && !move[k])) v[k] = g_np[j].av[k];
+                /* while the host NPC stands, its speed / turn inputs too: the puppet's own (v00 2.4 -> 0 while it caught
+                 * up with the host position) made it step on the spot */
+                if (g_npcface && npc_standing(j)) { v[0x00] = g_np[j].av[0x00]; v[0x01] = g_np[j].av[0x01]; v[0x02] = g_np[j].av[0x02]; }
             }
             return;
         }
