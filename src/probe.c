@@ -351,11 +351,15 @@ static Target g_targets[] = {
 static int g_npc_role;            /* npcsync: 1 host, 2 join (declared here for coop_flags.txt) */
 static int g_noautodraw;          /* coop_flags.txt "noautodraw": leave our player's inventory bAutoDraw as loaded */
 static int g_vehsync;              /* vehsync 0|1 (defined with the vehicle sync) */
+static int g_doorsync;              /* doorsync 0|1 (defined with the doors) */
 static int g_siglog, g_sigsync = 1; /* siglog 0|1|2|3, sigsync 0 off | 1 allow list | 2 all but denied (RE) */
 static unsigned g_sig_deny[32], g_sig_allow[32] = {
     0x328D8D10u, 0x9D3BCA58u,      /* throw_grenade, throw_player: the avatar throws (its weapon sync gives empty hands) */
+    0x33111508u, 0xC4A5E460u, 0x9F347422u,  /* open_door, open_door_to / out_of_weaponsafe: the door moves only with its
+                                             * user's animation, so the avatar plays it (DOR1 gives it the door first) */
 };
-static int g_sig_ndeny, g_sig_nallow = 2;
+static int g_sig_ndeny, g_sig_nallow = 5;
+static void door_target_send(void);
 static int sig_listed(const unsigned *l, int n, unsigned h);
 static int patch_iat(HMODULE m)
 {
@@ -1603,6 +1607,8 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "siglog %d", &n) == 1) {
         /* siglog 0|1|2|3: log state signals of our player and the avatar (2 also other pawns, first 400; 3 all) */
         g_siglog = n; logf_("siglog %d", n);
+    } else if (sscanf(ln, "doorsync %d", &n) == 1) {
+        g_doorsync = n; logf_("doorsync %d", n);
     } else if (sscanf(ln, "sigsync %d", &n) == 1) {
         g_sigsync = n; logf_("sigsync %d (%d allowed, %d denied)", n, g_sig_nallow, g_sig_ndeny);
     } else if (sscanf(ln, "sigallow %lx", &a) == 1 || sscanf(ln, "sigdeny %lx", &a) == 1) {
@@ -4381,6 +4387,7 @@ static void sig_tick(DWORD now)
             static unsigned nother;
             if (++nother <= 400) logf_("sig: other %p %08x from D+%X", d, h, c);
         }
+        if (tx && (h == 0x33111508u || h == 0xC4A5E460u || h == 0x9F347422u)) door_target_send();
         if (tx) {
             memmove(g_sig_hist, g_sig_hist + 1, (SIG_N - 1) * 4);
             g_sig_hist[SIG_N - 1] = h; g_sig_seq++; g_sig_new_t = now;
@@ -4389,6 +4396,86 @@ static void sig_tick(DWORD now)
     }
     /* UDP can drop one: repeat the last packet twice, 100 ms apart */
     if (g_sig_seq && now - g_sig_new_t < 250 && now - g_sig_sent_t >= 100) { sig_send(); g_sig_sent_t = now; }
+}
+
+/* ---- doors (DOR1). The door graph's "Use Door" event (CGOStateEventFCXPawn req 6, Begin of Opening Door) runs
+ * FUN_10727650(pawn comp) (stdcall): door id from the pawn's blackboard 0x3C06F343, its CDoor component (key
+ * 11649A18), then FUN_106c4040(door comp, pawn handle): anim var 0x5B = door action (CDoor +0x4C), the door's
+ * animation comp (FDF2F0) is bound to the pawn's animation (FUN_10524be0), weapon-safe zone in/out. So a door only
+ * moves with its user's Pawn_Generic_Open_Door animation; calling it for an avatar that plays nothing did nothing.
+ * Now: right before an open_door* signal goes out in SIG1 our player's door target goes out in DOR1, the peer puts it
+ * in the avatar's blackboard, and the avatar's own door graph (from the signal) uses the door. ---- */
+#define DOR_MAGIC 0x31524F44u      /* "DOR1" */
+#define DOOR_BB_KEY 0x3C06F343u
+typedef struct { unsigned magic, seq; unsigned long long door; int action, pad; } DoorPkt;   /* action = CDoor +0x4C */
+#define DOOR_ACTION 0x4C            /* LastDoorAction (0 / 1 by the side the user stands on; descriptor 6C39A0) */
+static int g_door_action;
+static BYTE *door_comp(unsigned long long id)
+{
+    void *hd = NULL;
+    BYTE *obj = id && id != ~0ULL ? entity_obj(id, &hd) : NULL, *dc;
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    dc = obj ? ((BYTE *(__attribute__((thiscall)) *)(void *, void *))(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0x1649A18)) : NULL;
+    return dc && !IsBadWritePtr(dc, DOOR_ACTION + 4) ? dc : NULL;
+}
+static void *g_door_orig;
+static BYTE *volatile g_door_av;      /* the avatar's pawn comp (set by door_tick) */
+static volatile unsigned g_door_used; /* bumped by the detour when the avatar uses a door */
+static unsigned g_door_seq, g_door_rx_seq;
+static unsigned long long g_door_last;
+static DWORD g_door_t, g_door_sent_t;
+static int g_doorsync = 1;
+static void __attribute__((stdcall)) door_hook(BYTE *pawn)
+{
+    ((void (__attribute__((stdcall)) *)(BYTE *))g_door_orig)(pawn);
+    if (pawn && pawn == g_door_av) g_door_used++;
+}
+static void door_install(void)
+{
+    /* 727650: sub esp,8; test byte [1164CDEC],1 (10 bytes, position independent), then push ebx */
+    static const BYTE pro[10] = { 0x83, 0xEC, 0x08, 0xF6, 0x05, 0xEC, 0xCD, 0x64, 0x11, 0x01 };
+    if (g_door_orig) return;
+    if (memcmp(g_base + 0x727650, pro, sizeof pro)) { logf_("door: unexpected bytes at 727650, no door hook"); g_door_orig = (void *)1; return; }
+    g_door_orig = make_detour(g_base + 0x727650, 10, (void *)door_hook, 1);
+    logf_("door: use-door hook on 727650 installed");
+}
+static void door_send(void)
+{
+    DoorPkt k = { DOR_MAGIC, g_door_seq, g_door_last, g_door_action, 0 };
+    sendto(g_ns, (char *)&k, sizeof k, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+}
+/* called by sig_tick before it sends an open_door* signal */
+static void door_target_send(void)
+{
+    if (!g_doorsync) return;
+    BYTE *dc;
+    /* the door code (6C43BE) sets our target (blackboard) and the door's action right after this signal */
+    g_door_last = pawn_bb_u64(g_net_id, DOOR_BB_KEY);
+    g_door_action = (dc = door_comp(g_door_last)) ? *(int *)(dc + DOOR_ACTION) : -1;
+    g_door_seq++; g_door_t = g_door_sent_t = GetTickCount();
+    logf_("door: our player opens door %llu, action %d -> peer", g_door_last, g_door_action);
+    door_send();
+}
+static void door_rx(const DoorPkt *k)
+{
+    BYTE *dc;
+    if (k->seq < g_door_rx_seq) g_door_rx_seq = 0;      /* the peer's probe restarted */
+    if (k->seq == g_door_rx_seq) return;
+    g_door_rx_seq = k->seq;
+    if (!g_doorsync || !g_av_id) return;
+    /* the door's action picks the side of the animation: left as it was here, the avatar jumped to the other side */
+    if ((dc = door_comp(k->door)) && (k->action == 0 || k->action == 1)) *(int *)(dc + DOOR_ACTION) = k->action;
+    logf_("door: the peer opens door %llu, action %d (door comp %p) -> avatar's target: %d", k->door, k->action, dc,
+          pawn_bb_set_u64(g_av_id, DOOR_BB_KEY, k->door));
+}
+static void door_tick(DWORD now)
+{
+    static unsigned seen;
+    if (!g_door_orig) door_install();
+    g_door_av = g_av_id ? pawn_comp_of(g_av_id) : NULL;
+    if (g_door_used != seen) { seen = g_door_used; logf_("door: the avatar used door %llu", pawn_bb_u64(g_av_id, DOOR_BB_KEY)); }
+    /* repeat twice, 100 ms apart, like SIG1 (DOR1 goes out before the signal, so it arrives first) */
+    if (g_doorsync && g_door_seq && now - g_door_t < 250 && now - g_door_sent_t >= 100) { door_send(); g_door_sent_t = now; }
 }
 
 static void net_tick(void)
@@ -4494,6 +4581,7 @@ static void net_tick(void)
         if (r == (int)sizeof(RldPkt) && rb.magic == RLD_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) rld_rx((const RldPkt *)&rb); continue; }
         if (r == (int)sizeof(HitPkt) && rb.magic == HIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) hit_apply((const HitPkt *)&rb); continue; }
         if (r >= (int)offsetof(VehPkt, e) && rb.magic == VEH_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) veh_rx((const VehPkt *)&rb, r); continue; }
+        if (r == (int)sizeof(DoorPkt) && rb.magic == DOR_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) door_rx((const DoorPkt *)&rb); continue; }
         if (r == (int)sizeof(SigPkt) && rb.magic == SIG_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) sig_rx((const SigPkt *)&rb); continue; }
         if (r >= 12 && rb.magic == NPC_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_rx(&rb, r); continue; }
         if (r > (int)sizeof q4) { g_net_drop++; continue; }
@@ -4615,6 +4703,7 @@ static void net_tick(void)
     npc_join_tick(now);
     veh_tick(now);
     sig_tick(now);
+    door_tick(now);
     /* send at 20 Hz */
     if ((g_bodymat || g_net_id) && now - g_net_lastsend >= 50 && player_ready(g_net_id)) {
         NetPktX4 q4;
