@@ -353,6 +353,9 @@ static int g_noautodraw;          /* coop_flags.txt "noautodraw": leave our play
 static int g_vehsync;              /* vehsync 0|1 (defined with the vehicle sync) */
 static int g_doorsync;              /* doorsync 0|1 (defined with the doors) */
 static int g_nresync;               /* nresync 0|1 (defined with the NPC reactions) */
+static int g_mslog;                 /* mslog 0|1 (defined with the anim vars) */
+static int g_nmssync;               /* nmssync 0|1 (defined with the NPC move states) */
+static unsigned g_nms_tx, g_nms_rx, g_nms_set;
 static int g_nsgsync;               /* nsgsync 0|1 (defined with the NPC behaviour signals) */
 static int g_plyfind;                /* plyfind 1: the player lookup answers a fake player for the avatar */
 static int g_plylog;                 /* plylog 1: plycallers every 2 s */
@@ -1679,6 +1682,10 @@ static void native_cmd(const char *ln)
         ply_install(); ply_callers();
     } else if (sscanf(ln, "nsgsync %d", &n) == 1) {
         g_nsgsync = n; logf_("nsgsync %d", n);
+    } else if (sscanf(ln, "nmssync %d", &n) == 1) {
+        g_nmssync = n; logf_("nmssync %d (sent %u, got %u, set %u)", n, g_nms_tx, g_nms_rx, g_nms_set);
+    } else if (sscanf(ln, "mslog %d", &n) == 1) {
+        g_mslog = n; logf_("mslog %d", n);
     } else if (sscanf(ln, "nresync %d", &n) == 1) {
         g_nresync = n; logf_("nresync %d", n);
     } else if (sscanf(ln, "doorsync %d", &n) == 1) {
@@ -2971,6 +2978,110 @@ typedef struct { unsigned magic; unsigned long long id; unsigned v[NANM_VARS]; }
  * play (a host NPC drank, its puppet stood): the variables mirror the action, they do not start it */
 static const unsigned char g_anim_own[] = { 0x00, 0x01, 0x02, 0x07, 0x08, 0x0b, 0x14, 0x1d, 0x1f, 0x20, 0x25, 0x26, 0x33, 0x34, 0x38, 0x40,
                                             0x5c, 0x5d, 0x5e, 0x5f, 0x62, 0x65, 0x66 };
+/* the animation graph's three layers (MoveLayer 0..2): what the AI and the GO states ask each layer to play ends up
+ * as a move state id at +0x220 + layer * 4 of the same block (FUN_1051f500(layer, id, flag, blend) on the anim
+ * component writes it through FUN_1027c4f0: id, flag byte +0x274, dirty byte +0x284; FUN_1051f4e0(layer) reads it).
+ * mslog 1 logs every change for host NPCs and puppets. */
+static int g_mslog;
+static struct { unsigned long long id; int ms[3]; } g_msw[128];
+static void ms_watch(const char *tag, unsigned long long id, const unsigned *v)
+{
+    const int *ms = (const int *)((const BYTE *)v - 0x10 + 0x220);
+    int i, k, fr = -1;
+    if (!g_mslog) return;
+    for (i = 0; i < 128; i++) { if (g_msw[i].id == id) break; if (!g_msw[i].id && fr < 0) fr = i; }
+    if (i == 128) { if (fr < 0) return; i = fr; g_msw[i].id = id; for (k = 0; k < 3; k++) g_msw[i].ms[k] = 0x7FFFFFFF; }
+    for (k = 0; k < 3; k++)
+        if (ms[k] != g_msw[i].ms[k]) {
+            logf_("ms %s %llu layer %d: %x -> %x (flag %u, blend %.2f; v58 %d)", tag, id, k, g_msw[i].ms[k], ms[k],
+                  ((const BYTE *)v - 0x10 + 0x274)[k], ((const float *)((const BYTE *)v - 0x10 + 0x22c))[k], (int)v[0x58]);
+            g_msw[i].ms[k] = ms[k];
+        }
+}
+/* ---- NPC move states (NMS1). Whatever the host's AI makes an NPC do (sit, drink, smoke, talk, gesture, react) ends
+ * up as these three layer ids; the joiner's puppet (AI paused) asks for nothing and stands. The host sends each NPC's
+ * three ids when one changes and every 2 s; the joiner asks its puppet's anim component for the same ones with the
+ * game's own request FUN_1051f500. ---- */
+#define NMS_MAGIC 0x31534D4Eu      /* "NMS1" */
+typedef struct { unsigned magic; unsigned long long id; int ms[3]; } NpcMsPkt;
+/* off: requests through FUN_1051f500 crash the joiner within seconds (Dunia+282D52 missing clip, then with the guard
+ * +CF7D63, +286F82, +28462D: bad layer node pointers): the host's AI loads what a move state needs, the puppet's
+ * does not, and a bare request does not either */
+static int g_nmssync = 0;          /* nmssync 0|1 */
+static unsigned g_nms_tx, g_nms_rx, g_nms_set;
+static struct { unsigned long long id; int ms[3]; DWORD sent; } g_nms_h[128];    /* host: last sent */
+static struct { unsigned long long id; int ms[3], done[3]; int ok; } g_nms_j[128];   /* joiner: last from the host, last requested */
+static void nms_host(unsigned long long id, const unsigned *v, DWORD now)
+{
+    const int *ms = (const int *)((const BYTE *)v - 0x10 + 0x220);
+    int i, fr = -1;
+    NpcMsPkt k;
+    if (!g_nmssync) return;
+    for (i = 0; i < 128; i++) { if (g_nms_h[i].id == id) break; if (!g_nms_h[i].id && fr < 0) fr = i; }
+    if (i == 128) { if (fr < 0) return; i = fr; g_nms_h[i].id = id; g_nms_h[i].sent = 0; }
+    if (!memcmp(g_nms_h[i].ms, ms, sizeof k.ms) && now - g_nms_h[i].sent < 2000) return;
+    memcpy(g_nms_h[i].ms, ms, sizeof k.ms); g_nms_h[i].sent = now;
+    k.magic = NMS_MAGIC; k.id = id; memcpy(k.ms, ms, sizeof k.ms);
+    sendto(g_ns, (char *)&k, sizeof k, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+    g_nms_tx++;
+}
+static void nms_rx(const NpcMsPkt *k)
+{
+    int i, fr = -1;
+    if (g_npc_role != 2) return;
+    g_nms_rx++;
+    for (i = 0; i < 128; i++) { if (g_nms_j[i].id == k->id) break; if (!g_nms_j[i].id && fr < 0) fr = i; }
+    if (i == 128) { if (fr < 0) return; i = fr; g_nms_j[i].id = k->id; }
+    if (!g_nms_j[i].ok) { int l; for (l = 0; l < 3; l++) g_nms_j[i].done[l] = 0x7FFFFFFF; }
+    memcpy(g_nms_j[i].ms, k->ms, sizeof k->ms); g_nms_j[i].ok = 1;
+}
+/* joiner, after the puppet's beautifier update: request the host's ids on layers that differ */
+static void nms_apply(unsigned long long id, BYTE *obj, const unsigned *v)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    typedef void (__attribute__((thiscall)) *req_t)(void *ac, int layer, int ms, int flag, float blend);
+    const int *cur = (const int *)((const BYTE *)v - 0x10 + 0x220);
+    BYTE *ac;
+    int i, l;
+    if (!g_nmssync) return;
+    for (i = 0; i < 128 && g_nms_j[i].id != id; i++) ;
+    if (i == 128 || !g_nms_j[i].ok) return;
+    if (!(ac = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDF190)))) return;
+    /* layers 0 (body) and 1 (arms) only: layer 2 holds the props' gestures (beer, cigarette: 58x); a puppet asked
+     * for one crashed in the layer update right after (Dunia+286F82), like the relayed layered STP before */
+    for (l = 0; l < 2; l++)
+        /* once per host change: asked again every frame, a layer the puppet resets itself (layer 2 went back to -1
+         * each frame) left its node pointer bad (Dunia+CF7D63, read of 2) */
+        if (cur[l] != g_nms_j[i].ms[l] && g_nms_j[i].done[l] != g_nms_j[i].ms[l]) {
+            g_nms_j[i].done[l] = g_nms_j[i].ms[l];
+            if (++g_nms_set <= 300 || g_mslog) logf_("nms: puppet %llu layer %d: %x -> host's %x", id, l, cur[l], g_nms_j[i].ms[l]);
+            ((req_t)(g_base + 0x51F500))(ac, l, g_nms_j[i].ms[l], 0, 0.0f);
+        }
+}
+/* a layer whose move state has no animation loaded here (the host's AI streamed it in for the NPC, the puppet's did
+ * not): FUN_10284770 asks both of its blend nodes for it (vf+0x80) and passed null on to FUN_10282d10 (Dunia+282D52,
+ * read of 0). Patched at 102848F0: when the second one is null too, it leaves the way it does when vf+0x64 fails
+ * (10284BC1), so the layer just does not play that request. */
+static void ms_guard_install(void)
+{
+    static const BYTE orig[10] = { 0x8B, 0x82, 0x88, 0x00, 0x00, 0x00, 0xFF, 0xD0, 0xEB, 0x07 };
+    BYTE *at = g_base + 0x2848F0, *c;
+    DWORD old;
+    if (memcmp(at, orig, sizeof orig)) { logf_("ms guard: unexpected bytes at 2848F0"); return; }
+    c = (BYTE *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    memcpy(c, orig, 8);                                           /* mov eax,[edx+88h]; call eax (st0 = float) */
+    memcpy(c + 8, "\x83\xBC\x24\x94\x00\x00\x00\x00", 8);          /* cmp dword [esp+94h],0 */
+    c[16] = 0x74; c[17] = 5;                                      /* je +5 */
+    c[18] = 0xE9; *(DWORD *)(c + 19) = (DWORD)(g_base + 0x284901) - (DWORD)(c + 23);
+    c[23] = 0xDD; c[24] = 0xD8;                                   /* fstp st(0) */
+    c[25] = 0xE9; *(DWORD *)(c + 26) = (DWORD)(g_base + 0x284BC1) - (DWORD)(c + 30);
+    VirtualProtect(at, 10, PAGE_EXECUTE_READWRITE, &old);
+    at[0] = 0xE9; *(DWORD *)(at + 1) = (DWORD)c - (DWORD)(at + 5);
+    memset(at + 5, 0x90, 5);
+    VirtualProtect(at, 10, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), at, 10);
+    logf_("ms guard: missing layer animation no longer crashes (2848F0)");
+}
 static unsigned *npc_animvars(BYTE *obj)
 {
     typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
@@ -3098,6 +3209,8 @@ static void npc_host_tick(DWORD now)
             if (hd2) (*(int *)((BYTE *)hd2 + 8))--;
             v = o2 ? npc_animvars(o2) : NULL;
             if (!v || !safe_read(v, a.v, sizeof a.v)) continue;
+            ms_watch("host", g_nh[i].id, v);
+            nms_host(g_nh[i].id, v, now);
             if (a.v[0x58] != g_nh[i].lastact) {
                 logf_("npcact host %llu: action v58 %d -> %d (v42 %u v48 %u v11 %u v12 %u)", g_nh[i].id, (int)g_nh[i].lastact, (int)a.v[0x58], a.v[0x42],
                       a.v[0x48], a.v[0x11], a.v[0x12]);
@@ -3273,6 +3386,7 @@ static void npc_anim_apply(BYTE *mb)
             BYTE *o3 = entity_obj(g_np[j].lid ? g_np[j].lid : g_np[j].id, &hd3);
             if (hd3) (*(int *)((BYTE *)hd3 + 8))--;
             if (o3 != g_np[j].obj) return;   /* the puppet left the world: its cached entity pointer is stale */
+            if ((v = npc_animvars(o3))) { nms_apply(g_np[j].id, o3, v); ms_watch("puppet", g_np[j].id, v); }
             if (g_np_react[j] && (int)(g_np_react[j] - GetTickCount()) > 0) return;
             if (g_np[j].avok && (v = npc_animvars(o3))) {
                 if (!g_np[j].lastact && !g_np[j].lid && (v[0x58] != g_np[j].av[0x58] || v[0x42] != g_np[j].av[0x42])) g_np[j].ownact = 1;
@@ -4772,6 +4886,7 @@ static void sig_tick(DWORD now)
 {
     static DWORD drv_t;
     if (!g_sig_orig) sig_install();
+    if (g_nmssync) { static int gi; if (!gi) { gi = 1; ms_guard_install(); } }
     if (now - drv_t > 500) {
         drv_t = now;
         g_sig_mydrv = player_ready(g_net_id) ? pawn_driver(g_net_id) : NULL;
@@ -4983,6 +5098,7 @@ static void net_tick(void)
             continue;
         }
         if (r == (int)sizeof(NpcWeapPkt) && rb.magic == NWPN_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_weap_rx((const NpcWeapPkt *)&rb); continue; }
+        if (r == (int)sizeof(NpcMsPkt) && rb.magic == NMS_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) nms_rx((const NpcMsPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcAnimPkt) && rb.magic == NANM_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_anim_rx((const NpcAnimPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NSHT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_shot_apply((const NpcHitPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NHIT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_hit_apply((const NpcHitPkt *)&rb); continue; }
