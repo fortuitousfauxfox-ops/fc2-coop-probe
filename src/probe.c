@@ -756,6 +756,11 @@ static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, con
  * then select it like SelectWeapon (FUN_1012ce80 -> FUN_1012b9b0: inventory weapon mode +0x78 = 1, current weapon) */
 static int pawn_give_weapon(BYTE *obj, const char *arch, const char *who);
 static void *g_last_gadget;          /* gadget component pawn_give_weapon added last */
+static unsigned long long g_last_wid;  /* weapon entity pawn_give_weapon added last (0 = a gadget or nothing) */
+/* weapons the avatar already carries, by archetype: switching back to one only selects it (as the player's own
+ * switch does: holster / draw animations). Spawning a new entity on every switch swapped the weapon in the hands
+ * at once, sometimes leaving them empty. */
+static struct { char arch[96]; unsigned long long wid; } g_av_wc[8];
 static void *g_av_mapcomp;           /* the avatar's map gadget component while it holds the map */
 static unsigned long long g_av_gps;  /* the avatar's own GPS entity while it holds the map (0 none) */
 /* The GPS in the other hand while the map is out. The map's UseStrategy (gadget comp +0x10, vtable E99EC0) owns a
@@ -812,6 +817,45 @@ static void pawn_holster(BYTE *obj)
     if (impl && *(int *)(impl + 0x74) == 2) ((inv0_t)(g_base + 0x12B350))(inv);
     if (((iget_t)(g_base + 0x125F40))(inv) == 1) ((inv0_t)(g_base + 0x12B340))(inv);
 }
+/* select a weapon the avatar already carries: 0 when it has none of that archetype in its slot any more */
+static int av_select_cached(const char *arch)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    typedef void *(__fastcall *inv_t)(void *pawn);
+    typedef unsigned (__attribute__((thiscall)) *slot_t)(void *weapon);
+    typedef void *(__attribute__((thiscall)) *inslot_t)(void *inv, unsigned slot);
+    typedef void (__attribute__((thiscall)) *sel_t)(void *inv, unsigned *cat);
+    void *hd = NULL, *wh = NULL, *pawn, *wc, *inv;
+    BYTE *obj, *wobj;
+    unsigned slot, cat;
+    int i;
+    for (i = 0; i < 8; i++) if (g_av_wc[i].wid && !strcmp(g_av_wc[i].arch, arch)) break;
+    if (i == 8 || !g_av_id) return 0;
+    obj = entity_obj(g_av_id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    wobj = entity_obj(g_av_wc[i].wid, &wh);
+    if (wh) (*(int *)((BYTE *)wh + 8))--;
+    if (!obj || !wobj || !(pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C))) ||
+        !(wc = ((gcomp_t)(g_base + 0x4E2CC0))(wobj, (void *)(g_base + 0xFE01F8))) || !(inv = ((inv_t)(g_base + 0x7E140))(pawn))) {
+        g_av_wc[i].wid = 0; return 0;
+    }
+    slot = ((slot_t)(*(void ***)wc)[0x8C / 4])(wc);
+    if (((inslot_t)(g_base + 0x129DE0))(inv, slot) != wc || IsBadReadPtr((void *)slot, 4)) { g_av_wc[i].wid = 0; return 0; }
+    cat = *(unsigned *)slot;
+    ((sel_t)(g_base + 0x12CE80))(inv, &cat);
+    logf_("avweapon: %s already carried (entity %llu), selected", arch, g_av_wc[i].wid);
+    return 1;
+}
+static void av_cache_weapon(const char *arch, unsigned long long wid)
+{
+    int i, j = -1;
+    for (i = 0; i < 8; i++) {
+        if (g_av_wc[i].wid && !strcmp(g_av_wc[i].arch, arch)) { j = i; break; }
+        if (!g_av_wc[i].wid && j < 0) j = i;
+    }
+    if (j < 0) j = 0;
+    snprintf(g_av_wc[j].arch, sizeof g_av_wc[j].arch, "%s", arch); g_av_wc[j].wid = wid;
+}
 static int av_give_weapon(const char *arch)
 {
     void *holder = NULL;
@@ -844,6 +888,7 @@ static int pawn_give_weapon(BYTE *obj, const char *arch, const char *who)
     if (!wobj) { logf_("%s: spawn of %s failed (%s)", who, arch, out); return 0; }
     pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
     wc = ((gcomp_t)(g_base + 0x4E2CC0))(wobj, (void *)(g_base + 0xFE01F8));
+    g_last_wid = wc ? wid : 0;
     if (pawn && !wc && (wc = ((gcomp_t)(g_base + 0x4E2CC0))(wobj, (void *)(g_base + 0xFDFFB4)))) {
         /* a gadget (map / GPS), added like the Lua AddGadget handler (LAB_109f9460) does: slot = vf+0x8C, the old
          * gadget of that slot FUN_10129df0 -> FUN_1012e3f0, FUN_10149ec0(3), FUN_10128a00; then taken into the hands
@@ -2374,6 +2419,18 @@ static void np_tick(DWORD now)
         if (ahead > maxa) ahead = maxa;
         for (k = 0; k < 3; k++) p[k] = g_av_lastpos[k] + g_av_vel[k] * ahead;
     }
+    {
+        /* a door (cinematic beautifier E16AD0) or a vehicle swaps the main beautifier; the new standard one needs the MP
+         * flag at once, not at the next 500 ms check: until then the avatar slid out of the door without walking */
+        static DWORD mf_t;
+        if (now - mf_t >= 50) {
+            void *hd = NULL;
+            BYTE *ao = entity_obj(g_av_id, &hd), *bc;
+            if (hd) (*(int *)((BYTE *)hd + 8))--;
+            mf_t = now;
+            if (ao && (bc = ((np_getcomp_t)(g_base + 0x4E2CC0))(ao, (void *)(g_base + 0xFDEAD4)))) mf_install(bc);
+        }
+    }
     if (now - g_av_lastlog >= 500) {
         /* measurements: how far the pawn is from the written target, and both speeds */
         void *holder = NULL;
@@ -2498,6 +2555,7 @@ static void av_forget(void)
 {
     g_st_obj[0] = NULL;
     g_av_id = 0; g_av_body = g_av_mat = NULL; g_av_have = 0; av_compass(0);
+    memset(g_av_wc, 0, sizeof g_av_wc);
     g_av_mem = NULL; g_av_comp = NULL; g_av_npstate = 0; g_av_weap[0] = 0; g_av_lastseq = 0; g_av_smhave = 0;
 }
 
@@ -3477,8 +3535,10 @@ static void av_tick(DWORD now)
                 strcpy(g_av_weap, g_rx_weap);
                 g_av_weap_try = 0;
             }
+            else if (av_select_cached(g_rx_weap)) { strcpy(g_av_weap, g_rx_weap); g_av_weap_try = 0; }
             else if (av_give_weapon(g_rx_weap)) {
                 strcpy(g_av_weap, g_rx_weap); g_av_weap_try = 0;
+                if (g_last_wid) av_cache_weapon(g_rx_weap, g_last_wid);
                 if (!strcmp(g_rx_weap, "gadgets.Equipped.Map")) { g_av_mapcomp = g_last_gadget; av_compass(1); }
             }
         }
