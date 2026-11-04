@@ -356,6 +356,9 @@ static int g_nresync;               /* nresync 0|1 (defined with the NPC reactio
 static int g_mslog;                 /* mslog 0|1 (defined with the anim vars) */
 static int g_nmssync;               /* nmssync 0|1 (defined with the NPC move states) */
 static unsigned g_nms_tx, g_nms_rx, g_nms_set;
+static volatile LONG g_ms_skips;
+static int g_nmslayers;
+static unsigned g_ndp_tx, g_ndp_rx, g_ndp_add, g_ndp_del;
 static int g_nsgsync;               /* nsgsync 0|1 (defined with the NPC behaviour signals) */
 static int g_plyfind;                /* plyfind 1: the player lookup answers a fake player for the avatar */
 static int g_plylog;                 /* plylog 1: plycallers every 2 s */
@@ -640,6 +643,48 @@ static unsigned long long g_hold_id;
 static float g_hold_pos[3];
 static unsigned long g_hold_ticks;
 
+/* ---- resources an entity has streamed in for itself: CDynamicDeploadComponent (component key FDFC14) +0x10 is a
+ * CResourceContainer (vtable E38B20): children at +0x28, count +0x2C, loaded children +0x34; a resource has its
+ * refcount at +4, its id (CRC32 of the lowercase path) at +0x1C, vf+4 its type {name, ...}, vf+0x18 "loaded",
+ * vf+0x48 find(&id), vf+0x60 add, vf+0x64 remove. The AI adds what an action needs (FUN_10543f40) and removes it
+ * after (FUN_10543f70): the smart terrain executor (9AB190) adds the STP's CAIWorkspaceResource. ---- */
+static const char *res_type(BYTE *r)
+{
+    typedef const char ***(__attribute__((thiscall)) *tf_t)(void *);
+    const char ***t;
+    if (!r || IsBadReadPtr(r, 0x30) || IsBadReadPtr(*(void **)r, 0x1C)) return "?";
+    t = ((tf_t)(*(void ***)r)[1])(r);
+    if (!t || IsBadReadPtr(t, 8) || IsBadReadPtr(*t, 4)) return "?";
+    return (const char *)*t;
+}
+static BYTE *dep_container(BYTE *obj)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    BYTE *c = obj ? ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDFC14)) : NULL, *k;
+    if (!c || IsBadReadPtr(c + 0x10, 4) || !(k = *(BYTE **)(c + 0x10)) || IsBadReadPtr(k, 0x38)) return NULL;
+    return k;
+}
+static void dep_log(unsigned long long id, BYTE *obj)
+{
+    typedef char (__attribute__((thiscall)) *lf_t)(void *);
+    BYTE *k = dep_container(obj), **ch, **cc;
+    unsigned i, j, n, m;
+    if (!k) { logf_("deplist %llu: no depload component", id); return; }
+    n = *(unsigned *)(k + 0x2C); ch = *(BYTE ***)(k + 0x28);
+    logf_("deplist %llu: container %p (%s) %u children, %u loaded", id, k, res_type(k), n, *(unsigned *)(k + 0x34));
+    if (n > 64 || IsBadReadPtr(ch, n * 4)) return;
+    for (i = 0; i < n; i++) {
+        BYTE *r = ch[i];
+        if (!r || IsBadReadPtr(r, 0x38)) { logf_("  [%u] %p unreadable", i, r); continue; }
+        logf_("  [%u] %p %s id %08x refs %d state %d loaded %d, %u children", i, r, res_type(r), *(unsigned *)(r + 0x1C),
+              *(int *)(r + 4), *(short *)(r + 8), (int)((lf_t)(*(void ***)r)[6])(r), *(unsigned *)(r + 0x2C));
+        m = *(unsigned *)(r + 0x2C); cc = *(BYTE ***)(r + 0x28);
+        if (m > 64 || IsBadReadPtr(cc, m * 4)) continue;
+        for (j = 0; j < m; j++)
+            if (cc[j] && !IsBadReadPtr(cc[j], 0x20))
+                logf_("      %s id %08x", res_type(cc[j]), *(unsigned *)(cc[j] + 0x1C));
+    }
+}
 static void hexdump_(const BYTE *p, int len)
 {
     int i, j;
@@ -1476,6 +1521,13 @@ static void native_cmd(const char *ln)
         sub = *(BYTE **)(c + 0x44);
         if (!sub || IsBadReadPtr(sub, 0x60)) return;
         for (k = 0; k < 0x60; k += 16) logf_("  sub+%02x: %08x %08x %08x %08x", k, *(unsigned *)(sub + k), *(unsigned *)(sub + k + 4), *(unsigned *)(sub + k + 8), *(unsigned *)(sub + k + 12));
+    } else if (sscanf(ln, "deplist %llu", &id) == 1) {
+        /* deplist <entity id>: the resources the entity's CDynamicDeploadComponent (key FDFC14) holds ([[ai]]) */
+        void *holder = NULL;
+        BYTE *obj = entity_obj(id, &holder);
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        if (!obj) { logf_("deplist %llu: no entity", id); return; }
+        dep_log(id, obj);
     } else if (sscanf(ln, "tpbuild %lx", &a) == 1) {
         /* tpbuild <component address>: give a not-started pawn net component only the ThirdParty pieces that the
          * NetPlayer beautifier reads (remote flag, started flag, +0x164 = 1, ThirdParty memento at +0x170) */
@@ -1683,7 +1735,10 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "nsgsync %d", &n) == 1) {
         g_nsgsync = n; logf_("nsgsync %d", n);
     } else if (sscanf(ln, "nmssync %d", &n) == 1) {
-        g_nmssync = n; logf_("nmssync %d (sent %u, got %u, set %u)", n, g_nms_tx, g_nms_rx, g_nms_set);
+        g_nmssync = n; logf_("nmssync %d (sent %u, got %u, set %u, guard skips %ld; ndp sent %u, got %u, added %u, removed %u)", n, g_nms_tx, g_nms_rx,
+              g_nms_set, g_ms_skips, g_ndp_tx, g_ndp_rx, g_ndp_add, g_ndp_del);
+    } else if (sscanf(ln, "nmslayers %d", &n) == 1) {
+        g_nmslayers = n < 0 ? 0 : n > 3 ? 3 : n; logf_("nmslayers %d", g_nmslayers);
     } else if (sscanf(ln, "mslog %d", &n) == 1) {
         g_mslog = n; logf_("mslog %d", n);
     } else if (sscanf(ln, "nresync %d", &n) == 1) {
@@ -2952,7 +3007,10 @@ static void npc_host_cb(unsigned long long id, BYTE *obj, BYTE *agent, void *ctx
         for (k = 0; k < 64; k++) { if (g_nagent[k].id == id) break; if (!g_nagent[k].id && free_k < 0) free_k = k; }
         if (k == 64) k = free_k >= 0 ? free_k : (int)(id % 64);
         g_nagent[k].id = id; g_nagent[k].agent = agent;
-        g_nagent[k].drv = ((void *(__attribute__((thiscall)) *)(void *))(*(void ***)agent)[0x118 / 4])(agent);
+        /* vf+0x118 reads the pawn at agent+0x268: still 0 for an agent right after a load (Dunia+9600B6 crashed A);
+         * the next pass fills it in */
+        g_nagent[k].drv = IsBadReadPtr(agent + 0x268, 4) || !*(void **)(agent + 0x268) ? NULL :
+            ((void *(__attribute__((thiscall)) *)(void *))(*(void ***)agent)[0x118 / 4])(agent);
     }
 }
 static float npc_hp(BYTE *obj, float *hpmax)
@@ -3008,9 +3066,10 @@ typedef struct { unsigned magic; unsigned long long id; int ms[3]; } NpcMsPkt;
  * +28462D crashes); the AI calls it as (id, layer from FUN_1051f5f0(id), 0, 0.0). Checked on A/B 2026-11-04 with
  * npcanim 2 (owner: puppets calm like the host's and repeat their moves; smart terrain sitting still does not start) */
 static int g_nmssync = 1;          /* nmssync 0|1 */
+static int g_nmslayers = 3;        /* nmslayers 2|3: layers requested on puppets */
 static unsigned g_nms_tx, g_nms_rx, g_nms_set;
 static struct { unsigned long long id; int ms[3]; DWORD sent; } g_nms_h[128];    /* host: last sent */
-static struct { unsigned long long id; int ms[3], done[3]; int ok; } g_nms_j[128];   /* joiner: last from the host, last requested */
+static struct { unsigned long long id; int ms[3], done[3]; int ok, tries[3]; DWORD at[3]; } g_nms_j[128];   /* joiner: last from the host, last requested */
 static void nms_host(unsigned long long id, const unsigned *v, DWORD now)
 {
     const int *ms = (const int *)((const BYTE *)v - 0x10 + 0x220);
@@ -3035,6 +3094,126 @@ static void nms_rx(const NpcMsPkt *k)
     if (!g_nms_j[i].ok) { int l; for (l = 0; l < 3; l++) g_nms_j[i].done[l] = 0x7FFFFFFF; }
     memcpy(g_nms_j[i].ms, k->ms, sizeof k->ms); g_nms_j[i].ok = 1;
 }
+/* ---- NPC movement resources (NDP1). A move state plays only if the CMovementResource holding its clips is in the
+ * pawn's CDynamicDeploadComponent container (dep_container): the host's AI adds the ones an action needs (smart
+ * terrain: CSmartTerrain +0x158 lists them, FUN_1091bc00; the executor 9AB190 adds the STP's workspace), the paused
+ * AI of a puppet never does, so a requested sit id (647-649) was dropped by the guard at 2848F0. The host sends each
+ * NPC's CMovementResource ids on change and every 3 s; the joiner adds the missing ones with the game's own
+ * FUN_10520a60(&id, container) (resource manager [11606294], type CMovementResource 10FDF168) and requests the
+ * layers only once they are loaded. Ones it added and the host dropped are removed 10 s later. ---- */
+#define NDP_MAGIC 0x3150444Eu      /* "NDP1" */
+#define NDP_MAX 24
+typedef struct { unsigned magic; unsigned long long id; unsigned n, ids[NDP_MAX]; int bb[5]; unsigned bbok; } NpcDepPkt;
+/* the move state ints on the pawn blackboard that the graph's smart terrain nodes play (CGOStateSmartTerrain,
+ * blackboardMoveStateName): 647-649 on layer 0 are generic STP slots, the clip is the id in these. A puppet kept stale
+ * ones: it sat with another clip (lifted above the box) and fell back to 4dd. */
+static const unsigned g_bb_ms_keys[5] = { 0xBD3C16F5u /* smartterrain_moveStateID */, 0x7F6E3CC1u /* _start_ */,
+                                          0x6B68DF22u /* _end_ */, 0xFCC03024u /* _abrutend_ */, 0xE755C0CDu };
+/* the int value object of a blackboard entry (value vtable E39578, int at +4): map end node at bb+0x18, entries
+ * {next, prev, key, holder}, holder+4 -> value */
+static int *bb_int(BYTE *obj, unsigned key)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    typedef BYTE *(__attribute__((thiscall)) *bb_t)(void *pawn);
+    BYTE *pawn, *bb, *end, *n, *v;
+    int c;
+    if (!obj || !(pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C))) || IsBadReadPtr(*(void **)pawn, 0x80)) return NULL;
+    if (!(bb = ((bb_t)(*(void ***)pawn)[0x7C / 4])(pawn)) || IsBadReadPtr(bb, 0x20) || !(end = *(BYTE **)(bb + 0x18)) || IsBadReadPtr(end, 4)) return NULL;
+    for (n = *(BYTE **)end, c = 0; n && n != end && c < 64; n = *(BYTE **)n, c++) {
+        if (IsBadReadPtr(n, 0x10)) return NULL;
+        if (*(unsigned *)(n + 8) != key) continue;
+        if (IsBadReadPtr(*(BYTE **)(n + 0xC), 8) || !(v = *(BYTE **)(*(BYTE **)(n + 0xC) + 4)) || IsBadReadPtr(v, 8)) return NULL;
+        return *(unsigned *)v == (unsigned)(g_base + 0xE39578) ? (int *)(v + 4) : NULL;
+    }
+    return NULL;
+}
+static unsigned g_ndp_tx, g_ndp_rx, g_ndp_add, g_ndp_del, g_ndp_bb;
+static struct { unsigned long long id; unsigned n, ids[NDP_MAX]; int bb[5]; DWORD sent; } g_ndp_h[128];
+static struct { unsigned long long id; unsigned n, ids[NDP_MAX], na, added[NDP_MAX], bbok; int bb[5]; DWORD gone[NDP_MAX], since; int ok; } g_ndp_j[128];
+static unsigned dep_movements(BYTE *obj, unsigned *ids)
+{
+    BYTE *k = dep_container(obj), **ch;
+    unsigned i, n, m = 0;
+    if (!k) return 0;
+    n = *(unsigned *)(k + 0x2C); ch = *(BYTE ***)(k + 0x28);
+    if (n > 64 || IsBadReadPtr(ch, n * 4)) return 0;
+    for (i = 0; i < n && m < NDP_MAX; i++)
+        if (ch[i] && !IsBadReadPtr(ch[i], 0x20) && !strcmp(res_type(ch[i]), "CMovementResource")) ids[m++] = *(unsigned *)(ch[i] + 0x1C);
+    return m;
+}
+static void dep_host(unsigned long long id, BYTE *obj, DWORD now)
+{
+    NpcDepPkt k;
+    int i, fr = -1;
+    memset(&k, 0, sizeof k);
+    k.n = dep_movements(obj, k.ids);
+    for (i = 0; i < 5; i++) { int *b = bb_int(obj, g_bb_ms_keys[i]); if (b) { k.bb[i] = *b; k.bbok |= 1u << i; } }
+    for (i = 0; i < 128; i++) { if (g_ndp_h[i].id == id) break; if (!g_ndp_h[i].id && fr < 0) fr = i; }
+    if (i == 128) { if (fr < 0) return; i = fr; g_ndp_h[i].id = id; g_ndp_h[i].sent = 0; g_ndp_h[i].n = 0xFFFFFFFF; }
+    if (g_ndp_h[i].n == k.n && !memcmp(g_ndp_h[i].ids, k.ids, k.n * 4) && !memcmp(g_ndp_h[i].bb, k.bb, sizeof k.bb) && now - g_ndp_h[i].sent < 3000) return;
+    if (g_mslog && (g_ndp_h[i].n != k.n || memcmp(g_ndp_h[i].ids, k.ids, k.n * 4))) logf_("ndp host %llu: %u movements", id, k.n);
+    g_ndp_h[i].n = k.n; memcpy(g_ndp_h[i].ids, k.ids, sizeof k.ids); memcpy(g_ndp_h[i].bb, k.bb, sizeof k.bb); g_ndp_h[i].sent = now;
+    k.magic = NDP_MAGIC; k.id = id;
+    sendto(g_ns, (char *)&k, sizeof k, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+    g_ndp_tx++;
+}
+static void ndp_rx(const NpcDepPkt *k)
+{
+    int i, fr = -1;
+    if (g_npc_role != 2 || k->n > NDP_MAX) return;
+    g_ndp_rx++;
+    for (i = 0; i < 128; i++) { if (g_ndp_j[i].id == k->id) break; if (!g_ndp_j[i].id && fr < 0) fr = i; }
+    if (i == 128) { if (fr < 0) return; i = fr; memset(&g_ndp_j[i], 0, sizeof g_ndp_j[i]); g_ndp_j[i].id = k->id; }
+    if (g_ndp_j[i].ok && (g_ndp_j[i].n != k->n || memcmp(g_ndp_j[i].ids, k->ids, k->n * 4))) g_ndp_j[i].since = 0;
+    g_ndp_j[i].n = k->n; memcpy(g_ndp_j[i].ids, k->ids, k->n * 4); memcpy(g_ndp_j[i].bb, k->bb, sizeof k->bb); g_ndp_j[i].bbok = k->bbok; g_ndp_j[i].ok = 1;
+}
+/* joiner: make the puppet's container hold the host's movements; 1 = all of them loaded (or no list / given up) */
+static int dep_apply(unsigned long long id, BYTE *obj, DWORD now)
+{
+    typedef BYTE *(__attribute__((thiscall)) *find_t)(void *c, unsigned *id);
+    typedef void (__attribute__((thiscall)) *rem_t)(void *c, void *r);
+    typedef char (__attribute__((thiscall)) *lf_t)(void *);
+    BYTE *k = dep_container(obj), *r;
+    unsigned j, a, in;
+    int i, ready = 1;
+    for (i = 0; i < 128 && g_ndp_j[i].id != id; i++) ;
+    if (i == 128 || !g_ndp_j[i].ok || !k) return 1;
+    for (j = 0; j < 5; j++) {
+        int *b;
+        if (!(g_ndp_j[i].bbok >> j & 1) || !(b = bb_int(obj, g_bb_ms_keys[j])) || *b == g_ndp_j[i].bb[j]) continue;
+        if (++g_ndp_bb <= 300 || g_mslog) logf_("ndp: puppet %llu blackboard %08x: %x -> host's %x", id, g_bb_ms_keys[j], *b, g_ndp_j[i].bb[j]);
+        *b = g_ndp_j[i].bb[j];
+    }
+    for (j = 0; j < g_ndp_j[i].n; j++) {
+        unsigned rid = g_ndp_j[i].ids[j];
+        if (!(r = ((find_t)(*(void ***)k)[0x48 / 4])(k, &rid))) {
+            ((void (*)(unsigned *, void *))(g_base + 0x520A60))(&rid, k);
+            if (!(r = ((find_t)(*(void ***)k)[0x48 / 4])(k, &rid))) { ready = 0; continue; }
+            if (++g_ndp_add <= 200 || g_mslog) logf_("ndp: puppet %llu + movement %08x", id, rid);
+            for (a = 0; a < g_ndp_j[i].na && g_ndp_j[i].added[a] != rid; a++) ;
+            if (a == g_ndp_j[i].na && a < NDP_MAX) { g_ndp_j[i].added[a] = rid; g_ndp_j[i].gone[a] = 0; g_ndp_j[i].na++; }
+        }
+        if (!((lf_t)(*(void ***)r)[6])(r)) ready = 0;
+    }
+    /* the ones we added that the host no longer has: removed 10 s after it dropped them */
+    for (a = 0; a < g_ndp_j[i].na; a++) {
+        for (in = 0, j = 0; j < g_ndp_j[i].n; j++) if (g_ndp_j[i].ids[j] == g_ndp_j[i].added[a]) in = 1;
+        if (in) { g_ndp_j[i].gone[a] = 0; continue; }
+        if (!g_ndp_j[i].gone[a]) { g_ndp_j[i].gone[a] = now | 1; continue; }
+        if (now - g_ndp_j[i].gone[a] < 10000) continue;
+        if ((r = ((find_t)(*(void ***)k)[0x48 / 4])(k, &g_ndp_j[i].added[a]))) {
+            BYTE **ch = *(BYTE ***)(k + 0x28);
+            unsigned n = *(unsigned *)(k + 0x2C), c;
+            for (c = 0; c < n && ch[c] != r; c++) ;
+            if (c < n) { ((rem_t)(*(void ***)k)[0x64 / 4])(k, r); if (++g_ndp_del <= 200 || g_mslog) logf_("ndp: puppet %llu - movement %08x", id, g_ndp_j[i].added[a]); }
+        }
+        g_ndp_j[i].na--;
+        g_ndp_j[i].added[a] = g_ndp_j[i].added[g_ndp_j[i].na]; g_ndp_j[i].gone[a] = g_ndp_j[i].gone[g_ndp_j[i].na]; a--;
+    }
+    if (ready) { g_ndp_j[i].since = 0; return 1; }
+    if (!g_ndp_j[i].since) g_ndp_j[i].since = now | 1;
+    return now - g_ndp_j[i].since > 5000;   /* still not loaded after 5 s: request anyway (the guard drops it) */
+}
 /* joiner, after the puppet's beautifier update: request the host's ids on layers that differ */
 static void nms_apply(unsigned long long id, BYTE *obj, const unsigned *v)
 {
@@ -3044,16 +3223,21 @@ static void nms_apply(unsigned long long id, BYTE *obj, const unsigned *v)
     BYTE *ac;
     int i, l;
     if (!g_nmssync) return;
+    { static LONG last; static DWORD t; DWORD now = GetTickCount();
+      if (g_ms_skips != last && now - t > 5000) { logf_("ms guard: %ld requests skipped (no clip loaded)", g_ms_skips); last = g_ms_skips; t = now; } }
     for (i = 0; i < 128 && g_nms_j[i].id != id; i++) ;
     if (i == 128 || !g_nms_j[i].ok) return;
     if (!(ac = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDF190)))) return;
-    /* layers 0 (body) and 1 (arms) only: layer 2 holds the props' gestures (beer, cigarette: 58x); a puppet asked
-     * for one crashed in the layer update right after (Dunia+286F82), like the relayed layered STP before */
-    for (l = 0; l < 2; l++)
+    if (!dep_apply(id, obj, GetTickCount())) return;
+    /* layer 2 holds the props' gestures (beer, cigarette: 58x); before NDP1 a puppet asked for one crashed in the
+     * layer update right after (Dunia+286F82), like the relayed layered STP before: nmslayers 2 leaves it out */
+    for (l = 0; l < g_nmslayers; l++)
         /* once per host change: asked again every frame, a layer the puppet resets itself (layer 2 went back to -1
          * each frame) left its node pointer bad (Dunia+CF7D63, read of 2) */
-        if (cur[l] != g_nms_j[i].ms[l] && g_nms_j[i].done[l] != g_nms_j[i].ms[l]) {
-            g_nms_j[i].done[l] = g_nms_j[i].ms[l];
+        if (cur[l] != g_nms_j[i].ms[l] && (g_nms_j[i].done[l] != g_nms_j[i].ms[l] ||
+            (g_nms_j[i].tries[l] < 3 && GetTickCount() - g_nms_j[i].at[l] > 1000))) {
+            g_nms_j[i].tries[l] = g_nms_j[i].done[l] != g_nms_j[i].ms[l] ? 0 : g_nms_j[i].tries[l] + 1;
+            g_nms_j[i].done[l] = g_nms_j[i].ms[l]; g_nms_j[i].at[l] = GetTickCount();
             if (++g_nms_set <= 300 || g_mslog) logf_("nms: puppet %llu layer %d: %x -> host's %x", id, l, cur[l], g_nms_j[i].ms[l]);
             ((req_t)(g_base + 0x51F500))(ac, g_nms_j[i].ms[l], l, 0, 0.0f);
         }
@@ -3073,8 +3257,9 @@ static void ms_guard_install(void)
     memcpy(c + 8, "\x83\xBC\x24\x94\x00\x00\x00\x00", 8);          /* cmp dword [esp+94h],0 */
     c[16] = 0x74; c[17] = 5;                                      /* je +5 */
     c[18] = 0xE9; *(DWORD *)(c + 19) = (DWORD)(g_base + 0x284901) - (DWORD)(c + 23);
-    c[23] = 0xDD; c[24] = 0xD8;                                   /* fstp st(0) */
-    c[25] = 0xE9; *(DWORD *)(c + 26) = (DWORD)(g_base + 0x284BC1) - (DWORD)(c + 30);
+    c[23] = 0xFF; c[24] = 0x05; *(DWORD *)(c + 25) = (DWORD)&g_ms_skips;   /* inc dword [g_ms_skips] */
+    c[29] = 0xDD; c[30] = 0xD8;                                   /* fstp st(0) */
+    c[31] = 0xE9; *(DWORD *)(c + 32) = (DWORD)(g_base + 0x284BC1) - (DWORD)(c + 36);
     VirtualProtect(at, 10, PAGE_EXECUTE_READWRITE, &old);
     at[0] = 0xE9; *(DWORD *)(at + 1) = (DWORD)c - (DWORD)(at + 5);
     memset(at + 5, 0x90, 5);
@@ -3211,6 +3396,7 @@ static void npc_host_tick(DWORD now)
             if (!v || !safe_read(v, a.v, sizeof a.v)) continue;
             ms_watch("host", g_nh[i].id, v);
             nms_host(g_nh[i].id, v, now);
+            if (g_nmssync) dep_host(g_nh[i].id, o2, now);
             if (a.v[0x58] != g_nh[i].lastact) {
                 logf_("npcact host %llu: action v58 %d -> %d (v42 %u v48 %u v11 %u v12 %u)", g_nh[i].id, (int)g_nh[i].lastact, (int)a.v[0x58], a.v[0x42],
                       a.v[0x48], a.v[0x11], a.v[0x12]);
@@ -5102,6 +5288,7 @@ static void net_tick(void)
             continue;
         }
         if (r == (int)sizeof(NpcWeapPkt) && rb.magic == NWPN_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_weap_rx((const NpcWeapPkt *)&rb); continue; }
+        if (r == (int)sizeof(NpcDepPkt) && rb.magic == NDP_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) ndp_rx((const NpcDepPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcMsPkt) && rb.magic == NMS_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) nms_rx((const NpcMsPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcAnimPkt) && rb.magic == NANM_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_anim_rx((const NpcAnimPkt *)&rb); continue; }
         if (r == (int)sizeof(NpcHitPkt) && rb.magic == NSHT_MAGIC) { if (from.sin_addr.s_addr == g_peer.sin_addr.s_addr) npc_shot_apply((const NpcHitPkt *)&rb); continue; }
