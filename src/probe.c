@@ -686,8 +686,10 @@ static LONG WINAPI veh_filter(EXCEPTION_POINTERS *ep)
     }
     if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && n < 30) {
         char mod[96];
-        n++;
         caller_str(ep->ExceptionRecord->ExceptionAddress, mod, sizeof mod);
+        /* IsBadReadPtr's own caught faults (scans) would use up the 30 entries before a real crash */
+        if (!_strnicmp(mod, "KERNEL32", 8) || !_strnicmp(mod, "KERNELBASE", 10)) return EXCEPTION_CONTINUE_SEARCH;
+        n++;
         logf_("ACCESS VIOLATION #%d at %s, %s address %p", n, mod, ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
               (void *)ep->ExceptionRecord->ExceptionInformation[1]);
         if (n <= 3) {
