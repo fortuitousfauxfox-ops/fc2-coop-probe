@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <math.h>
+#include <tlhelp32.h>
 
 static FILE *g_log;
 static CRITICAL_SECTION g_cs;
@@ -359,6 +360,14 @@ static unsigned g_nms_tx, g_nms_rx, g_nms_set;
 static volatile LONG g_ms_skips;
 static int g_nmslayers;
 static int g_npcface;
+static void wbp_start(int n);
+static int g_npcflag;
+static void wbp_tick(void);
+static int g_npcsigdrop = 1;         /* npcsigdrop 0|1 */
+static unsigned g_npcsigdropped;
+static void *g_np_drv[64];
+static int g_npcz = 1;              /* npcz 0|1: puppet height pulled to the host's */
+static DWORD g_npcz_log;
 static int g_mountprof;
 static unsigned g_ndp_tx, g_ndp_rx, g_ndp_add, g_ndp_del;
 static int g_nsgsync;               /* nsgsync 0|1 (defined with the NPC behaviour signals) */
@@ -1741,6 +1750,14 @@ static void native_cmd(const char *ln)
               g_nms_set, g_ms_skips, g_ndp_tx, g_ndp_rx, g_ndp_add, g_ndp_del);
     } else if (sscanf(ln, "mountprof %d", &n) == 1) {
         g_mountprof = n; logf_("mountprof %d", n);
+    } else if (sscanf(ln, "npcsigdrop %d", &n) == 1) {
+        g_npcsigdrop = n; logf_("npcsigdrop %d (%u dropped)", n, g_npcsigdropped);
+    } else if (sscanf(ln, "npcflag %d", &n) == 1) {
+        g_npcflag = n; logf_("npcflag %d", n);
+    } else if (sscanf(ln, "wbp %d", &n) == 1) {
+        wbp_start(n);
+    } else if (sscanf(ln, "npcz %d", &n) == 1) {
+        g_npcz = n; logf_("npcz %d", n);
     } else if (sscanf(ln, "npcface %d", &n) == 1) {
         g_npcface = n; logf_("npcface %d", n);
     } else if (sscanf(ln, "nmslayers %d", &n) == 1) {
@@ -2366,6 +2383,7 @@ static BYTE *np_setup(unsigned long long id)
  * without it (single player) it is limited by the physics' current velocity, so a remote-driven pawn can never speed
  * up past a walk. The avatar's main beautifier gets a private vtable copy whose update slots (vf+0x7C, vf+0x80) run
  * with that flag set for the duration of the call only. */
+static void npc_flags_pre(BYTE *mb);
 static void *g_mf_vt[64], *g_mf_orig7c, *g_mf_orig80, *g_mf_obj;
 static int g_mf_on = 1;
 static void __attribute__((thiscall)) mf_call(void *orig, void *self, float dt)
@@ -2373,6 +2391,7 @@ static void __attribute__((thiscall)) mf_call(void *orig, void *self, float dt)
     BYTE *mp = *(BYTE **)(g_base + 0x1645A74);
     BYTE old = 0;
     if (mp && g_mf_on) { old = mp[4]; mp[4] = 1; }
+    npc_flags_pre((BYTE *)self);
     ((void (__attribute__((thiscall)) *)(void *, float))orig)(self, dt);
     if (mp && g_mf_on) mp[4] = old;
     npc_anim_apply(self);
@@ -3477,8 +3496,12 @@ static void npc_host_tick(DWORD now)
         /* the encoder leaves the first (look) pair at 0/0 for AI pawns while the second pair holds the body yaw (a doorman
          * facing 1.67 rad stood at 0 on the joiner, the third-person beautifier turns the body to the look pair): the body
          * yaw goes into both; head turns come with the animation graph inputs */
-        e->aim[0] = 0; e->aim[1] = e->aim[3];
+        e->aim[1] = e->aim[3];
+        /* aim[0] (always 0 on the puppet) carries the entity's real yaw in milliradians: the encoded yaw is where the
+         * NPC looks, walking that is not where its body points (puppets walked up to 100 degrees off) */
+        e->aim[0] = (int)(atan2f(*(float *)(obj + 0x34), *(float *)(obj + 0x30)) * 1000.0f);
         e->s104 = m[0x104]; e->s11c = m[0x11C]; e->s110 = m[0x110];
+        { BYTE *pd = *(BYTE **)((BYTE *)pawn + 0x10); e->pad = pd ? pd[0x2D0 + 4] & 1 : 0; }
         if (e->s104 && !g_nh[i].lastfire) g_nh[i].fires++;
         g_nh[i].lastfire = e->s104;
         e->hp = npc_hp(obj, &e->hpmax);
@@ -3659,12 +3682,15 @@ static void npc_anim_rx(const NpcAnimPkt *a)
     if (g_npc_role != 2) return;
     for (j = 0; j < g_np_n; j++) if (g_np[j].id == a->id) { memcpy(g_np[j].av, a->v, sizeof g_np[j].av); g_np[j].avok = 1; return; }
 }
-/* facing: the host's body yaw arrives in the memento's second aim pair (+0xE8, it matches the host entity's row 0),
- * but a puppet standing still never turned to it (A/B 2026-11-04: most puppets 15-160 degrees off, for good). After
- * the puppet's update its entity matrix gets that yaw, eased in (rows (c,s,0) (-s,c,0) (0,0,1) as for the avatar).
- * npcface 0 turns it off. */
+/* facing: the host entity's yaw arrives in NpcEnt aim[0] (milliradians), but
+ * nothing turns a puppet to it: NetPlayer does not rotate the body, clips do (root motion, turn on the spot), so
+ * puppets stood 15-160 degrees off. While the host NPC stands, after the puppet's update its actual yaw (whatever the
+ * clip made of it) is turned towards the host's, rate limited, with a dead zone. Overwriting the matrix with a yaw of
+ * our own every frame fought the clips: puppets twitched (owner). Walking is left alone: a correction there is undone
+ * by the next frame (a walking puppet holds a steady ~54 degrees off the host, in any direction; not understood) and
+ * only makes the walk jerky. npcface 0 turns it off. */
 static int g_npcface = 1;
-static float g_np_face[NPC_MAX][2];
+static DWORD g_np_ft[NPC_MAX];
 /* the host NPC stands: its synced velocity (memento +0x70 / +0x84) under 0.25 m/s */
 static int npc_standing(int j)
 {
@@ -3674,19 +3700,138 @@ static int npc_standing(int j)
     vx = np_dq(m + 0x70, 15); vy = np_dq(m + 0x84, 15);
     return vx * vx + vy * vy < 0.25f * 0.25f;
 }
-/* only while it stands: walking, the puppet turns itself and the forced yaw made the walk jerky (owner, A/B) */
+/* heading of a puppet: FUN_100ab3d0 takes it from the velocity with bit 0 of the state flags (pawn data +0x140 / +0x2D0,
+ * +4) clear, else from the aim point plus the weapon's offset (weapon +0xAC). NetPlayer's applier always sets the bit
+ * (a remote player aims); AI NPCs walking do not have it (02, puppets 03), so puppets walked ~54 degrees off, sometimes
+ * backwards. Before the beautifier update both flags get the host NPC's bit 0 (NpcEnt pad). Measured on A/B, forward
+ * against velocity: 55 of 60 samples at -60 degrees, cleared 53 of 57 at 0. npcflag 0 turns it off. */
+static int g_npcflag = 1;
+static void npc_flags_pre(BYTE *mb)
+{
+    int j;
+    if (g_npc_role != 2 || !g_npcflag) return;
+    for (j = 0; j < g_np_n; j++) if (g_np[j].mb == mb) {
+        BYTE *pc = *(BYTE **)(mb + 0x10);
+        pc = pc ? *(BYTE **)(pc + 0x10) : NULL;        /* pawn comp +0x10 = pawn data */
+        if (pc) {
+            BYTE b = g_np[j].e.pad & 1;
+            pc[0x140 + 4] = (BYTE)((pc[0x140 + 4] & ~1) | b);
+            pc[0x2D0 + 4] = (BYTE)((pc[0x2D0 + 4] & ~1) | b);
+        }
+        return;
+    }
+}
+/* wbp <n> (RE): hardware write breakpoint on row 0 of a walking puppet's matrix on all threads; the next n writes are
+ * logged with the writer's address. Set from an exception on our thread, by suspending the others. */
+static volatile LONG g_wbp_hits;
+static LONG g_wbp_read, g_wbp_max;
+static DWORD g_wbp_addr;
+static struct { DWORD eip, tid, sp[32]; float v; } g_wbp_ring[64];
+static LONG WINAPI wbp_veh(EXCEPTION_POINTERS *ep)
+{
+    CONTEXT *c = ep->ContextRecord;
+    if (ep->ExceptionRecord->ExceptionCode == 0xE0C0DE01u) {
+        c->Dr0 = g_wbp_addr; c->Dr7 = g_wbp_addr ? 0xD0001 : 0; c->Dr6 = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP && (c->Dr6 & 1)) {
+        LONG i = InterlockedIncrement(&g_wbp_hits) - 1;
+        c->Dr6 = 0;
+        if (i < 64) {
+            int k;
+            g_wbp_ring[i].eip = c->Eip; g_wbp_ring[i].tid = GetCurrentThreadId(); g_wbp_ring[i].v = *(float *)g_wbp_addr;
+            for (k = 0; k < 32; k++) g_wbp_ring[i].sp[k] = IsBadReadPtr((DWORD *)c->Esp + k, 4) ? 0 : ((DWORD *)c->Esp)[k];
+        }
+        if (i + 1 >= g_wbp_max) c->Dr7 = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static void wbp_set(DWORD addr)
+{
+    static int veh;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te;
+    DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    int n = 0;
+    if (!veh) { veh = 1; AddVectoredExceptionHandler(1, wbp_veh); }
+    g_wbp_addr = addr;
+    te.dwSize = sizeof te;
+    if (snap != INVALID_HANDLE_VALUE) {
+        if (Thread32First(snap, &te)) do {
+            if (te.th32OwnerProcessID == pid && te.th32ThreadID != me) {
+                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+                if (h) {
+                    CONTEXT c;
+                    SuspendThread(h);
+                    memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                    if (GetThreadContext(h, &c)) { c.Dr0 = addr; c.Dr7 = addr ? 0xD0001 : 0; c.Dr6 = 0; if (SetThreadContext(h, &c)) n++; }
+                    ResumeThread(h); CloseHandle(h);
+                }
+            }
+        } while (Thread32Next(snap, &te));
+        CloseHandle(snap);
+    }
+    RaiseException(0xE0C0DE01u, 0, 0, NULL);
+    logf_("wbp: %s %08lx on %d other threads", addr ? "set on" : "cleared", (unsigned long)addr, n);
+}
+static void wbp_start(int n)
+{
+    int j;
+    for (j = 0; j < g_np_n; j++) if (g_np[j].obj && g_np[j].mem && !npc_standing(j) && g_np[j].state) {
+        g_wbp_hits = 0; g_wbp_read = 0; g_wbp_max = n > 64 ? 64 : n;
+        logf_("wbp: puppet %llu", g_np[j].id);
+        wbp_set((DWORD)(g_np[j].obj + 0x30));
+        return;
+    }
+    logf_("wbp: no walking puppet now");
+}
+static void wbp_tick(void)
+{
+    LONG w = g_wbp_hits;
+    if (w > 64) w = 64;
+    for (; g_wbp_read < w; g_wbp_read++) {
+        char s[300]; int k, o = 0;
+        DWORD *q = g_wbp_ring[g_wbp_read].sp;
+        for (k = 0; k < 32; k++) if (q[k] > (DWORD)g_base + 0x1000 && q[k] < (DWORD)g_base + 0xE00000) o += snprintf(s + o, sizeof s - o, " %lx", (unsigned long)(q[k] - (DWORD)g_base));
+        s[o] = 0;
+        logf_("wbp hit: T%lu eip %s%lx row0x %.3f, stack%s", (unsigned long)g_wbp_ring[g_wbp_read].tid, g_wbp_ring[g_wbp_read].eip > (DWORD)g_base && g_wbp_ring[g_wbp_read].eip < (DWORD)g_base + 0xE00000 ? "D+" : "abs ",
+              (unsigned long)(g_wbp_ring[g_wbp_read].eip > (DWORD)g_base && g_wbp_ring[g_wbp_read].eip < (DWORD)g_base + 0xE00000 ? g_wbp_ring[g_wbp_read].eip - (DWORD)g_base : g_wbp_ring[g_wbp_read].eip), g_wbp_ring[g_wbp_read].v, s);
+    }
+    if (g_wbp_addr && g_wbp_hits >= g_wbp_max) wbp_set(0);
+}
 static void npc_face(int j, BYTE *obj)
 {
     BYTE *m = g_np[j].mem;
-    float yaw, dx, dy, *f = g_np_face[j], *r, n;
-    if (!g_npcface || !m || IsBadReadPtr(m + 0xE8, 0x14) || IsBadWritePtr(obj + 0x30, 0x30)) return;
-    if (!npc_standing(j)) { f[0] = *(float *)(obj + 0x30); f[1] = *(float *)(obj + 0x34); return; }
-    yaw = np_dq(m + 0xE8, 360); dx = cosf(yaw); dy = sinf(yaw);
-    if (f[0] * dx + f[1] * dy < -0.9f || (f[0] == 0 && f[1] == 0)) { f[0] = dx; f[1] = dy; }
-    else { f[0] += (dx - f[0]) * 0.2f; f[1] += (dy - f[1]) * 0.2f; n = sqrtf(f[0] * f[0] + f[1] * f[1]); if (n < 1e-3f) { f[0] = dx; f[1] = dy; } else { f[0] /= n; f[1] /= n; } }
+    DWORD now = GetTickCount(), ms = now - g_np_ft[j];
+    float err, step, a, dt, *r;
+    g_np_ft[j] = now;
+    if (g_npcface == 2 && m && !npc_standing(j)) {
+        static DWORD tl;
+        if (now - tl > 500) {
+            float vd = atan2f(np_dq(m + 0x84, 15), np_dq(m + 0x70, 15)) * 57.3f, pd = atan2f(*(float *)(obj + 0x34), *(float *)(obj + 0x30)) * 57.3f + 90.0f, off = pd - vd;
+            while (off > 180) off -= 360;
+            while (off < -180) off += 360;
+            tl = now;
+            { BYTE *pc = g_np[j].mb ? *(BYTE **)(g_np[j].mb + 0x10) : NULL;
+            pc = pc ? *(BYTE **)(pc + 0x10) : NULL;
+            logf_("facew %llu: forward vs velocity %.0f (host forward vs velocity %.0f) D %08x S %08x", g_np[j].id, off, remainderf(g_np[j].e.aim[0] * 0.0573f + 90.0f - vd, 360.0f),
+                  pc ? *(unsigned *)(pc + 0x144) : 0, pc ? *(unsigned *)(pc + 0x2D4) : 0); }
+        }
+    }
+    if (!g_npcface || !m || !npc_standing(j) || IsBadWritePtr(obj + 0x30, 0x30)) return;
     r = (float *)(obj + 0x30);
-    r[0] = f[0]; r[1] = f[1]; r[2] = 0;
-    r[4] = -f[1]; r[5] = f[0]; r[6] = 0;
+    a = atan2f(r[1], r[0]);
+    err = g_np[j].e.aim[0] * 0.001f - a;
+    while (err > 3.14159265f) err -= 6.2831853f;
+    while (err < -3.14159265f) err += 6.2831853f;
+    if (fabsf(err) < 0.05f) return;                      /* ~3 degrees */
+    dt = (ms > 100 ? 100 : ms) * 0.001f;
+    step = (fabsf(err) > 1.5f ? 6.0f : 3.0f) * dt;       /* rad/s: a late turn catches up, a small error eases out */
+    if (fabsf(err) < step) step = fabsf(err);
+    a += err < 0 ? -step : step;
+    r[0] = cosf(a); r[1] = sinf(a); r[2] = 0;
+    r[4] = -r[1]; r[5] = r[0]; r[6] = 0;
     r[8] = 0; r[9] = 0; r[10] = 1;
 }
 /* called after a remote-driven main beautifier's update (mf_call) */
@@ -3825,6 +3970,7 @@ static void npc_join_local_cb(unsigned long long id, BYTE *obj, BYTE *agent, voi
 }
 static void npc_join_tick(DWORD now)
 {
+    wbp_tick();
     static DWORD last_find;
     int j, k;
     if (g_npc_role != 2) return;
@@ -3897,10 +4043,30 @@ static void npc_join_tick(DWORD now)
         if (!m) continue;
         npc_weap_watch("puppet", g_np[j].id, obj, &g_np[j].wcur, &g_np[j].wmode, g_np[j].wname, &g_np[j].wcat);
         npc_weap_fix(j, obj, now);
+        {
+            BYTE *pwc = ((void *(__attribute__((thiscall)) *)(void *, void *))(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
+            g_np_drv[j] = pwc ? ((void *(__attribute__((thiscall)) *)(void *))(*(void ***)pwc)[0x78 / 4])(pwc) : NULL;
+        }
         if (g_nmssync) mount_tick(g_np[j].id, g_np[j].lid ? g_np[j].lid : g_np[j].id, obj, now);
         np_pos(m + 4, e->pos);
         for (k = 0; k < 3; k++) { *(int *)(m + 0x78 + 0x14 * k) = e->vel[k]; m[0x74 + 0x14 * k] = 1; }
-        { static const int aimf[4] = { 0xAC, 0xC0, 0xD4, 0xE8 }; for (k = 0; k < 4; k++) { *(int *)(m + aimf[k] + 8) = e->aim[k]; m[aimf[k] + 4] = 1; } }
+        {
+            /* height: NetPlayer corrects position errors only above 1.5 m and a puppet's controller keeps the packet's
+             * z velocity (0 standing), so a puppet that got lifted (onto a crate) stayed in the air (+1.4 m measured).
+             * The error goes into the z velocity. */
+            float ez = e->pos[2] - *(float *)(obj + 0x68);
+            unsigned bits = *(unsigned *)(m + 0x98 + 0x10);
+            if (g_npcz && fabsf(ez) > 0.15f && bits && bits < 31) {
+                float vz = ez * 3.0f;
+                if (vz > 3.0f) vz = 3.0f; if (vz < -3.0f) vz = -3.0f;
+                *(int *)(m + 0xA0) = e->vel[2] + (int)(vz * ((1u << bits) - 1) / 15.0f);
+                if (fabsf(ez) > 0.4f && now - g_npcz_log > 2000) {
+                    g_npcz_log = now;
+                    logf_("npcz: puppet %llu %.2f m off the host's height (%.2f, host %.2f)", g_np[j].id, -ez, *(float *)(obj + 0x68), e->pos[2]);
+                }
+            }
+        }
+        { static const int aimf[4] = { 0xAC, 0xC0, 0xD4, 0xE8 }; for (k = 0; k < 4; k++) { *(int *)(m + aimf[k] + 8) = k ? e->aim[k] : 0; m[aimf[k] + 4] = 1; } }
         m[0x104] = e->s104; m[0x100] = 1; m[0x11C] = e->s11c; m[0x118] = 1; m[0x110] = e->s110; m[0x10C] = 1;
         if (e->hp >= 0) { *(float *)(m + 0x13C) = e->hp; m[0x134] = 1; }
     }
@@ -5057,6 +5223,17 @@ static void __attribute__((thiscall)) sig_hook(void *drv, unsigned hash)
         g_sig_ring[i & 511].hash = hash; g_sig_ring[i & 511].drv = drv;
         g_sig_ring[i & 511].caller = (unsigned)__builtin_return_address(0) - (unsigned)g_base;
     }
+    /* a puppet takes orders from the host only. Its paused AI still runs and signals its pawn (FUN_109ff990: end_stp,
+     * holsterweapon, drawweapon, stop_aimedat...): near the joiner's player puppets twitched, a shove took the weapon
+     * away for 1.5 s (owner, A/B). The signals of AI code (900000-A10000) are still seen above (NRE1 forwards them) but
+     * do not reach the pawn. npcsigdrop 0 lets them through. */
+    if (g_npc_role == 2 && g_npcsigdrop && drv) {
+        unsigned c = (unsigned)__builtin_return_address(0) - (unsigned)g_base;
+        if (c >= 0x900000 && c < 0xA10000) {
+            int j;
+            for (j = 0; j < NPC_MAX; j++) if (g_np_drv[j] == drv) { g_npcsigdropped++; return; }
+        }
+    }
     ((void (__attribute__((thiscall)) *)(void *, unsigned))g_sig_orig)(drv, hash);
 }
 static void sig_install(void)
@@ -5179,9 +5356,9 @@ static void nre_puppet_signal(void *drv, unsigned h)
         if (k == 16) k = slot;
         if (k >= 0 && k < 16) { g_nre_aim[k].id = g_np[j].id; g_nre_aim[k].aimed = h == 0x6699A29Cu ? GetTickCount() | 1 : 0; }
     }
-    /* the puppet's own reaction would be overwritten by the host's anim vars every frame: hold them back meanwhile
-     * (hands up until stop_aimedat, at most 15 s; a shove 2.5 s) */
-    if (j < 64) g_np_react[j] = h == 0x3183E869u ? 0 : (GetTickCount() + (h == 0x6699A29Cu ? 15000 : 2500)) | 1;
+    /* with npcsigdrop 0 the puppet plays its own reaction, which the host's anim vars would overwrite every frame: hold
+     * them back meanwhile (hands up until stop_aimedat, at most 15 s; a shove 2.5 s) */
+    if (j < 64 && !g_npcsigdrop) g_np_react[j] = h == 0x3183E869u ? 0 : (GetTickCount() + (h == 0x6699A29Cu ? 15000 : 2500)) | 1;
     logf_("nre: puppet %llu got %08x from its AI -> host", g_np[j].id, h);
     nre_send(g_np[j].id, h);
 }
