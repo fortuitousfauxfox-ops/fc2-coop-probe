@@ -368,6 +368,8 @@ static unsigned g_npcsigdropped;
 static void *g_np_drv[64];
 static int g_npcz = 1;              /* npcz 0|1: puppet height pulled to the host's */
 static DWORD g_npcz_log;
+static unsigned g_npcz_snaps;
+static DWORD g_npcz_t[64];
 static int g_mountprof;
 static unsigned g_ndp_tx, g_ndp_rx, g_ndp_add, g_ndp_del;
 static int g_nsgsync;               /* nsgsync 0|1 (defined with the NPC behaviour signals) */
@@ -3813,8 +3815,8 @@ static void npc_face(int j, BYTE *obj)
             while (off > 180) off -= 360;
             while (off < -180) off += 360;
             tl = now;
-            { BYTE *pc = g_np[j].mb ? *(BYTE **)(g_np[j].mb + 0x10) : NULL;
-            pc = pc ? *(BYTE **)(pc + 0x10) : NULL;
+            { BYTE *pc = ((void *(__attribute__((thiscall)) *)(void *, void *))(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
+            pc = pc && !IsBadReadPtr(pc + 0x10, 4) ? *(BYTE **)(pc + 0x10) : NULL;
             logf_("facew %llu: forward vs velocity %.0f (host forward vs velocity %.0f) D %08x S %08x", g_np[j].id, off, remainderf(g_np[j].e.aim[0] * 0.0573f + 90.0f - vd, 360.0f),
                   pc ? *(unsigned *)(pc + 0x144) : 0, pc ? *(unsigned *)(pc + 0x2D4) : 0); }
         }
@@ -4056,13 +4058,29 @@ static void npc_join_tick(DWORD now)
              * The error goes into the z velocity. */
             float ez = e->pos[2] - *(float *)(obj + 0x68);
             unsigned bits = *(unsigned *)(m + 0x98 + 0x10);
-            if (g_npcz && fabsf(ez) > 0.15f && bits && bits < 31) {
+            if (g_npcz && e->hp > 0 && fabsf(ez) > 0.15f && bits && bits < 31) {
                 float vz = ez * 3.0f;
                 if (vz > 3.0f) vz = 3.0f; if (vz < -3.0f) vz = -3.0f;
                 *(int *)(m + 0xA0) = e->vel[2] + (int)(vz * ((1u << bits) - 1) / 15.0f);
-                if (fabsf(ez) > 0.4f && now - g_npcz_log > 2000) {
-                    g_npcz_log = now;
-                    logf_("npcz: puppet %llu %.2f m off the host's height (%.2f, host %.2f)", g_np[j].id, -ez, *(float *)(obj + 0x68), e->pos[2]);
+                /* real floating only: above a standing host by 0.35 m, or 1 m off, for 0.5 s. A running NPC's height from
+                 * 5 packets a second lags on slopes by that much all the time (96 snaps in 20 s: a twitch of its own) */
+                if (!((ez < -0.35f && npc_standing(j)) || fabsf(ez) > 1.0f)) g_npcz_t[j] = 0;
+                else if (!g_npcz_t[j]) g_npcz_t[j] = now | 1;
+                if (g_npcz_t[j] && now - g_npcz_t[j] > 500) {
+                    g_npcz_t[j] = 0;
+                    /* the velocity does not always win: a standing puppet was seen rising at 0.1 m/s against it, up to
+                     * NetPlayer's teleport at 5 m (owner: floating in the air). Same call as that teleport, sooner */
+                    /* through the entity: g_np[j].mb goes stale when a dying NPC changes beautifier (crash on B, D+.. P+e14c) */
+                    BYTE *pd2 = ((void *(__attribute__((thiscall)) *)(void *, void *))(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C));
+                    pd2 = pd2 && !IsBadReadPtr(pd2 + 0x10, 4) ? *(BYTE **)(pd2 + 0x10) : NULL;
+                    if (pd2 && IsBadReadPtr(pd2 + 0x2D0, 0xC0)) pd2 = NULL;
+                    g_npcz_snaps++;
+                    if (now - g_npcz_log > 2000) {
+                        g_npcz_log = now;
+                        logf_("npcz: puppet %llu %.2f m off the host's height (%.2f, host %.2f), snap %u; vz desired %.2f actual %.2f, sent %.2f", g_np[j].id, -ez, *(float *)(obj + 0x68), e->pos[2], g_npcz_snaps,
+                              pd2 ? *(float *)(pd2 + 0x140 + 0xB8) : 0, pd2 ? *(float *)(pd2 + 0x2D0 + 0xB8) : 0, np_dq(m + 0x98, 15));
+                    }
+                    ((void (__attribute__((thiscall)) *)(void *, float, float, float))(g_base + 0x4E01B0))(obj, *(float *)(obj + 0x60), *(float *)(obj + 0x64), e->pos[2]);
                 }
             }
         }
