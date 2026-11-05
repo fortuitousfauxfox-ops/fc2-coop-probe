@@ -359,6 +359,7 @@ static unsigned g_nms_tx, g_nms_rx, g_nms_set;
 static volatile LONG g_ms_skips;
 static int g_nmslayers;
 static int g_npcface;
+static int g_mountprof;
 static unsigned g_ndp_tx, g_ndp_rx, g_ndp_add, g_ndp_del;
 static int g_nsgsync;               /* nsgsync 0|1 (defined with the NPC behaviour signals) */
 static int g_plyfind;                /* plyfind 1: the player lookup answers a fake player for the avatar */
@@ -1738,6 +1739,8 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "nmssync %d", &n) == 1) {
         g_nmssync = n; logf_("nmssync %d (sent %u, got %u, set %u, guard skips %ld; ndp sent %u, got %u, added %u, removed %u)", n, g_nms_tx, g_nms_rx,
               g_nms_set, g_ms_skips, g_ndp_tx, g_ndp_rx, g_ndp_add, g_ndp_del);
+    } else if (sscanf(ln, "mountprof %d", &n) == 1) {
+        g_mountprof = n; logf_("mountprof %d", n);
     } else if (sscanf(ln, "npcface %d", &n) == 1) {
         g_npcface = n; logf_("npcface %d", n);
     } else if (sscanf(ln, "nmslayers %d", &n) == 1) {
@@ -3106,7 +3109,7 @@ static void nms_rx(const NpcMsPkt *k)
  * layers only once they are loaded. Ones it added and the host dropped are removed 10 s later. ---- */
 #define NDP_MAGIC 0x3150444Eu      /* "NDP1" */
 #define NDP_MAX 24
-typedef struct { unsigned magic; unsigned long long id; unsigned n, ids[NDP_MAX]; int bb[5]; unsigned bbok; } NpcDepPkt;
+typedef struct { unsigned magic; unsigned long long id; unsigned n, ids[NDP_MAX]; int bb[5]; unsigned bbok; unsigned long long mount; } NpcDepPkt;
 /* the move state ints on the pawn blackboard that the graph's smart terrain nodes play (CGOStateSmartTerrain,
  * blackboardMoveStateName): 647-649 on layer 0 are generic STP slots, the clip is the id in these. A puppet kept stale
  * ones: it sat with another clip (lifted above the box) and fell back to 4dd. */
@@ -3131,8 +3134,77 @@ static int *bb_int(BYTE *obj, unsigned key)
     return NULL;
 }
 static unsigned g_ndp_tx, g_ndp_rx, g_ndp_add, g_ndp_del, g_ndp_bb;
-static struct { unsigned long long id; unsigned n, ids[NDP_MAX]; int bb[5]; DWORD sent; } g_ndp_h[128];
-static struct { unsigned long long id; unsigned n, ids[NDP_MAX], na, added[NDP_MAX], bbok; int bb[5]; DWORD gone[NDP_MAX], since; int ok; } g_ndp_j[128];
+static struct { unsigned long long id, mount; unsigned n, ids[NDP_MAX]; int bb[5]; DWORD sent; } g_ndp_h[128];
+static struct { unsigned long long id, mount, mounted; unsigned n, ids[NDP_MAX], na, added[NDP_MAX], bbok; int bb[5], mtries; DWORD gone[NDP_MAX], since, mt; int ok; } g_ndp_j[128];
+/* mounted guns: an NPC at a stationary gun is attached to it by FUN_100c76b0(CMountedWeapon comp (key FDE92C), pawn
+ * comp) ("MountedWeapon - Attach": attaches the pawn entity to the gun, makes the gun its weapon, blackboard 9BB56DBB =
+ * the gun's id); FUN_100c76c0 lets it go. The host's AI does it from a GO state (CE4580); a puppet only played the
+ * gunner animation, ~0.5 m off the gun, and the gun did not turn. The host sends the gun's id (NDP1 mount) while its
+ * NPC holds a weapons.MountedWeapons.* weapon; the joiner attaches its puppet the same way. */
+#define MOUNT_BB_KEY 0x9BB56DBBu
+static int ndp_mounted(unsigned long long id)
+{
+    int i;
+    for (i = 0; i < 128; i++) if (g_ndp_j[i].id == id) return g_ndp_j[i].mounted != 0 || g_ndp_j[i].mount != ~0ULL;
+    return 0;
+}
+static unsigned main_beaut_vt(BYTE *obj, BYTE **bcp)
+{
+    BYTE *bc = obj ? ((void *(__attribute__((thiscall)) *)(void *, void *))(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4)) : NULL;
+    if (bcp) *bcp = bc;
+    return bc && *(void **)(bc + 0x28) && !IsBadReadPtr(*(void **)(bc + 0x28), 4) ? **(unsigned **)(bc + 0x28) - (unsigned)g_base : 0;
+}
+/* while an NPC is at a gun, every 1.5 s on both copies: where it and the gun are, who the gun thinks uses it */
+static void mount_diag(const char *tag, unsigned long long id, BYTE *obj, unsigned long long gun, DWORD now)
+{
+    static DWORD last[2];
+    DWORD *l = &last[tag[0] == 'p'];
+    void *hd = NULL, *mw;
+    BYTE *go, *bc;
+    unsigned vt;
+    float *a, *b;
+    if (now - *l < 1500) return;
+    *l = now;
+    go = entity_obj(gun, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!go) { logf_("mountd %s %llu: gun %llu not found", tag, id, gun); return; }
+    mw = ((void *(__attribute__((thiscall)) *)(void *, void *))(g_base + 0x4E2CC0))(go, (void *)(g_base + 0xFDE92C));
+    vt = main_beaut_vt(obj, &bc);
+    a = (float *)obj; b = (float *)go;
+    logf_("mountd %s %llu: pawn (%.2f %.2f %.2f) dir (%.2f %.2f) | gun %llu (%.2f %.2f %.2f) dir (%.2f %.2f) | main vt %x base vt %x | gun user %llx", tag, id,
+          a[0x60 / 4], a[0x64 / 4], a[0x68 / 4], a[0x30 / 4], a[0x34 / 4], gun, b[0x60 / 4], b[0x64 / 4], b[0x68 / 4], b[0x30 / 4], b[0x34 / 4], vt,
+          bc && *(void **)(bc + 0x2C) && !IsBadReadPtr(*(void **)(bc + 0x2C), 4) ? **(unsigned **)(bc + 0x2C) - (unsigned)g_base : 0,
+          mw && *(BYTE **)((BYTE *)mw + 0x10) ? *(unsigned long long *)(*(BYTE **)((BYTE *)mw + 0x10) + 0x38) : 0ULL);
+}
+static int g_mountprof = 1;   /* mountprof 0|1: the puppet at a gun gets the mountedweapon beautifier profile */
+static void mf_install(BYTE *bc);
+static void mount_call(unsigned long long gun, BYTE *obj, int on)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    typedef void (__attribute__((thiscall)) *use_t)(void *mw, void *pawn);
+    void *hd = NULL, *mw, *pc;
+    BYTE *go = entity_obj(gun, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!go || !(mw = ((gcomp_t)(g_base + 0x4E2CC0))(go, (void *)(g_base + 0xFDE92C))) || !(pc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)))) {
+        logf_("mount: gun %llu or pawn not found", gun); return;
+    }
+    ((use_t)(g_base + (on ? 0xC76B0 : 0xC76C0)))(mw, pc);
+    {
+        /* the host's gunner is posed by the mountedweapon beautifier (profile CE7A971C); the puppet kept the
+         * third-person one and stood ~0.5 m off the gun. Back to standard (10F7D787) when it lets go. */
+        BYTE *bc;
+        unsigned before = main_beaut_vt(obj, &bc), h = on ? 0xCE7A971Cu : 0x10F7D787u;
+        int j;
+        if (g_mountprof && bc) {
+            ((void (__attribute__((thiscall)) *)(void *, unsigned *))(g_base + 0xE97C0))(bc, &h);
+            mf_install(bc);
+            for (j = 0; j < g_np_n; j++) if (g_np[j].obj == obj) g_np[j].mb = *(BYTE **)(bc + 0x28);
+            if (!on && (!*(void **)(bc + 0x2C) || **(unsigned **)(bc + 0x2C) != (unsigned)(g_base + 0xE16E98))) np_slot(obj, 0x2C, 0x608487bc, 0xFFFFFFFFu, 0xFFFFFFFFu);
+        }
+        logf_("mount: puppet main beautifier vt %x -> %x, base vt %x (profile %08x%s)", before, main_beaut_vt(obj, NULL),
+              bc && *(void **)(bc + 0x2C) ? **(unsigned **)(bc + 0x2C) - (unsigned)g_base : 0, h, g_mountprof ? "" : ", not set");
+    }
+}
 static unsigned dep_movements(BYTE *obj, unsigned *ids)
 {
     BYTE *k = dep_container(obj), **ch;
@@ -3144,16 +3216,20 @@ static unsigned dep_movements(BYTE *obj, unsigned *ids)
         if (ch[i] && !IsBadReadPtr(ch[i], 0x20) && !strcmp(res_type(ch[i]), "CMovementResource")) ids[m++] = *(unsigned *)(ch[i] + 0x1C);
     return m;
 }
-static void dep_host(unsigned long long id, BYTE *obj, DWORD now)
+static void dep_host(unsigned long long id, BYTE *obj, int mounted, DWORD now)
 {
     NpcDepPkt k;
     int i, fr = -1;
     memset(&k, 0, sizeof k);
     k.n = dep_movements(obj, k.ids);
     for (i = 0; i < 5; i++) { int *b = bb_int(obj, g_bb_ms_keys[i]); if (b) { k.bb[i] = *b; k.bbok |= 1u << i; } }
+    k.mount = mounted ? pawn_bb_u64(id, MOUNT_BB_KEY) : ~0ULL;
+    if (k.mount != ~0ULL) mount_diag("host", id, obj, k.mount, now);
     for (i = 0; i < 128; i++) { if (g_ndp_h[i].id == id) break; if (!g_ndp_h[i].id && fr < 0) fr = i; }
     if (i == 128) { if (fr < 0) return; i = fr; g_ndp_h[i].id = id; g_ndp_h[i].sent = 0; g_ndp_h[i].n = 0xFFFFFFFF; }
-    if (g_ndp_h[i].n == k.n && !memcmp(g_ndp_h[i].ids, k.ids, k.n * 4) && !memcmp(g_ndp_h[i].bb, k.bb, sizeof k.bb) && now - g_ndp_h[i].sent < 3000) return;
+    if (g_ndp_h[i].n == k.n && !memcmp(g_ndp_h[i].ids, k.ids, k.n * 4) && !memcmp(g_ndp_h[i].bb, k.bb, sizeof k.bb) && g_ndp_h[i].mount == k.mount && now - g_ndp_h[i].sent < 3000) return;
+    if (g_ndp_h[i].mount != k.mount && g_ndp_h[i].sent) logf_("ndp host %llu: mounted gun %llx -> %llx (main beautifier vt %x)", id, g_ndp_h[i].mount, k.mount, main_beaut_vt(obj, NULL));
+    g_ndp_h[i].mount = k.mount;
     if (g_mslog && (g_ndp_h[i].n != k.n || memcmp(g_ndp_h[i].ids, k.ids, k.n * 4))) logf_("ndp host %llu: %u movements", id, k.n);
     g_ndp_h[i].n = k.n; memcpy(g_ndp_h[i].ids, k.ids, sizeof k.ids); memcpy(g_ndp_h[i].bb, k.bb, sizeof k.bb); g_ndp_h[i].sent = now;
     k.magic = NDP_MAGIC; k.id = id;
@@ -3168,7 +3244,30 @@ static void ndp_rx(const NpcDepPkt *k)
     for (i = 0; i < 128; i++) { if (g_ndp_j[i].id == k->id) break; if (!g_ndp_j[i].id && fr < 0) fr = i; }
     if (i == 128) { if (fr < 0) return; i = fr; memset(&g_ndp_j[i], 0, sizeof g_ndp_j[i]); g_ndp_j[i].id = k->id; }
     if (g_ndp_j[i].ok && (g_ndp_j[i].n != k->n || memcmp(g_ndp_j[i].ids, k->ids, k->n * 4))) g_ndp_j[i].since = 0;
-    g_ndp_j[i].n = k->n; memcpy(g_ndp_j[i].ids, k->ids, k->n * 4); memcpy(g_ndp_j[i].bb, k->bb, sizeof k->bb); g_ndp_j[i].bbok = k->bbok; g_ndp_j[i].ok = 1;
+    if (g_ndp_j[i].mount != k->mount) g_ndp_j[i].mtries = 0;
+    g_ndp_j[i].n = k->n; memcpy(g_ndp_j[i].ids, k->ids, k->n * 4); memcpy(g_ndp_j[i].bb, k->bb, sizeof k->bb); g_ndp_j[i].bbok = k->bbok; g_ndp_j[i].mount = k->mount; g_ndp_j[i].ok = 1;
+}
+/* joiner, every pass for every puppet (not from the third-person beautifier's update: at a gun the main beautifier is
+ * another class, dep_apply and the rest stop running there and the puppet never left the gun): the host NPC's gun,
+ * attach (2 s apart, 3 tries per gun), let go when the host's lets go, then ask for the host's layers again */
+static void mount_tick(unsigned long long id, unsigned long long lid, BYTE *obj, DWORD now)
+{
+    int i, l;
+    for (i = 0; i < 128 && g_ndp_j[i].id != id; i++) ;
+    if (i == 128 || !g_ndp_j[i].ok) return;
+    if (g_ndp_j[i].mounted) mount_diag("puppet", id, obj, g_ndp_j[i].mounted, now);
+    if (g_ndp_j[i].mounted && g_ndp_j[i].mounted != g_ndp_j[i].mount) {
+        logf_("mount: puppet %llu leaves gun %llu", id, g_ndp_j[i].mounted);
+        mount_call(g_ndp_j[i].mounted, obj, 0); g_ndp_j[i].mounted = 0;
+        for (i = 0; i < 128; i++) if (g_nms_j[i].id == id) for (l = 0; l < 3; l++) g_nms_j[i].done[l] = 0x7FFFFFFF;
+        return;
+    }
+    if (g_ndp_j[i].mount != ~0ULL && !g_ndp_j[i].mounted && g_ndp_j[i].mtries < 3 && now - g_ndp_j[i].mt > 2000) {
+        g_ndp_j[i].mt = now; g_ndp_j[i].mtries++;
+        mount_call(g_ndp_j[i].mount, obj, 1);
+        logf_("mount: puppet %llu takes gun %llu (try %d): blackboard now %llx", id, g_ndp_j[i].mount, g_ndp_j[i].mtries, pawn_bb_u64(lid, MOUNT_BB_KEY));
+        if (pawn_bb_u64(lid, MOUNT_BB_KEY) == g_ndp_j[i].mount) g_ndp_j[i].mounted = g_ndp_j[i].mount;
+    }
 }
 /* joiner: make the puppet's container hold the host's movements; 1 = all of them loaded (or no list / given up) */
 static int dep_apply(unsigned long long id, BYTE *obj, DWORD now)
@@ -3399,7 +3498,7 @@ static void npc_host_tick(DWORD now)
             if (!v || !safe_read(v, a.v, sizeof a.v)) continue;
             ms_watch("host", g_nh[i].id, v);
             nms_host(g_nh[i].id, v, now);
-            if (g_nmssync) dep_host(g_nh[i].id, o2, now);
+            if (g_nmssync) dep_host(g_nh[i].id, o2, !strncmp(g_nh[i].wname, "weapons.MountedWeapons.", 23), now);
             if (a.v[0x58] != g_nh[i].lastact) {
                 logf_("npcact host %llu: action v58 %d -> %d (v42 %u v48 %u v11 %u v12 %u)", g_nh[i].id, (int)g_nh[i].lastact, (int)a.v[0x58], a.v[0x42],
                       a.v[0x48], a.v[0x11], a.v[0x12]);
@@ -3652,6 +3751,7 @@ static void npc_weap_fix(int j, BYTE *obj, DWORD now)
     typedef void (__attribute__((thiscall)) *sel_t)(void *inv, unsigned *cat);
     void *pawn, *inv;
     if (!g_np[j].hset || !strcmp(g_np[j].wname, g_np[j].hw) || now - g_np[j].wfix < 1500 || g_np[j].wtries >= 4) return;
+    if (ndp_mounted(g_np[j].id)) return;   /* at the host's gun: the gun is its weapon (NDP1 mount) */
     g_np[j].wfix = now; g_np[j].wtries++;
     if (!(pawn = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C))) || !(inv = ((inv_t)(g_base + 0x7E140))(pawn))) return;
     if (!g_np[j].hw[0]) ((inv0_t)(g_base + 0x12B340))(inv);
@@ -3797,6 +3897,7 @@ static void npc_join_tick(DWORD now)
         if (!m) continue;
         npc_weap_watch("puppet", g_np[j].id, obj, &g_np[j].wcur, &g_np[j].wmode, g_np[j].wname, &g_np[j].wcat);
         npc_weap_fix(j, obj, now);
+        if (g_nmssync) mount_tick(g_np[j].id, g_np[j].lid ? g_np[j].lid : g_np[j].id, obj, now);
         np_pos(m + 4, e->pos);
         for (k = 0; k < 3; k++) { *(int *)(m + 0x78 + 0x14 * k) = e->vel[k]; m[0x74 + 0x14 * k] = 1; }
         { static const int aimf[4] = { 0xAC, 0xC0, 0xD4, 0xE8 }; for (k = 0; k < 4; k++) { *(int *)(m + aimf[k] + 8) = e->aim[k]; m[aimf[k] + 4] = 1; } }
