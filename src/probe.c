@@ -564,6 +564,7 @@ static int g_npcrespawn;            /* npcrespawn 1: replace puppets that run an
 static void npc_anim_apply(BYTE *mb);
 static int g_reinfblock = 1;         /* reinfblock 0|1: the joiner's world spawns no reinforcements of its own */
 static int g_npcdiff;                /* npcdiff 0|1: log each live puppet's error against the host once a second */
+static int g_npcfire = 1;   /* npcfire 0|1: puppets replay the host's trigger pulls */
 static int g_npcnofire;  /* npcnofire 0|1 (test): puppets on the joiner do not fire */
 static int g_avai = 0, g_avai_missing;  /* avai 0|1 (experiment, off): on the host the avatar is coop.PawnPlayerAI (AI component; needs the make_avatar_ai.py patch). NPCs still ignored it */
 static int g_npchitsrc = 1;          /* npchitsrc 0|1: the joiner's hits reach the host NPC as hits by the host's player (its AI ignores the avatar) */
@@ -1770,6 +1771,8 @@ static void native_cmd(const char *ln)
         g_npcinterp = n; logf_("npcinterp %d", n);
     } else if (sscanf(ln, "npcnofire %d", &n) == 1) {
         g_npcnofire = n; logf_("npcnofire %d", n);
+    } else if (sscanf(ln, "npcfire %d", &n) == 1) {
+        g_npcfire = n; logf_("npcfire %d", n);
     } else if (sscanf(ln, "avai %d", &n) == 1) {
         g_avai = n; g_avai_missing = 0; logf_("avai %d (next avatar spawn)", n);
     } else if (sscanf(ln, "npchitsrc %d", &n) == 1) {
@@ -2509,6 +2512,31 @@ static void av_fire(const float *point, const float *off, int mode)
     tags = ((tags_t)(*(void ***)pawn)[0x78 / 4])(pawn);
     if (tags) ((ev_t)(g_base + 0x29DA10))(tags, 0x121ADE93u);
     if (++fired <= 200) logf_("avfire %u: weapon %p, avatar shot-method calls so far %u", fired, wc, g_xh_calls);
+}
+
+/* a puppet's shot: its AI is paused, so nothing pulls the trigger on the joiner. Same calls as av_fire. Damage stays the
+ * host's: the stim of this bullet on our player is dropped in st_hook, the hit comes as NSHT. */
+static void npc_fire(BYTE *obj, const float *point)
+{
+    typedef void *(__fastcall *inv_t)(void *pawn);
+    typedef void *(__attribute__((thiscall)) *cur_t)(void *inv);
+    typedef void (__attribute__((thiscall)) *req_t)(void *weapon, unsigned *req, int mode);
+    typedef void (__attribute__((thiscall)) *fire_t)(void *weapon, void *pawn);
+    typedef void *(__attribute__((thiscall)) *tags_t)(void *pawn);
+    typedef void (__attribute__((thiscall)) *ev_t)(void *tags, unsigned ev);
+    static const float off[3] = { 0, 0, 1.5f };
+    void *pawn = ((np_getcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDE39C)), *inv, *wc, *tags;
+    unsigned req[10];
+    inv = pawn ? ((inv_t)(g_base + 0x7E140))(pawn) : NULL;
+    wc = inv ? ((cur_t)(g_base + 0x127DA0))(inv) : NULL;
+    if (!wc) return;
+    ((BYTE *)pawn)[0x140 + 6] |= 0x20;
+    req[0] = req[1] = req[2] = req[3] = 0xFFFFFFFFu;
+    memcpy(&req[4], point, 12); memcpy(&req[7], off, 12);
+    ((req_t)(g_base + 0x12F130))(wc, req, 0);
+    ((fire_t)(*(void ***)wc)[0x80 / 4])(wc, pawn);
+    tags = ((tags_t)(*(void ***)pawn)[0x78 / 4])(pawn);
+    if (tags) ((ev_t)(g_base + 0x29DA10))(tags, 0x121ADE93u);
 }
 
 /* per tick: position (with the test offset), velocity from consecutive packets, yaw for aim/body, fire origin/dir */
@@ -4306,6 +4334,31 @@ static void npc_join_tick(DWORD now)
             }
         }
         { static const int aimf[4] = { 0xAC, 0xC0, 0xD4, 0xE8 }; for (k = 0; k < 4; k++) { *(int *)(m + aimf[k] + 8) = k ? e->aim[k] : 0; m[aimf[k] + 4] = 1; } }
+        {
+            /* replay the host's trigger pulls and, while shooting, look at the target (our player) */
+            static unsigned fired[NPC_MAX];
+            static DWORD fire_t[NPC_MAX];
+            static unsigned char seen[NPC_MAX];
+            void *hd3 = NULL;
+            BYTE *me3 = entity_obj(g_net_id, &hd3);
+            if (hd3) (*(int *)((BYTE *)hd3 + 8))--;
+            if (!seen[j]) { seen[j] = 1; fired[j] = e->pulls; }
+            if (g_npcfire && me3 && e->hp > 0) {
+                float t[3], dx, dy, dz, h;
+                t[0] = *(float *)(me3 + 0x60); t[1] = *(float *)(me3 + 0x64); t[2] = *(float *)(me3 + 0x68) + 1.2f;
+                dx = t[0] - *(float *)(obj + 0x60); dy = t[1] - *(float *)(obj + 0x64); dz = t[2] - (*(float *)(obj + 0x68) + 1.5f);
+                h = sqrtf(dx * dx + dy * dy);
+                if (e->pulls != fired[j] && now - fire_t[j] >= 110) {
+                    if (e->pulls - fired[j] > 8) fired[j] = e->pulls - 1;
+                    fired[j]++; fire_t[j] = now;
+                    if (h < 80.0f) { static unsigned logged; npc_fire(obj, t); if (logged++ < 10) logf_("npcfire: puppet %llu fired (%u of %u)", g_np[j].id, fired[j], e->pulls); }
+                }
+                if (fire_t[j] && now - fire_t[j] < 1500 && h < 80.0f) {
+                    float yaw = atan2f(-dx, dy), pitch = atan2f(dz, h);
+                    np_q(m + 0xAC, pitch, 360.0f); np_q(m + 0xC0, yaw, 360.0f); np_q(m + 0xD4, pitch, 360.0f); np_q(m + 0xE8, yaw, 360.0f);
+                }
+            }
+        }
         m[0x104] = e->s104; m[0x100] = 1; m[0x11C] = e->s11c; m[0x118] = 1; m[0x110] = e->s110; m[0x10C] = 1;
         if (e->hp >= 0) { *(float *)(m + 0x13C) = e->hp; m[0x134] = 1; }
     }
