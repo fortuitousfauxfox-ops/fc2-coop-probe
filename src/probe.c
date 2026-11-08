@@ -564,7 +564,8 @@ static int g_npcrespawn;            /* npcrespawn 1: replace puppets that run an
 static void npc_anim_apply(BYTE *mb);
 static int g_reinfblock = 1;         /* reinfblock 0|1: the joiner's world spawns no reinforcements of its own */
 static int g_npcdiff;                /* npcdiff 0|1: log each live puppet's error against the host once a second */
-static int g_npcinterp = 250;        /* npcinterp <ms>: puppets are placed on the host's path this far back; 0 = NetPlayer physics */
+static int g_npchitsrc = 1;          /* npchitsrc 0|1: the joiner's hits reach the host NPC as hits by the host's player (its AI ignores the avatar) */
+static int g_npcinterp = 300;        /* npcinterp <ms>: puppets are placed on the host's path this far back; 0 = NetPlayer physics */
 static DWORD g_np_react[64];     /* joiner: the puppet plays its own reaction until then (NRE1): host anim vars wait */
 static unsigned long long g_dd_id;   /* dumpd: NPC whose desired-state block is logged */
 static DWORD g_dd_until;  /* hit sync on by default; stimlog turns on event logging */
@@ -1765,6 +1766,8 @@ static void native_cmd(const char *ln)
         g_reinfblock = n; logf_("reinfblock %d", n);
     } else if (sscanf(ln, "npcinterp %d", &n) == 1) {
         g_npcinterp = n; logf_("npcinterp %d", n);
+    } else if (sscanf(ln, "npchitsrc %d", &n) == 1) {
+        g_npchitsrc = n; logf_("npchitsrc %d", n);
     } else if (sscanf(ln, "npcdiff %d", &n) == 1) {
         g_npcdiff = n; logf_("npcdiff %d", n);
     } else if (sscanf(ln, "npcz %d", &n) == 1) {
@@ -2912,7 +2915,7 @@ static void npc_hit_apply(const NpcHitPkt *nk)
     obj = entity_obj(nk->npc, &hd);
     if (hd) (*(int *)((BYTE *)hd + 8))--;
     if (!obj) return;
-    st_deliver(&nk->h, obj, *(void ***)obj == &g_st_vt[2][1] ? g_st_orig[2] : (*(void ***)obj)[0x20 / 4], g_av_id);
+    st_deliver(&nk->h, obj, *(void ***)obj == &g_st_vt[2][1] ? g_st_orig[2] : (*(void ***)obj)[0x20 / 4], g_npchitsrc ? g_net_id : g_av_id);
     if (++g_nhit_rx <= 50) logf_("npc hit %u: the joiner hit NPC %llu (type %d, amount %d, part %08x) -> applied", nk->h.seq, nk->npc, nk->h.type, nk->h.amount, nk->h.part);
 }
 
@@ -3568,9 +3571,18 @@ static DWORD g_np_first;
  * is placed every frame on that path, npcinterp ms in the past so there are two states to blend between. */
 static DWORD g_np_lastrx;
 static unsigned char g_np_rm[NPC_MAX];   /* puppet removed because the host no longer has it: spawn again if it returns */
-typedef struct { DWORD t; float p[3]; } NpSample;
+typedef struct { DWORD t; float p[3], y; } NpSample;
 static NpSample g_np_s[NPC_MAX][8];
+static float g_np_step[NPC_MAX], g_np_drift[NPC_MAX];   /* npcdiff: fastest placement step (m/s), largest move between our placements */
 static unsigned g_np_sn[NPC_MAX];
+/* out: x y z yaw. No extrapolation: running ahead of a late state and being pulled back was a short teleport */
+static float npc_yaw_lerp(float a, float b, float f)
+{
+    float d = b - a;
+    while (d > 3.14159265f) d -= 6.2831853f;
+    while (d < -3.14159265f) d += 6.2831853f;
+    return a + d * f;
+}
 static int npc_interp(int j, DWORD now, float *out)
 {
     unsigned n = g_np_sn[j], c = n > 8 ? 8 : n, k;
@@ -3580,25 +3592,18 @@ static int npc_interp(int j, DWORD now, float *out)
     int i;
     if (!c) return 0;
     b = &g_np_s[j][(n - 1) & 7];
-    if ((int)(r - b->t) >= 0) {
-        /* no newer state yet: carry on along the last step for a moment, then wait */
-        int late = (int)(r - b->t);
-        if (late > 150) late = 150;
-        a = c > 1 ? &g_np_s[j][(n - 2) & 7] : b;
-        f = b->t != a->t ? (float)late / (float)(b->t - a->t) : 0;
-        for (i = 0; i < 3; i++) out[i] = b->p[i] + (b->p[i] - a->p[i]) * f;
-        return 1;
-    }
+    if ((int)(r - b->t) >= 0) { memcpy(out, b->p, 3 * sizeof(float)); out[3] = b->y; return 1; }
     for (k = 1; k < c; k++) {
         a = &g_np_s[j][(n - 1 - k) & 7];
         if ((int)(r - a->t) >= 0) {
             f = b->t != a->t ? (float)(r - a->t) / (float)(b->t - a->t) : 1;
             for (i = 0; i < 3; i++) out[i] = a->p[i] + (b->p[i] - a->p[i]) * f;
+            out[3] = npc_yaw_lerp(a->y, b->y, f);
             return 1;
         }
         b = a;
     }
-    memcpy(out, b->p, 3 * sizeof(float));
+    memcpy(out, b->p, 3 * sizeof(float)); out[3] = b->y;
     return 1;
 }
 static void npc_rx(const NpcPkt *pk, int len)
@@ -3612,7 +3617,7 @@ static void npc_rx(const NpcPkt *pk, int len)
         for (j = 0; j < g_np_n && g_np[j].id != pk->e[i].id; j++) ;
         if (j == g_np_n) { if (g_np_n >= NPC_MAX) continue; memset(&g_np[j], 0, sizeof g_np[j]); g_np[j].id = pk->e[i].id; g_np_n++; }
         g_np[j].e = pk->e[i]; g_np[j].last = GetTickCount();
-        { NpSample *s = &g_np_s[j][g_np_sn[j]++ & 7]; s->t = g_np[j].last; memcpy(s->p, pk->e[i].pos, sizeof s->p); }
+        { NpSample *s = &g_np_s[j][g_np_sn[j]++ & 7]; s->t = g_np[j].last; memcpy(s->p, pk->e[i].pos, sizeof s->p); s->y = pk->e[i].aim[0] * 0.001f; }
         g_np_lastrx = g_np[j].last;
     }
 }
@@ -3871,7 +3876,7 @@ static void npc_face(int j, BYTE *obj)
                   pc ? *(unsigned *)(pc + 0x144) : 0, pc ? *(unsigned *)(pc + 0x2D4) : 0); }
         }
     }
-    if (!g_npcface || !m || !npc_standing(j) || IsBadWritePtr(obj + 0x30, 0x30)) return;
+    if (g_npcinterp || !g_npcface || !m || !npc_standing(j) || IsBadWritePtr(obj + 0x30, 0x30)) return;
     r = (float *)(obj + 0x30);
     a = atan2f(r[1], r[0]);
     err = g_np[j].e.aim[0] * 0.001f - a;
@@ -3889,13 +3894,32 @@ static void npc_face(int j, BYTE *obj)
 /* after the puppet's update: on the host's path (not dead: a ragdoll is its own; not at a gun or in a vehicle: the seat places it) */
 static void npc_place(int j, BYTE *obj, DWORD now)
 {
-    float p[3];
+    static float last[NPC_MAX][3];
+    static DWORD lt[NPC_MAX];
+    float p[4], *r = (float *)(obj + 0x30), *cur = (float *)(obj + 0x60), d[3], dr;
     unsigned long long veh;
     if (!g_npcinterp || g_np[j].e.hp <= 0 || !npc_interp(j, now, p) || ndp_mounted(g_np[j].id)) return;
     veh = pawn_bb_u64(g_np[j].lid ? g_np[j].lid : g_np[j].id, 0xFD1BA782u);
     if (veh && veh != ~0ULL) return;
-    if (fabsf(p[0] - *(float *)(obj + 0x60)) < 0.02f && fabsf(p[1] - *(float *)(obj + 0x64)) < 0.02f && fabsf(p[2] - *(float *)(obj + 0x68)) < 0.02f) return;
-    ((void (__attribute__((thiscall)) *)(void *, float, float, float))(g_base + 0x4E01B0))(obj, p[0], p[1], p[2]);
+    if (lt[j] && now - lt[j] < 200 && now != lt[j]) {
+        int i; float st;
+        for (i = 0; i < 3; i++) d[i] = cur[i] - last[j][i];
+        dr = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (dr > g_np_drift[j]) g_np_drift[j] = dr;
+        for (i = 0; i < 3; i++) d[i] = p[i] - last[j][i];
+        st = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) * 1000.0f / (float)(now - lt[j]);
+        if (st > g_np_step[j]) g_np_step[j] = st;
+    }
+    lt[j] = now; memcpy(last[j], p, sizeof last[j]);
+    if (fabsf(p[0] - cur[0]) >= 0.02f || fabsf(p[1] - cur[1]) >= 0.02f || fabsf(p[2] - cur[2]) >= 0.02f)
+        ((void (__attribute__((thiscall)) *)(void *, float, float, float))(g_base + 0x4E01B0))(obj, p[0], p[1], p[2]);
+    /* the body's yaw is the host's too, standing or walking: on its own a puppet takes it from a velocity of almost 0 or the
+     * aim, and spun on the spot in fights. Rows as in npc_face */
+    if (!IsBadWritePtr(r, 0x30)) {
+        r[0] = cosf(p[3]); r[1] = sinf(p[3]); r[2] = 0;
+        r[4] = -r[1]; r[5] = r[0]; r[6] = 0;
+        r[8] = 0; r[9] = 0; r[10] = 1;
+    }
 }
 /* called after a remote-driven main beautifier's update (mf_call) */
 static void npc_anim_apply(BYTE *mb)
@@ -4062,13 +4086,13 @@ static void npc_diff(int j, BYTE *obj, DWORD now)
     static DWORD t[NPC_MAX];
     const NpcEnt *e = &g_np[j].e;
     const BYTE *m = g_np[j].mem;
-    float dx, dy, dz, a, err, vx, vy, ref[3];
+    float dx, dy, dz, a, err, vx, vy, ref[4];
     const int *ms = NULL;
     unsigned *v;
     int i;
     if (!g_npcdiff || e->hp <= 0 || now - t[j] < 1000) return;
     t[j] = now;
-    if (!g_npcinterp || !npc_interp(j, now, ref)) memcpy(ref, e->pos, sizeof ref);   /* against the path it should be on */
+    if (!g_npcinterp || !npc_interp(j, now, ref)) memcpy(ref, e->pos, 12);   /* against the path it should be on */
     dx = *(float *)(obj + 0x60) - ref[0]; dy = *(float *)(obj + 0x64) - ref[1]; dz = *(float *)(obj + 0x68) - ref[2];
     a = atan2f(*(float *)(obj + 0x34), *(float *)(obj + 0x30));
     err = e->aim[0] * 0.001f - a;
@@ -4077,9 +4101,10 @@ static void npc_diff(int j, BYTE *obj, DWORD now)
     vx = np_dq((BYTE *)m + 0x70, 15); vy = np_dq((BYTE *)m + 0x84, 15);
     if ((v = npc_animvars(obj))) ms = (const int *)((const BYTE *)v - 0x10 + 0x220);
     for (i = 0; i < 128 && g_nms_j[i].id != g_np[j].id; i++) ;
-    logf_("npcdiff %llu: off %.2f m (z %+.2f), yaw %+.0f, host speed %.1f, flag %d, layer0 here %x host %x, age %lu ms, hp %.0f",
+    logf_("npcdiff %llu: off %.2f m (z %+.2f), yaw %+.0f, host speed %.1f, flag %d, layer0 here %x host %x, age %lu ms, hp %.0f, step max %.1f m/s, drift max %.2f m",
           g_np[j].id, sqrtf(dx * dx + dy * dy), dz, err * 57.3f, sqrtf(vx * vx + vy * vy), e->pad & 1, ms ? ms[0] : -1,
-          i < 128 ? g_nms_j[i].ms[0] : -1, (unsigned long)(now - g_np[j].last), e->hp);
+          i < 128 ? g_nms_j[i].ms[0] : -1, (unsigned long)(now - g_np[j].last), e->hp, g_np_step[j], g_np_drift[j]);
+    g_np_step[j] = 0; g_np_drift[j] = 0;
 }
 static void npc_join_tick(DWORD now)
 {
@@ -4190,7 +4215,7 @@ static void npc_join_tick(DWORD now)
             g_np_drv[j] = pwc ? ((void *(__attribute__((thiscall)) *)(void *))(*(void ***)pwc)[0x78 / 4])(pwc) : NULL;
         }
         if (g_nmssync) mount_tick(g_np[j].id, g_np[j].lid ? g_np[j].lid : g_np[j].id, obj, now);
-        { float ip[3]; np_pos(m + 4, g_npcinterp && npc_interp(j, now, ip) ? ip : e->pos); }
+        { float ip[4]; np_pos(m + 4, g_npcinterp && npc_interp(j, now, ip) ? ip : e->pos); }
         for (k = 0; k < 3; k++) { *(int *)(m + 0x78 + 0x14 * k) = e->vel[k]; m[0x74 + 0x14 * k] = 1; }
         {
             /* height: NetPlayer corrects position errors only above 1.5 m and a puppet's controller keeps the packet's
