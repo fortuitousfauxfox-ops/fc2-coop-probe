@@ -564,6 +564,7 @@ static int g_npcrespawn;            /* npcrespawn 1: replace puppets that run an
 static void npc_anim_apply(BYTE *mb);
 static int g_reinfblock = 1;         /* reinfblock 0|1: the joiner's world spawns no reinforcements of its own */
 static int g_npcdiff;                /* npcdiff 0|1: log each live puppet's error against the host once a second */
+static int g_avai = 0, g_avai_missing;  /* avai 0|1 (experiment, off): on the host the avatar is coop.PawnPlayerAI (AI component; needs the make_avatar_ai.py patch). NPCs still ignored it */
 static int g_npchitsrc = 1;          /* npchitsrc 0|1: the joiner's hits reach the host NPC as hits by the host's player (its AI ignores the avatar) */
 static int g_npcinterp = 300;        /* npcinterp <ms>: puppets are placed on the host's path this far back; 0 = NetPlayer physics */
 static DWORD g_np_react[64];     /* joiner: the puppet plays its own reaction until then (NRE1): host anim vars wait */
@@ -1766,6 +1767,8 @@ static void native_cmd(const char *ln)
         g_reinfblock = n; logf_("reinfblock %d", n);
     } else if (sscanf(ln, "npcinterp %d", &n) == 1) {
         g_npcinterp = n; logf_("npcinterp %d", n);
+    } else if (sscanf(ln, "avai %d", &n) == 1) {
+        g_avai = n; g_avai_missing = 0; logf_("avai %d (next avatar spawn)", n);
     } else if (sscanf(ln, "npchitsrc %d", &n) == 1) {
         g_npchitsrc = n; logf_("npchitsrc %d", n);
     } else if (sscanf(ln, "npcdiff %d", &n) == 1) {
@@ -2935,8 +2938,28 @@ static void hit_apply(const HitPkt *hp)
 }
 
 /* keep the event hooks on the avatar and on our player (both get new objects after a respawn) */
+/* host: the avatar's own agent (coop.PawnPlayerAI) must not move it; only its presence for the other agents' perception counts */
+static void av_agent_pause(void)
+{
+    static BYTE *paused;
+    typedef void *(__attribute__((thiscall)) *gc_t)(void *ent, void *key);
+    void *hd = NULL;
+    BYTE *obj, *comp, *agent;
+    if (g_npc_role != 1 || !g_avai || !g_av_id) return;
+    obj = entity_obj(g_av_id, &hd);
+    if (hd) (*(int *)((BYTE *)hd + 8))--;
+    if (!obj) return;
+    comp = ((gc_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFE4090));
+    agent = comp ? *(BYTE **)(comp + 0x14) : NULL;
+    if (!agent || agent == paused || !*(BYTE **)(agent + 0x268)) return;
+    ((void (__attribute__((thiscall)) *)(void *, char))(*(void ***)agent)[0x164 / 4])(agent, 1);
+    paused = agent;
+    logf_("avatar: its agent %p paused", agent);
+}
+
 static void hit_tick(DWORD now)
 {
+    av_agent_pause();
     static DWORD last;
     void *hd = NULL;
     BYTE *o;
@@ -4483,6 +4506,19 @@ static void av_tick(DWORD now)
             }
         }
         g_av_lastspawn = now;
+        if (g_av_np && g_avai && g_npc_role == 1 && !g_avai_missing && strstr(g_av_arch, "PawnPlayerNetwork")) {
+            /* host: coop.PawnPlayerAI = PawnPlayerNetwork + the player's CFCXAIComponent, so that the NPC AI can perceive the avatar */
+            snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('coop.PawnPlayerAI', %.3f, %.3f, %.3f, 0, 0, 0))",
+                     g_remote.pos[0] + g_av_off[0], g_remote.pos[1] + g_av_off[1], g_remote.pos[2] + 1.0f);
+            lua_eval(code, out, sizeof out);
+            id = strtoull(out, NULL, 10);
+            if (id == 0 || id == 0xFFFFFFFFFFFFFFFFull) { logf_("avatar: no archetype coop.PawnPlayerAI (%s): patch missing, NPCs will not see the avatar", out); g_avai_missing = 1; }
+            else { g_av_id = id; logf_("avatar spawned with AI component: %llu", id);
+                snprintf(code, sizeof code, "CDominoManager_GetInstance():SendRegisteredEventToEntity('%llu', 'CFCXCountersComponent_SetInvincible') __out = 'ok'", id);
+                lua_eval(code, out, sizeof out);
+                logf_("avatar set invincible: status %s", out);
+                return; }
+        }
         if (g_av_np)
             snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('%s', %.3f, %.3f, %.3f, 0, 0, 0))",
                      g_av_arch, g_remote.pos[0] + g_av_off[0], g_remote.pos[1] + g_av_off[1], g_remote.pos[2] + 1.0f);
