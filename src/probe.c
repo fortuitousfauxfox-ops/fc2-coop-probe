@@ -3597,6 +3597,7 @@ static DWORD g_np_first;
  * forth (owner: "teleports, flies"). Instead the last host positions are kept with their arrival time and the puppet
  * is placed every frame on that path, npcinterp ms in the past so there are two states to blend between. */
 static DWORD g_np_lastrx;
+static DWORD g_np_miss[NPC_MAX];        /* when a save NPC near us was first found missing here */
 static unsigned char g_np_rm[NPC_MAX];   /* puppet removed because the host no longer has it: spawn again if it returns */
 typedef struct { DWORD t; float p[3], y; } NpSample;
 static NpSample g_np_s[NPC_MAX][8];
@@ -4066,7 +4067,11 @@ static void npc_join_local_cb(unsigned long long id, BYTE *obj, BYTE *agent, voi
         }
     }
     if (id == g_net_id || id == g_av_id || g_nr_n >= 32) return;
-    for (j = 0; j < g_np_n; j++) if (g_np[j].lid == id || g_np[j].id == id) return;
+    for (j = 0; j < g_np_n; j++) if (g_np[j].lid == id || g_np[j].id == id) {
+        /* the world brought the original after we spawned a copy for it: the copy is the puppet, the original goes */
+        if (g_np[j].id == id && g_np[j].lid && g_np[j].lid != id) g_nr[g_nr_n++] = id;
+        return;
+    }
     for (j = 0; j < g_nkeep_n; j++) if (g_nkeep[j] == id) return;
     if (!(id >> 63)) {
         /* a save NPC within 60 m of us that the host has not reported 10 s into the session: dead or gone on the host
@@ -4183,9 +4188,23 @@ static void npc_join_tick(DWORD now)
         if (!obj) {
             /* not in this world (spawned on the host after the save): ask for its archetype, at most every 3 s */
             if (g_np[j].state == 1 && !g_np[j].gone) { g_np[j].gone = 1; logf_("npcsync join: puppet %llu is gone from this world", g_np[j].id); }
+            if (g_np[j].state == 1) {
+                /* the entity is gone (streamed out): forget it, so that a copy that comes back or is spawned becomes a puppet again */
+                g_np[j].state = 0; g_np[j].lid = 0; g_np[j].agent = NULL; g_np[j].obj = NULL; g_np[j].mb = NULL; g_np[j].comp = NULL; g_np[j].mem = NULL;
+                g_np[j].wcur = NULL; g_np[j].wmode = 0; g_np[j].wname[0] = 0; g_np_drv[j] = NULL;
+            }
+            {
+                /* a save NPC the host reports within 60 m of us, missing here for 8 s: our world will not bring it, so spawn it */
+                void *hd2 = NULL;
+                BYTE *me = entity_obj(g_net_id, &hd2);
+                float dx = me ? e->pos[0] - *(float *)(me + 0x60) : 999, dy = me ? e->pos[1] - *(float *)(me + 0x64) : 999;
+                if (hd2) (*(int *)((BYTE *)hd2 + 8))--;
+                if (me && now - g_np[j].last < 1500 && dx * dx + dy * dy < 60.0f * 60.0f) { if (!g_np_miss[j]) g_np_miss[j] = now | 1; }
+                else g_np_miss[j] = 0;
+            }
             /* only NPCs spawned during play (ids with the high bit): a save NPC can simply not be streamed in yet, and
              * spawning one made a second copy next to the original */
-            if (g_np[j].state == 0 && ((g_np[j].id >> 63) || g_np_rm[j]) && !g_np[j].lid && !g_np[j].nospawn && e->hp > 0 && now - g_np[j].last < 1500 && now - g_np[j].req > 3000 && g_ns != INVALID_SOCKET) {
+            if (g_np[j].state == 0 && ((g_np[j].id >> 63) || g_np_rm[j] || (g_np_miss[j] && now - g_np_miss[j] > 8000)) && !g_np[j].lid && !g_np[j].nospawn && e->hp > 0 && now - g_np[j].last < 1500 && now - g_np[j].req > 3000 && g_ns != INVALID_SOCKET) {
                 NpcArcPkt q;
                 memset(&q, 0, sizeof q); q.magic = NREQ_MAGIC; q.id = g_np[j].id; g_np[j].req = now;
                 sendto(g_ns, (char *)&q, sizeof q, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
