@@ -562,6 +562,8 @@ static int g_join_tp;              /* the joiner was put next to the host once *
 static int g_npcrespawn;            /* npcrespawn 1: replace puppets that run an action of their own (off: replacements are
                                      * spawned from the generic archetype and look different, and actions still differed) */
 static void npc_anim_apply(BYTE *mb);
+static int g_reinfblock = 1;         /* reinfblock 0|1: the joiner's world spawns no reinforcements of its own */
+static int g_npcdiff;                /* npcdiff 0|1: log each live puppet's error against the host once a second */
 static DWORD g_np_react[64];     /* joiner: the puppet plays its own reaction until then (NRE1): host anim vars wait */
 static unsigned long long g_dd_id;   /* dumpd: NPC whose desired-state block is logged */
 static DWORD g_dd_until;  /* hit sync on by default; stimlog turns on event logging */
@@ -1758,6 +1760,10 @@ static void native_cmd(const char *ln)
         g_npcflag = n; logf_("npcflag %d", n);
     } else if (sscanf(ln, "wbp %d", &n) == 1) {
         wbp_start(n);
+    } else if (sscanf(ln, "reinfblock %d", &n) == 1) {
+        g_reinfblock = n; logf_("reinfblock %d", n);
+    } else if (sscanf(ln, "npcdiff %d", &n) == 1) {
+        g_npcdiff = n; logf_("npcdiff %d", n);
     } else if (sscanf(ln, "npcz %d", &n) == 1) {
         g_npcz = n; logf_("npcz %d", n);
     } else if (sscanf(ln, "npcface %d", &n) == 1) {
@@ -3970,14 +3976,65 @@ static void npc_join_local_cb(unsigned long long id, BYTE *obj, BYTE *agent, voi
     }
     g_nr[g_nr_n++] = id;
 }
+/* The joiner's reinforcement manager (singleton [11655274], ticked from the AI world at 95FBEF) kept creating squads:
+ * it fills free places up to its limits (FUN_1092ac90: 20 infantry, 5 vehicles), so every RemoveEntity below made
+ * room for the next squad. On A/B 606 NPCs in 5 min were spawned, shot at the player for up to 4 s and were removed,
+ * which is what "NPCs vanish while shooting" was. The joiner's world must not decide this at all (the host's
+ * reinforcements arrive as NREQ/NARC puppets through SpawnEntityFromArchetype, a separate path), so its tick returns at
+ * once and the capacity check always says no (both are called only for AI spawning; the check's callers skip the
+ * spawn and release their references normally). */
+static void reinf_tick(void)
+{
+    static const BYTE t0[3] = { 0x55, 0x8B, 0xEC }, c0[5] = { 0x8B, 0x44, 0x24, 0x08, 0x85 };
+    static const BYTE t1[3] = { 0xC2, 0x04, 0x00 }, c1[5] = { 0x33, 0xC0, 0xC2, 0x08, 0x00 };
+    static int state;                /* 0 not applied, 1 applied, -1 unexpected bytes */
+    BYTE *t = g_base + 0x92E0B0, *c = g_base + 0x92AC90;
+    DWORD o1, o2;
+    int want = g_reinfblock != 0;
+    if (state < 0 || state == want) return;
+    if (memcmp(t, want ? t0 : t1, 3) || memcmp(c, want ? c0 : c1, 5)) { state = -1; logf_("reinforcements: unexpected code at 92E0B0 / 92AC90, not patched"); return; }
+    VirtualProtect(t, 3, PAGE_EXECUTE_READWRITE, &o1); VirtualProtect(c, 5, PAGE_EXECUTE_READWRITE, &o2);
+    memcpy(t, want ? t1 : t0, 3); memcpy(c, want ? c1 : c0, 5);
+    VirtualProtect(t, 3, o1, &o1); VirtualProtect(c, 5, o2, &o2);
+    FlushInstructionCache(GetCurrentProcess(), t, 3); FlushInstructionCache(GetCurrentProcess(), c, 5);
+    state = want;
+    logf_("reinforcements: the joiner's own spawning is %s", want ? "off (the host decides)" : "on");
+}
+/* npcdiff 1: one line a second per live puppet: how far it is from the host's NPC, and which move state each has */
+static void npc_diff(int j, BYTE *obj, DWORD now)
+{
+    static DWORD t[NPC_MAX];
+    const NpcEnt *e = &g_np[j].e;
+    const BYTE *m = g_np[j].mem;
+    float dx, dy, dz, a, err, vx, vy;
+    const int *ms = NULL;
+    unsigned *v;
+    int i;
+    if (!g_npcdiff || e->hp <= 0 || now - t[j] < 1000) return;
+    t[j] = now;
+    dx = *(float *)(obj + 0x60) - e->pos[0]; dy = *(float *)(obj + 0x64) - e->pos[1]; dz = *(float *)(obj + 0x68) - e->pos[2];
+    a = atan2f(*(float *)(obj + 0x34), *(float *)(obj + 0x30));
+    err = e->aim[0] * 0.001f - a;
+    while (err > 3.14159265f) err -= 6.2831853f;
+    while (err < -3.14159265f) err += 6.2831853f;
+    vx = np_dq((BYTE *)m + 0x70, 15); vy = np_dq((BYTE *)m + 0x84, 15);
+    if ((v = npc_animvars(obj))) ms = (const int *)((const BYTE *)v - 0x10 + 0x220);
+    for (i = 0; i < 128 && g_nms_j[i].id != g_np[j].id; i++) ;
+    logf_("npcdiff %llu: off %.2f m (z %+.2f), yaw %+.0f, host speed %.1f, flag %d, layer0 here %x host %x, age %lu ms, hp %.0f",
+          g_np[j].id, sqrtf(dx * dx + dy * dy), dz, err * 57.3f, sqrtf(vx * vx + vy * vy), e->pad & 1, ms ? ms[0] : -1,
+          i < 128 ? g_nms_j[i].ms[0] : -1, (unsigned long)(now - g_np[j].last), e->hp);
+}
 static void npc_join_tick(DWORD now)
 {
     wbp_tick();
     static DWORD last_find;
+    static int need_agent;
     int j, k;
     if (g_npc_role != 2) return;
+    reinf_tick();
     static IncScan js;
-    if (!js.busy && now - last_find > 3000) { g_nr_n = 0; last_find = now; npc_scan_step(&js, 0, npc_join_local_cb, NULL); }
+    /* an NPC we just spawned for the host runs its own AI until the scan has found its agent: don't wait 3 s for that */
+    if (!js.busy && now - last_find > (need_agent ? 300u : 3000u)) { g_nr_n = 0; last_find = now; need_agent = 0; npc_scan_step(&js, 0, npc_join_local_cb, NULL); }
     if (js.busy && npc_scan_step(&js, 16u << 20, npc_join_local_cb, NULL)) {
         last_find = now;
         for (k = 0; k < g_nr_n; k++) {
@@ -3985,9 +4042,17 @@ static void npc_join_tick(DWORD now)
             snprintf(code, sizeof code, "__out = tostring(GetEntityName('%llu'))", g_nr[k]);
             lua_eval(code, name, sizeof name);
             if (!strncmp(name, "buddies.", 8) || !strncmp(name, "player.", 7)) { if (g_nkeep_n < 32) g_nkeep[g_nkeep_n++] = g_nr[k]; continue; }
-            snprintf(code, sizeof code, "RemoveEntity('%llu')", g_nr[k]);
-            lua_eval(code, name, sizeof name);
-            logf_("npcsync join: removed our own NPC %llu (%s) - %s", g_nr[k], name, (g_nr[k] >> 63) ? "the host runs NPCs" : "not on the host (dead or gone there)");
+            {
+                void *hd = NULL;
+                BYTE *o = entity_obj(g_nr[k], &hd);
+                float p[3] = { 0, 0, 0 };
+                char o2[16];
+                if (hd) (*(int *)((BYTE *)hd + 8))--;
+                if (o) memcpy(p, o + 0x60, sizeof p);
+                snprintf(code, sizeof code, "RemoveEntity('%llu')", g_nr[k]);
+                lua_eval(code, o2, sizeof o2);
+                logf_("npcsync join: removed our own NPC %llu (%s) at (%.0f %.0f %.0f) - %s", g_nr[k], name, p[0], p[1], p[2], (g_nr[k] >> 63) ? "the host runs NPCs" : "not on the host (dead or gone there)");
+            }
         }
     }
     for (j = 0; j < g_np_n; j++) {
@@ -4012,7 +4077,7 @@ static void npc_join_tick(DWORD now)
             BYTE *comp = NULL, *bc;
             void **cs = *(void ***)(obj + 0x9C);
             int n = *(int *)(obj + 0xA0);
-            if (!g_np[j].agent) continue;
+            if (!g_np[j].agent) { need_agent = 1; continue; }
             ((void (__attribute__((thiscall)) *)(void *, char))(*(void ***)g_np[j].agent)[0x164 / 4])(g_np[j].agent, 1);
             for (k = 0; cs && k < n && k < 64; k++) if (cs[k] && !IsBadReadPtr(cs[k], 4) && *(DWORD *)cs[k] == (DWORD)(g_base + 0xE1AE00)) { comp = cs[k]; break; }
             if (!comp) { comp = ((np_factory_t)(g_base + 0x40840))(); if (!comp) continue; ((np_addcomp_t)(g_base + 0x4E0D80))(obj, comp); }
@@ -4043,6 +4108,7 @@ static void npc_join_tick(DWORD now)
         }
         m = g_np[j].mem;
         if (!m) continue;
+        npc_diff(j, obj, now);
         npc_weap_watch("puppet", g_np[j].id, obj, &g_np[j].wcur, &g_np[j].wmode, g_np[j].wname, &g_np[j].wcat);
         npc_weap_fix(j, obj, now);
         {
