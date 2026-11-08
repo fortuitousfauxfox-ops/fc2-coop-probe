@@ -4074,6 +4074,16 @@ static void npc_join_local_cb(unsigned long long id, BYTE *obj, BYTE *agent, voi
         me = entity_obj(g_net_id, &hd);
         if (hd) (*(int *)((BYTE *)hd + 8))--;
         if (!me) return;
+        {
+            /* after a jump of our player (teleport, respawn, fast vehicle) the host has not had time to report the NPCs
+             * here: without this wait they were deleted on arrival and never came back as puppets */
+            static float lastp[2];
+            static DWORD jumped;
+            float mx = *(float *)(me + 0x60) - lastp[0], my = *(float *)(me + 0x64) - lastp[1];
+            if (mx * mx + my * my > 30.0f * 30.0f) { jumped = GetTickCount(); lastp[0] = *(float *)(me + 0x60); lastp[1] = *(float *)(me + 0x64); }
+            if (GetTickCount() - jumped < 15000) return;
+            lastp[0] = *(float *)(me + 0x60); lastp[1] = *(float *)(me + 0x64);
+        }
         dx = *(float *)(obj + 0x60) - *(float *)(me + 0x60); dy = *(float *)(obj + 0x64) - *(float *)(me + 0x64);
         if (dx * dx + dy * dy > 60.0f * 60.0f) return;
     }
