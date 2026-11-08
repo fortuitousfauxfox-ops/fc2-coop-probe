@@ -564,6 +564,7 @@ static int g_npcrespawn;            /* npcrespawn 1: replace puppets that run an
 static void npc_anim_apply(BYTE *mb);
 static int g_reinfblock = 1;         /* reinfblock 0|1: the joiner's world spawns no reinforcements of its own */
 static int g_npcdiff;                /* npcdiff 0|1: log each live puppet's error against the host once a second */
+static int g_npcnofire;  /* npcnofire 0|1 (test): puppets on the joiner do not fire */
 static int g_avai = 0, g_avai_missing;  /* avai 0|1 (experiment, off): on the host the avatar is coop.PawnPlayerAI (AI component; needs the make_avatar_ai.py patch). NPCs still ignored it */
 static int g_npchitsrc = 1;          /* npchitsrc 0|1: the joiner's hits reach the host NPC as hits by the host's player (its AI ignores the avatar) */
 static int g_npcinterp = 300;        /* npcinterp <ms>: puppets are placed on the host's path this far back; 0 = NetPlayer physics */
@@ -1767,6 +1768,8 @@ static void native_cmd(const char *ln)
         g_reinfblock = n; logf_("reinfblock %d", n);
     } else if (sscanf(ln, "npcinterp %d", &n) == 1) {
         g_npcinterp = n; logf_("npcinterp %d", n);
+    } else if (sscanf(ln, "npcnofire %d", &n) == 1) {
+        g_npcnofire = n; logf_("npcnofire %d", n);
     } else if (sscanf(ln, "avai %d", &n) == 1) {
         g_avai = n; g_avai_missing = 0; logf_("avai %d (next avatar spawn)", n);
     } else if (sscanf(ln, "npchitsrc %d", &n) == 1) {
@@ -2769,6 +2772,7 @@ static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
         g_npcev_left--;
         logf_("npcev %llu: %s (vt rva %x)", npc_id_of(self), nm, evt - (unsigned)g_base);
     }
+    if (s == 2 && g_npcnofire && g_npc_role == 2 && (!strcmp(nm, "PullTrigger") || !strcmp(nm, "start_shoot") || !strcmp(nm, "WeaponFireBullet"))) return 0;
     if (s == 2 && (!strcmp(nm, "PullTrigger") || !strcmp(nm, "start_shoot") || !strcmp(nm, "WeaponFireBullet")) && !npc_shot_ok(self, nm[0] == 'P')) return 0;
     if (!strcmp(nm, "Stims") && !IsBadReadPtr(ev, 0x94)) {
         unsigned long long src = st_hid(*(BYTE **)(ev + 0x3C));
@@ -2827,7 +2831,7 @@ static int __attribute__((thiscall)) st_hook(BYTE *self, BYTE *ev)
                   *(unsigned *)(ev + 0x5C), st_hid(*(BYTE **)(ev + 0x3C)), st_hid(*(BYTE **)(ev + 0x40)), ev[0x70], ev[0x71], ev[0x72], ev[0x73], ev[0x74],
                   *(int *)(ev + 0x78), *(float *)(ev + 0x7C), *(float *)(ev + 0x80), *(float *)(ev + 0x84), *(float *)(ev + 0x88), *(float *)(ev + 0x8C),
                   *(float *)(ev + 0x90), *(unsigned *)(ev + 0x60), *(unsigned *)(ev + 0x64), *(unsigned *)(ev + 0x68), *(unsigned *)(ev + 0x6C), *(unsigned *)(ev + 0x44));
-    } else if (evt && g_st_verbose && ++g_st_other[s] <= 40)
+    } else if (evt && g_st_verbose && ++g_st_other[s] <= 400)
         logf_("event -> %s: %s (vt rva %x)", s == 2 ? "npc" : s ? "me" : "avatar", nm, evt - (unsigned)g_base);
     if (evt == (unsigned)(g_base + 0xE9376C)) {
         /* AI area query (FUN_107ac420): an entity that does not mark the reply (+0x31) must have component FE4090, the
