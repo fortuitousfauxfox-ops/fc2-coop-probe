@@ -564,6 +564,7 @@ static int g_npcrespawn;            /* npcrespawn 1: replace puppets that run an
 static void npc_anim_apply(BYTE *mb);
 static int g_reinfblock = 1;         /* reinfblock 0|1: the joiner's world spawns no reinforcements of its own */
 static int g_npcdiff;                /* npcdiff 0|1: log each live puppet's error against the host once a second */
+static int g_npcinterp = 250;        /* npcinterp <ms>: puppets are placed on the host's path this far back; 0 = NetPlayer physics */
 static DWORD g_np_react[64];     /* joiner: the puppet plays its own reaction until then (NRE1): host anim vars wait */
 static unsigned long long g_dd_id;   /* dumpd: NPC whose desired-state block is logged */
 static DWORD g_dd_until;  /* hit sync on by default; stimlog turns on event logging */
@@ -1762,6 +1763,8 @@ static void native_cmd(const char *ln)
         wbp_start(n);
     } else if (sscanf(ln, "reinfblock %d", &n) == 1) {
         g_reinfblock = n; logf_("reinfblock %d", n);
+    } else if (sscanf(ln, "npcinterp %d", &n) == 1) {
+        g_npcinterp = n; logf_("npcinterp %d", n);
     } else if (sscanf(ln, "npcdiff %d", &n) == 1) {
         g_npcdiff = n; logf_("npcdiff %d", n);
     } else if (sscanf(ln, "npcz %d", &n) == 1) {
@@ -3559,6 +3562,45 @@ static void npc_host_tick(DWORD now)
 }
 static unsigned g_np_hostcount;
 static DWORD g_np_first;
+/* A puppet's position used to come from NetPlayer physics corrected by 5 states a second: its controller climbed
+ * things the host's NPC walks around (running puppets up to 1.45 m in the air), and errors over 1.5 m snapped back and
+ * forth (owner: "teleports, flies"). Instead the last host positions are kept with their arrival time and the puppet
+ * is placed every frame on that path, npcinterp ms in the past so there are two states to blend between. */
+static DWORD g_np_lastrx;
+static unsigned char g_np_rm[NPC_MAX];   /* puppet removed because the host no longer has it: spawn again if it returns */
+typedef struct { DWORD t; float p[3]; } NpSample;
+static NpSample g_np_s[NPC_MAX][8];
+static unsigned g_np_sn[NPC_MAX];
+static int npc_interp(int j, DWORD now, float *out)
+{
+    unsigned n = g_np_sn[j], c = n > 8 ? 8 : n, k;
+    DWORD r = now - (DWORD)g_npcinterp;
+    const NpSample *b, *a;
+    float f;
+    int i;
+    if (!c) return 0;
+    b = &g_np_s[j][(n - 1) & 7];
+    if ((int)(r - b->t) >= 0) {
+        /* no newer state yet: carry on along the last step for a moment, then wait */
+        int late = (int)(r - b->t);
+        if (late > 150) late = 150;
+        a = c > 1 ? &g_np_s[j][(n - 2) & 7] : b;
+        f = b->t != a->t ? (float)late / (float)(b->t - a->t) : 0;
+        for (i = 0; i < 3; i++) out[i] = b->p[i] + (b->p[i] - a->p[i]) * f;
+        return 1;
+    }
+    for (k = 1; k < c; k++) {
+        a = &g_np_s[j][(n - 1 - k) & 7];
+        if ((int)(r - a->t) >= 0) {
+            f = b->t != a->t ? (float)(r - a->t) / (float)(b->t - a->t) : 1;
+            for (i = 0; i < 3; i++) out[i] = a->p[i] + (b->p[i] - a->p[i]) * f;
+            return 1;
+        }
+        b = a;
+    }
+    memcpy(out, b->p, 3 * sizeof(float));
+    return 1;
+}
 static void npc_rx(const NpcPkt *pk, int len)
 {
     unsigned i;
@@ -3570,6 +3612,8 @@ static void npc_rx(const NpcPkt *pk, int len)
         for (j = 0; j < g_np_n && g_np[j].id != pk->e[i].id; j++) ;
         if (j == g_np_n) { if (g_np_n >= NPC_MAX) continue; memset(&g_np[j], 0, sizeof g_np[j]); g_np[j].id = pk->e[i].id; g_np_n++; }
         g_np[j].e = pk->e[i]; g_np[j].last = GetTickCount();
+        { NpSample *s = &g_np_s[j][g_np_sn[j]++ & 7]; s->t = g_np[j].last; memcpy(s->p, pk->e[i].pos, sizeof s->p); }
+        g_np_lastrx = g_np[j].last;
     }
 }
 static unsigned long long npc_id_of(BYTE *obj)
@@ -3842,6 +3886,17 @@ static void npc_face(int j, BYTE *obj)
     r[4] = -r[1]; r[5] = r[0]; r[6] = 0;
     r[8] = 0; r[9] = 0; r[10] = 1;
 }
+/* after the puppet's update: on the host's path (not dead: a ragdoll is its own; not at a gun or in a vehicle: the seat places it) */
+static void npc_place(int j, BYTE *obj, DWORD now)
+{
+    float p[3];
+    unsigned long long veh;
+    if (!g_npcinterp || g_np[j].e.hp <= 0 || !npc_interp(j, now, p) || ndp_mounted(g_np[j].id)) return;
+    veh = pawn_bb_u64(g_np[j].lid ? g_np[j].lid : g_np[j].id, 0xFD1BA782u);
+    if (veh && veh != ~0ULL) return;
+    if (fabsf(p[0] - *(float *)(obj + 0x60)) < 0.02f && fabsf(p[1] - *(float *)(obj + 0x64)) < 0.02f && fabsf(p[2] - *(float *)(obj + 0x68)) < 0.02f) return;
+    ((void (__attribute__((thiscall)) *)(void *, float, float, float))(g_base + 0x4E01B0))(obj, p[0], p[1], p[2]);
+}
 /* called after a remote-driven main beautifier's update (mf_call) */
 static void npc_anim_apply(BYTE *mb)
 {
@@ -3858,6 +3913,7 @@ static void npc_anim_apply(BYTE *mb)
             BYTE *o3 = entity_obj(g_np[j].lid ? g_np[j].lid : g_np[j].id, &hd3);
             if (hd3) (*(int *)((BYTE *)hd3 + 8))--;
             if (o3 != g_np[j].obj) return;   /* the puppet left the world: its cached entity pointer is stale */
+            npc_place(j, o3, GetTickCount());
             if ((v = npc_animvars(o3))) { nms_apply(g_np[j].id, o3, v); ms_watch("puppet", g_np[j].id, v); }
             npc_face(j, o3);
             if (g_np_react[j] && (int)(g_np_react[j] - GetTickCount()) > 0) return;
@@ -4006,13 +4062,14 @@ static void npc_diff(int j, BYTE *obj, DWORD now)
     static DWORD t[NPC_MAX];
     const NpcEnt *e = &g_np[j].e;
     const BYTE *m = g_np[j].mem;
-    float dx, dy, dz, a, err, vx, vy;
+    float dx, dy, dz, a, err, vx, vy, ref[3];
     const int *ms = NULL;
     unsigned *v;
     int i;
     if (!g_npcdiff || e->hp <= 0 || now - t[j] < 1000) return;
     t[j] = now;
-    dx = *(float *)(obj + 0x60) - e->pos[0]; dy = *(float *)(obj + 0x64) - e->pos[1]; dz = *(float *)(obj + 0x68) - e->pos[2];
+    if (!g_npcinterp || !npc_interp(j, now, ref)) memcpy(ref, e->pos, sizeof ref);   /* against the path it should be on */
+    dx = *(float *)(obj + 0x60) - ref[0]; dy = *(float *)(obj + 0x64) - ref[1]; dz = *(float *)(obj + 0x68) - ref[2];
     a = atan2f(*(float *)(obj + 0x34), *(float *)(obj + 0x30));
     err = e->aim[0] * 0.001f - a;
     while (err > 3.14159265f) err -= 6.2831853f;
@@ -4066,7 +4123,7 @@ static void npc_join_tick(DWORD now)
             if (g_np[j].state == 1 && !g_np[j].gone) { g_np[j].gone = 1; logf_("npcsync join: puppet %llu is gone from this world", g_np[j].id); }
             /* only NPCs spawned during play (ids with the high bit): a save NPC can simply not be streamed in yet, and
              * spawning one made a second copy next to the original */
-            if (g_np[j].state == 0 && (g_np[j].id >> 63) && !g_np[j].lid && !g_np[j].nospawn && e->hp > 0 && now - g_np[j].req > 3000 && g_ns != INVALID_SOCKET) {
+            if (g_np[j].state == 0 && ((g_np[j].id >> 63) || g_np_rm[j]) && !g_np[j].lid && !g_np[j].nospawn && e->hp > 0 && now - g_np[j].last < 1500 && now - g_np[j].req > 3000 && g_ns != INVALID_SOCKET) {
                 NpcArcPkt q;
                 memset(&q, 0, sizeof q); q.magic = NREQ_MAGIC; q.id = g_np[j].id; g_np[j].req = now;
                 sendto(g_ns, (char *)&q, sizeof q, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
@@ -4108,6 +4165,23 @@ static void npc_join_tick(DWORD now)
         }
         m = g_np[j].mem;
         if (!m) continue;
+        /* the host stopped reporting a live NPC near us while its other NPCs still arrive and its list is not full: it left
+         * the host's world (seen after the host's player was moved 80 m: two puppets stood frozen for 190 s). No statues */
+        if (e->hp > 0 && now - g_np[j].last > 8000 && now - g_np_lastrx < 1000 && g_np_hostcount < NPC_MAX) {
+            void *hd2 = NULL;
+            BYTE *me = entity_obj(g_net_id, &hd2);
+            float dx = me ? *(float *)(obj + 0x60) - *(float *)(me + 0x60) : 999, dy = me ? *(float *)(obj + 0x64) - *(float *)(me + 0x64) : 999;
+            if (hd2) (*(int *)((BYTE *)hd2 + 8))--;
+            if (dx * dx + dy * dy < 60.0f * 60.0f) {
+                char rm[96], o2[16];
+                snprintf(rm, sizeof rm, "RemoveEntity('%llu') __out = 'ok'", g_np[j].lid ? g_np[j].lid : g_np[j].id);
+                lua_eval(rm, o2, sizeof o2);
+                logf_("npcsync join: puppet %llu removed, the host has not reported it for %lu ms", g_np[j].id, (unsigned long)(now - g_np[j].last));
+                g_np[j].state = 0; g_np[j].lid = 0; g_np[j].agent = NULL; g_np[j].obj = NULL; g_np[j].mb = NULL; g_np[j].comp = NULL; g_np[j].mem = NULL;
+                g_np[j].wcur = NULL; g_np[j].wmode = 0; g_np[j].wname[0] = 0; g_np[j].gone = 1; g_np_drv[j] = NULL; g_np_rm[j] = 1;
+                continue;
+            }
+        }
         npc_diff(j, obj, now);
         npc_weap_watch("puppet", g_np[j].id, obj, &g_np[j].wcur, &g_np[j].wmode, g_np[j].wname, &g_np[j].wcat);
         npc_weap_fix(j, obj, now);
@@ -4116,7 +4190,7 @@ static void npc_join_tick(DWORD now)
             g_np_drv[j] = pwc ? ((void *(__attribute__((thiscall)) *)(void *))(*(void ***)pwc)[0x78 / 4])(pwc) : NULL;
         }
         if (g_nmssync) mount_tick(g_np[j].id, g_np[j].lid ? g_np[j].lid : g_np[j].id, obj, now);
-        np_pos(m + 4, e->pos);
+        { float ip[3]; np_pos(m + 4, g_npcinterp && npc_interp(j, now, ip) ? ip : e->pos); }
         for (k = 0; k < 3; k++) { *(int *)(m + 0x78 + 0x14 * k) = e->vel[k]; m[0x74 + 0x14 * k] = 1; }
         {
             /* height: NetPlayer corrects position errors only above 1.5 m and a puppet's controller keeps the packet's
@@ -4124,7 +4198,7 @@ static void npc_join_tick(DWORD now)
              * The error goes into the z velocity. */
             float ez = e->pos[2] - *(float *)(obj + 0x68);
             unsigned bits = *(unsigned *)(m + 0x98 + 0x10);
-            if (g_npcz && e->hp > 0 && fabsf(ez) > 0.15f && bits && bits < 31) {
+            if (g_npcz && !g_npcinterp && e->hp > 0 && fabsf(ez) > 0.15f && bits && bits < 31) {
                 float vz = ez * 3.0f;
                 if (vz > 3.0f) vz = 3.0f; if (vz < -3.0f) vz = -3.0f;
                 *(int *)(m + 0xA0) = e->vel[2] + (int)(vz * ((1u << bits) - 1) / 15.0f);
