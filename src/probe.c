@@ -2085,6 +2085,13 @@ static void np_q(BYTE *f, float v, float scale)
 
 /* position block (memento+4 or +0x1A4): per axis cell*4 + frac*4/(2^bits-1); frac fields at +0xC/+0x20/+0x34, cells
  * {vtable, dirty +4, int +8} at +0x48/+0x54/+0x60 */
+static float np_dq(const BYTE *f, float scale);
+/* read back a position written like np_pos (cell of 4 m + quantized offset) */
+static void np_rpos(const BYTE *b, float *p)
+{
+    int k;
+    for (k = 0; k < 3; k++) p[k] = *(const int *)(b + 0x48 + 0xC * k + 8) * 4.0f + np_dq(b + 0xC + 0x14 * k, 4.0f);
+}
 static void np_pos(BYTE *b, const float *p)
 {
     int k;
@@ -2145,6 +2152,46 @@ static unsigned __attribute__((thiscall)) shot_hook(void *self, int *ev)
         }
     }
     return ((bt_event_t)g_shot_orig)(self, ev);
+}
+
+/* host: the bullets of synced NPCs. Their base beautifier gets CWeaponEventFireBullet in its event slot (vf+0x54) like a
+ * player's; a private copy of that class vtable records the impact point per NPC, sent in NpcEnt.shot */
+static void *g_nbt_vt[0x80], *g_nbt_orig;
+static struct { unsigned long long id; BYTE *bt; float p[3]; } g_nbs[32];
+static unsigned __attribute__((thiscall)) nbt_hook(void *self, int *ev)
+{
+    if (ev && !IsBadReadPtr(ev, 0x68)) {
+        typedef void *(__attribute__((thiscall)) *type_t)(void *o);
+        BYTE *ty = ((type_t)(*(void ***)ev)[1])(ev);
+        if (ty && *(unsigned *)(ty + 4) > 3 && *(unsigned *)(ty + 0x14) == *(unsigned *)(g_base + 0xFE15F8)) {
+            int i;
+            static unsigned nlog; for (i = 0; i < 32; i++) if (g_nbs[i].bt == self) { memcpy(g_nbs[i].p, (BYTE *)ev + 0x40, 12); break; } if (nlog++ < 20) logf_("npc bullets: bullet event, slot %d, point (%.1f %.1f %.1f)", i, *(float *)((BYTE *)ev + 0x40), *(float *)((BYTE *)ev + 0x44), *(float *)((BYTE *)ev + 0x48));
+        }
+    }
+    return ((bt_event_t)g_nbt_orig)(self, ev);
+}
+/* put NPC <id> on the copy; returns its last impact point slot or NULL */
+static float *nbt_point(unsigned long long id, BYTE *obj)
+{
+    typedef void *(__attribute__((thiscall)) *gcomp_t)(void *ent, void *key);
+    BYTE *bc = ((gcomp_t)(g_base + 0x4E2CC0))(obj, (void *)(g_base + 0xFDEAD4)), *bt = bc ? *(BYTE **)(bc + 0x2C) : NULL;
+    void **vt;
+    int i, fr = -1;
+    if (*(int *)(g_base + 0xFE15E4) == 0) return NULL;
+    if (!bt || IsBadReadPtr(bt, 4)) return NULL;
+    vt = *(void ***)bt;
+    if (vt != g_nbt_vt) {
+        if (!g_nbt_orig) {
+            if (IsBadReadPtr(vt, sizeof g_nbt_vt)) return NULL;
+            memcpy(g_nbt_vt, vt, sizeof g_nbt_vt); g_nbt_orig = vt[0x54 / 4]; g_nbt_vt[0x54 / 4] = (void *)nbt_hook;
+            logf_("npc bullets: NPC base beautifier class %x hooked", (unsigned)vt - (unsigned)g_base);
+        } else if (vt[0x54 / 4] != g_nbt_orig || memcmp(vt, g_nbt_vt, 0x54)) return NULL;
+        *(void ***)bt = g_nbt_vt;
+    }
+    for (i = 0; i < 32; i++) { if (g_nbs[i].id == id) { g_nbs[i].bt = bt; return g_nbs[i].p; } if (fr < 0 && !g_nbs[i].id) fr = i; }
+    if (fr < 0) fr = (int)(id % 32);
+    g_nbs[fr].id = id; g_nbs[fr].bt = bt; memset(g_nbs[fr].p, 0, 12);
+    return g_nbs[fr].p;
 }
 
 static void shot_hook_install(BYTE *obj)
@@ -2516,6 +2563,14 @@ static void av_fire(const float *point, const float *off, int mode)
 
 /* a puppet's shot: its AI is paused, so nothing pulls the trigger on the joiner. Same calls as av_fire. Damage stays the
  * host's: the stim of this bullet on our player is dropped in st_hook, the hit comes as NSHT. */
+/* a puppet whose body layer has no move state (T-pose: its clips are not loaded here) must not fire: the shots came from
+ * the weapon on its back */
+static int npc_layer0_ok(BYTE *obj)
+{
+    const BYTE *v = npc_animvars(obj);
+    int ms0 = v ? *(const int *)(v - 0x10 + 0x220) : -1;
+    return ms0 > 0;
+}
 static void npc_fire(BYTE *obj, const float *point)
 {
     typedef void *(__fastcall *inv_t)(void *pawn);
@@ -2534,7 +2589,7 @@ static void npc_fire(BYTE *obj, const float *point)
     req[0] = req[1] = req[2] = req[3] = 0xFFFFFFFFu;
     memcpy(&req[4], point, 12); memcpy(&req[7], off, 12);
     ((req_t)(g_base + 0x12F130))(wc, req, 0);
-    ((fire_t)(*(void ***)wc)[0x80 / 4])(wc, pawn);
+    /* no direct weapon fire (vf+0x80): on puppets it crashed the joiner 60 ms later in a worker (Dunia+61F293), 3 of 3 */
     tags = ((tags_t)(*(void ***)pawn)[0x78 / 4])(pawn);
     if (tags) ((ev_t)(g_base + 0x29DA10))(tags, 0x121ADE93u);
 }
@@ -3013,7 +3068,7 @@ static void hit_tick(DWORD now)
 #define NPC_MAGIC 0x3143504Eu
 #define NPC_MAX 24
 #pragma pack(push, 1)
-typedef struct { unsigned long long id; float pos[3]; int vel[3], aim[4]; unsigned char s104, s11c, s110, pad; float hp, hpmax; unsigned pulls; } NpcEnt;
+typedef struct { unsigned long long id; float pos[3]; int vel[3], aim[4]; unsigned char s104, s11c, s110, pad; float hp, hpmax; unsigned pulls; float shot[3]; } NpcEnt;
 typedef struct { unsigned magic, seq, count; NpcEnt e[NPC_MAX]; } NpcPkt;
 #pragma pack(pop)
 static struct { unsigned long long id; BYTE *mem, *obj; unsigned shots, fires; BYTE lastfire; void *wcur; int wmode; char wname[64]; unsigned wcat; DWORD wsent; unsigned lastact, animhash; DWORD animsent; } g_nh[NPC_MAX];
@@ -3566,6 +3621,7 @@ static void npc_host_tick(DWORD now)
          * facing 1.67 rad stood at 0 on the joiner, the third-person beautifier turns the body to the look pair): the body
          * yaw goes into both; head turns come with the animation graph inputs */
         e->aim[1] = e->aim[3];
+        { float *sp = nbt_point(e->id, obj); if (sp) memcpy(e->shot, sp, 12); else memset(e->shot, 0, 12); }
         /* aim[0] (always 0 on the puppet) carries the entity's real yaw in milliradians: the encoded yaw is where the
          * NPC looks, walking that is not where its body points (puppets walked up to 100 degrees off) */
         e->aim[0] = (int)(atan2f(*(float *)(obj + 0x34), *(float *)(obj + 0x30)) * 1000.0f);
@@ -3625,6 +3681,7 @@ static DWORD g_np_first;
  * forth (owner: "teleports, flies"). Instead the last host positions are kept with their arrival time and the puppet
  * is placed every frame on that path, npcinterp ms in the past so there are two states to blend between. */
 static DWORD g_np_lastrx;
+static DWORD g_np_firet[NPC_MAX];       /* last replayed shot of a puppet */
 static DWORD g_np_miss[NPC_MAX];        /* when a save NPC near us was first found missing here */
 static unsigned char g_np_rm[NPC_MAX];   /* puppet removed because the host no longer has it: spawn again if it returns */
 typedef struct { DWORD t; float p[3], y; } NpSample;
@@ -3673,6 +3730,15 @@ static void npc_rx(const NpcPkt *pk, int len)
         for (j = 0; j < g_np_n && g_np[j].id != pk->e[i].id; j++) ;
         if (j == g_np_n) { if (g_np_n >= NPC_MAX) continue; memset(&g_np[j], 0, sizeof g_np[j]); g_np[j].id = pk->e[i].id; g_np_n++; }
         g_np[j].e = pk->e[i]; g_np[j].last = GetTickCount();
+        if (g_np_sn[j]) {
+            /* spin research: how fast the yaw the host sends changes */
+            const NpSample *ps = &g_np_s[j][(g_np_sn[j] - 1) & 7];
+            float dy = pk->e[i].aim[0] * 0.001f - ps->y;
+            static unsigned spun;
+            while (dy > 3.14159265f) dy -= 6.2831853f;
+            while (dy < -3.14159265f) dy += 6.2831853f;
+            { static int pa3[NPC_MAX]; if (fabsf(dy) > 0.5f && spun++ < 3000) logf_("npcspin %llu: host yaw %+.0f deg in %lu ms (now %.0f), look raw %d (was %d), vel %d %d, flag %d", g_np[j].id, dy * 57.3f, (unsigned long)(g_np[j].last - ps->t), pk->e[i].aim[0] * 0.0573f, pk->e[i].aim[3], pa3[j], pk->e[i].vel[0], pk->e[i].vel[1], pk->e[i].pad & 1); pa3[j] = pk->e[i].aim[3]; }
+        }
         { NpSample *s = &g_np_s[j][g_np_sn[j]++ & 7]; s->t = g_np[j].last; memcpy(s->p, pk->e[i].pos, sizeof s->p); s->y = pk->e[i].aim[0] * 0.001f; }
         g_np_lastrx = g_np[j].last;
     }
@@ -3971,6 +4037,14 @@ static void npc_place(int j, BYTE *obj, DWORD now)
         ((void (__attribute__((thiscall)) *)(void *, float, float, float))(g_base + 0x4E01B0))(obj, p[0], p[1], p[2]);
     /* the body's yaw is the host's too, standing or walking: on its own a puppet takes it from a velocity of almost 0 or the
      * aim, and spun on the spot in fights. Rows as in npc_face */
+    if (g_np_firet[j] && now - g_np_firet[j] < 1500) {
+        /* shooting: the host's yaw flips by up to 175 degrees every packet then (seen standing, 165 jumps in 90 s), which spun the
+         * puppet; face the target (our player) instead. Forward = yaw + 90 degrees (as in npc_face) */
+        void *hd4 = NULL;
+        BYTE *me4 = entity_obj(g_net_id, &hd4);
+        if (hd4) (*(int *)((BYTE *)hd4 + 8))--;
+        if (me4) p[3] = atan2f(*(float *)(me4 + 0x64) - p[1], *(float *)(me4 + 0x60) - p[0]) - 1.5707963f;
+    }
     if (!IsBadWritePtr(r, 0x30)) {
         r[0] = cosf(p[3]); r[1] = sinf(p[3]); r[2] = 0;
         r[4] = -r[1]; r[5] = r[0]; r[6] = 0;
@@ -4346,12 +4420,17 @@ static void npc_join_tick(DWORD now)
             if (g_npcfire && me3 && e->hp > 0) {
                 float t[3], dx, dy, dz, h;
                 t[0] = *(float *)(me3 + 0x60); t[1] = *(float *)(me3 + 0x64); t[2] = *(float *)(me3 + 0x68) + 1.2f;
+                {
+                    /* the host's impact point, when the host sent one near this puppet: shots then land where they did there */
+                    float sx = e->shot[0] - *(float *)(obj + 0x60), sy = e->shot[1] - *(float *)(obj + 0x64);
+                    if ((e->shot[0] != 0 || e->shot[1] != 0) && sx * sx + sy * sy < 150.0f * 150.0f) { t[0] = e->shot[0]; t[1] = e->shot[1]; t[2] = e->shot[2]; }
+                }
                 dx = t[0] - *(float *)(obj + 0x60); dy = t[1] - *(float *)(obj + 0x64); dz = t[2] - (*(float *)(obj + 0x68) + 1.5f);
                 h = sqrtf(dx * dx + dy * dy);
                 if (e->pulls != fired[j] && now - fire_t[j] >= 110) {
                     if (e->pulls - fired[j] > 8) fired[j] = e->pulls - 1;
-                    fired[j]++; fire_t[j] = now;
-                    if (h < 80.0f) { static unsigned logged; npc_fire(obj, t); if (logged++ < 10) logf_("npcfire: puppet %llu fired (%u of %u)", g_np[j].id, fired[j], e->pulls); }
+                    fired[j]++; fire_t[j] = now; g_np_firet[j] = now;
+                    if (h < 80.0f && npc_layer0_ok(obj) && !ndp_mounted(g_np[j].id)) { static unsigned logged; static const float mo[3] = { 0, 0, 1.5f }; int q; /* fire block only, as the avatar's default (state) mode: NetPlayer hands it to the weapon; direct calls crashed */ *(int *)(m + 0x1A0) = -1; m[0x19C] = 1; *(unsigned *)(m + 0x218) = 0xFFFFFFFFu; *(unsigned *)(m + 0x21C) = 0xFFFFFFFFu; m[0x214] = 1; np_pos(m + 0x1A4, t); for (q = 0; q < 3; q++) np_q(m + 0x220 + 0x14 * q, mo[q], 3.0f); if (logged++ < 30) logf_("npcfire: puppet %llu fired (%u of %u) at (%.1f %.1f %.1f), host impact (%.1f %.1f %.1f)", g_np[j].id, fired[j], e->pulls, t[0], t[1], t[2], e->shot[0], e->shot[1], e->shot[2]); }
                 }
                 if (fire_t[j] && now - fire_t[j] < 1500 && h < 80.0f) {
                     float yaw = atan2f(-dx, dy), pitch = atan2f(dz, h);
@@ -4359,7 +4438,7 @@ static void npc_join_tick(DWORD now)
                 }
             }
         }
-        m[0x104] = e->s104; m[0x100] = 1; m[0x11C] = e->s11c; m[0x118] = 1; m[0x110] = e->s110; m[0x10C] = 1;
+        m[0x104] = e->s104 | (BYTE)(g_npcfire && g_np_firet[j] && now - g_np_firet[j] < 150); m[0x100] = 1; m[0x11C] = e->s11c; m[0x118] = 1; m[0x110] = e->s110; m[0x10C] = 1;
         if (e->hp >= 0) { *(float *)(m + 0x13C) = e->hp; m[0x134] = 1; }
     }
 }
