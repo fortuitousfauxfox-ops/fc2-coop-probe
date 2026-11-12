@@ -1,5 +1,7 @@
 # fc2-coop-probe
 
+Maintained by [HitchLangley](https://github.com/HitchLangley). Started from [MortyRei/fc2-coop-probe](https://github.com/MortyRei/fc2-coop-probe) (initial import, MIT); everything after that is developed here, on the `sync/avatar-world-npc` line.
+
 A research tool for **Far Cry 2** (Steam, version 1.03, Dunia engine): a `dinput8.dll` proxy
 that you drop into a **test copy** of the game. Inside the running game it
 
@@ -10,8 +12,10 @@ that you drop into a **test copy** of the game. Inside the running game it
 - and, as a prototype, exchanges the player's position between two copies over its own UDP
   socket and moves an invincible avatar of the peer.
 
-It is **not** a playable co-op mod: the avatar slides in an idle pose (it turns to face where
-the peer looks, but has no walking animation), with no weapons, health or mission sync. It is the code behind the Far Cry 2 write-up in
+Since then it has grown into a two-player co-op prototype (tested with two copies on one PC,
+the latest work not yet on two PCs): an animated avatar with weapons, shots and hit sync, Steam
+relay and friend lobbies, vehicles, and the host's NPCs shown as puppets on the joiner. It is
+**not** a finished mod: missions, world state and many fight details are not synced yet. It is the code behind the Far Cry 2 write-up in
 [coop-anything](https://github.com/cranebeaker/coop-anything/tree/main/games/far-cry-2)
 (pull request: https://github.com/cranebeaker/coop-anything/pull/43); the findings, dates and
 evidence are there.
