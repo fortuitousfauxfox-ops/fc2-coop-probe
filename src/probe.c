@@ -540,6 +540,118 @@ static int lua_eval(const char *code, char *out, size_t on)
 #define RVA_GETENTITY  0x55820
 typedef void *(__attribute__((thiscall)) *getent_t)(void *mgr, void **out, unsigned lo, unsigned hi);
 #define RVA_BODY_VTABLE 0xE67658
+
+/* CPawnInteractionMonitor per-frame target update. The monitor object has two vtable pointers
+ * (0x10E167B8 at +0, 0x10E167A8 at +4); slot 0 of the secondary vtable is 0x1009E460, called
+ * with `this` = object+4 and two stack arguments (delta time, flag). Field map, relative to the
+ * object base:
+ *   +0x08 owner holder   +0x10 pawn/component ref   +0x14 target holder
+ *   +0x18 target entity id (u64)                    +0x3C target position (3 floats)
+ *   +0x48 re-scan timer / distance float
+ * Clearing the holder to the engine's empty-holder sentinel and zeroing the id drops the
+ * interaction prompt without touching any other target (loot, vehicles, ...). */
+#define RVA_INTERACT_UPDATE 0x9E460
+typedef int (__attribute__((thiscall)) *interact_update_t)(void *self, int a, int b);
+static interact_update_t o_interact_update;
+static unsigned long long g_interact_ignore;
+static unsigned long g_interact_hits, g_interact_clears;
+static unsigned long long g_last_target;
+/* Last state seen per monitor instance, so `itarget` can report the live selection instead of
+ * only the changes the hook logs. Two monitors alternate frames. Read-only. */
+static struct { void *self; unsigned long long tid; unsigned long holder; } g_mon[8];
+static int g_nmon;
+static int g_interact_mode = 0;  /* 0=hook only, 1=holder, 2=holder+id+pos+timer, 3=id+pos+timer, 4=holder+id */
+
+/* GCC on i386 silently ignores __attribute__((thiscall)) in C, so a plain C function cannot be
+ * used as the detour: `this` would not be in ecx and the original would run with a stale ecx.
+ * This stub does it in machine code:
+ *     push ebp; mov ebp,esp; push ebx; push esi
+ *     mov ebx,ecx                      ; self
+ *     push [ebp+0xC]; push [ebp+8]     ; b, a
+ *     call dword ptr [&o_interact_update]   ; original, with ecx still = self
+ *     mov esi,eax
+ *     push esi; push ebx
+ *     call interact_post               ; cdecl: (self, retval)
+ *     add esp,8; mov eax,esi
+ *     pop esi; pop ebx; pop ebp; ret 8
+ * The indirect call reads o_interact_update at run time, so the stub can exist before the
+ * trampoline does. */
+static int __cdecl interact_post(void *self, int rval);
+static void *make_interact_hook(void)
+{
+    static const BYTE code[] = {
+        0x55,                   /* push ebp */
+        0x89, 0xE5,             /* mov ebp,esp */
+        0x53,                   /* push ebx */
+        0x56,                   /* push esi */
+        0x8B, 0xD9,             /* mov ebx,ecx */
+        0xFF, 0x75, 0x0C,       /* push [ebp+0xC] */
+        0xFF, 0x75, 0x08,       /* push [ebp+8] */
+        0xFF, 0x15, 0, 0, 0, 0, /* call dword ptr [imm32] */
+        0x8B, 0xF0,             /* mov esi,eax */
+        0x56,                   /* push esi */
+        0x53,                   /* push ebx */
+        0xE8, 0, 0, 0, 0,       /* call rel32 interact_post */
+        0x83, 0xC4, 0x08,       /* add esp,8 */
+        0x89, 0xF0,             /* mov eax,esi */
+        0x5E,                   /* pop esi */
+        0x5B,                   /* pop ebx */
+        0x5D,                   /* pop ebp */
+        0xC2, 0x08, 0x00        /* ret 8 */
+    };
+    BYTE *p = (BYTE *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!p) return NULL;
+    memcpy(p, code, sizeof code);
+    *(unsigned long *)(p + 15) = (unsigned long)&o_interact_update;
+    *(long *)(p + 24) = (long)interact_post - (long)(p + 28);
+    FlushInstructionCache(GetCurrentProcess(), p, sizeof code);
+    return p;
+}
+
+/* Runs after the monitor's own update. If it has just selected the puppet, replace the target
+ * holder with the engine's empty-holder sentinel and zero the id, position and timer, so the
+ * prompt never reaches the renderer. Other targets are left untouched. */
+static int __cdecl interact_post(void *self, int rval)
+{
+    BYTE *s = (BYTE *)self;  /* = monitor object + 4 */
+    unsigned long long tid = *(unsigned long long *)(s + 0x14);
+    int has = tid != 0 && tid != 0xFFFFFFFFFFFFFFFFull;  /* sentinel = no target */
+    int mi;
+    for (mi = 0; mi < g_nmon; mi++) if (g_mon[mi].self == self) break;
+    if (mi == g_nmon && g_nmon < (int)(sizeof g_mon / sizeof g_mon[0])) {
+        g_mon[g_nmon].self = self;
+        g_nmon++;
+    }
+    if (mi < g_nmon) {
+        g_mon[mi].tid = tid;
+        g_mon[mi].holder = *(unsigned long *)(s + 0x10);
+    }
+    g_interact_hits++;
+    /* Speak only for the first few frames and on non-empty target changes, so a 60 Hz hook
+     * does not flood the log. The first hits prove the hook is really on the per-frame path.
+     * Empty targets are not tracked: two monitors alternate frames and would otherwise
+     * re-log the other one's target forever. */
+    if (g_interact_hits <= 5 || (has && tid != g_last_target)) {
+        logf_("interact: hit %lu self=%p target=%llu holder=%08lx mode=%d",
+             g_interact_hits, self, tid, *(unsigned long *)(s + 0x10), g_interact_mode);
+        g_last_target = tid;
+    }
+    if (g_interact_mode && g_interact_ignore && tid == g_interact_ignore) {
+        if (g_interact_mode == 1 || g_interact_mode == 2 || g_interact_mode == 4)
+            *(unsigned long *)(s + 0x10) = 0x18040160ul;  /* empty target holder */
+        if (g_interact_mode >= 2) {
+            *(unsigned long long *)(s + 0x14) = 0;
+            *(float *)(s + 0x38) = 0.0f;
+            *(float *)(s + 0x3C) = 0.0f;
+            *(float *)(s + 0x40) = 0.0f;
+            *(float *)(s + 0x44) = 0.0f;
+        }
+        g_interact_clears++;
+        if (g_interact_clears <= 5)
+            logf_("interact: cleared target %llu (clear #%lu, mode %d)", tid, g_interact_clears, g_interact_mode);
+    }
+    return rval;
+}
 static BYTE *g_body, *g_bodymat;
 static unsigned g_findtries;   /* findbody tries since the body was last lost (3 s apart for 5 tries, then 60 s) */
 static BYTE **g_av_body_p;
@@ -830,6 +942,173 @@ static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, con
     logf_("findbody done: %d match(es) near entity %.3f %.3f %.3f, nearest dist %.3f", found, ex, ey, ez, *body_out ? best : -1.0f);
     return *body_out != NULL;
 }
+
+/* ---- CCharacterPhysComponent: locate it and drive its PhysicsEnabled flags ----
+ * The getter at RVA 0x5442C0 is exactly `mov al,[ecx+0x1B4]; ret`, which identifies the class.
+ * Field map: +0x160 body wrapper, +0x164 second Havok object, +0x178 state enum,
+ * +0x1B4 PhysicsEnabled, +0x1B5 second collision flag.
+ * The property setters are one-argument __thiscall, but their tails do not share a cleanup
+ * convention: the PhysicsEnabled setter (0x5446B0) tail-jumps into a plain-`ret` virtual,
+ * while its early-exit paths use `ret 4`. GCC on i386 drops __attribute__((thiscall)) in C,
+ * so call through a hand-built machine-code thunk, with one variant per convention:
+ *   mov eax,[esp+4] ; mov ecx,[esp+8] ; push [esp+0xC] ; call eax ; [add esp,4] ; ret
+ * The field write itself is unambiguous and is what the setter does first; `physset` uses it. */
+#define RVA_PHYS_SET_ENABLED 0x5446B0
+#define PHYS_BODY   0x160
+#define PHYS_BODY2  0x164
+#define PHYS_STATE  0x178
+#define PHYS_EN     0x1B4
+#define PHYS_EN2    0x1B5
+
+typedef int (__cdecl *call1_t)(void *fn, void *self, unsigned arg);
+static call1_t g_call1, g_call1r4;
+static BYTE *g_phys, *g_phys_body;
+
+/* Two thunk variants, because engine "setters" here do not share one cleanup convention:
+ *  - plain `ret`   (caller cleans): after the call, drop the pushed argument
+ *  - `ret 4`       (callee cleans): the argument is already gone, do not touch esp
+ * The function is read at run time from the first argument, so one allocated stub per kind. */
+static call1_t make_call1(int callee_pops)
+{
+    static const BYTE common[] = {
+        0x8B, 0x44, 0x24, 0x04,  /* mov eax,[esp+4]  fn */
+        0x8B, 0x4C, 0x24, 0x08,  /* mov ecx,[esp+8]  self */
+        0xFF, 0x74, 0x24, 0x0C   /* push dword [esp+0xC]  arg */
+    };
+    BYTE *p = (BYTE *)VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    size_t o = 0;
+    if (!p) return NULL;
+    memcpy(p, common, sizeof common); o += sizeof common;
+    p[o++] = 0xFF; p[o++] = 0xD0;                 /* call eax */
+    if (!callee_pops) { p[o++] = 0x83; p[o++] = 0xC4; p[o++] = 0x04; }
+    p[o++] = 0xC3;
+    FlushInstructionCache(GetCurrentProcess(), p, o);
+    return (call1_t)p;
+}
+
+static int call1(void *fn, void *self, unsigned arg)      /* callee: plain ret */
+{
+    if (!g_call1) g_call1 = make_call1(0);
+    if (!g_call1) { logf_("call1: no thunk"); return -1; }
+    return g_call1(fn, self, arg);
+}
+
+static int call1r4(void *fn, void *self, unsigned arg)    /* callee: ret 4 */
+{
+    if (!g_call1r4) g_call1r4 = make_call1(1);
+    if (!g_call1r4) { logf_("call1r4: no thunk"); return -1; }
+    return g_call1r4(fn, self, arg);
+}
+
+/* Two stack arguments, `ret 8`: ecx = self, then arg1 at [esp+4], arg2 at [esp+8]
+ * in the callee.  The entity transform setter 0x104DF440 uses this convention. */
+typedef int (__cdecl *call2_t)(void *fn, void *self, unsigned a1, unsigned a2);
+static call2_t g_call2r8;
+
+static call2_t make_call2r8(void)
+{
+    static const BYTE code[] = {
+        0x8B, 0x44, 0x24, 0x04,  /* mov eax,[esp+4]   fn   */
+        0x8B, 0x4C, 0x24, 0x08,  /* mov ecx,[esp+8]   self */
+        0xFF, 0x74, 0x24, 0x10,  /* push dword [esp+0x10]  a2 */
+        0xFF, 0x74, 0x24, 0x10,  /* push dword [esp+0x10]  a1 (shifted) */
+        0xFF, 0xD0,              /* call eax          callee ret 8 */
+        0xC3                     /* ret               */
+    };
+    BYTE *p = (BYTE *)VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!p) return NULL;
+    memcpy(p, code, sizeof code);
+    FlushInstructionCache(GetCurrentProcess(), p, sizeof code);
+    return (call2_t)p;
+}
+
+static int call2r8(void *fn, void *self, unsigned a1, unsigned a2)
+{
+    if (!g_call2r8) g_call2r8 = make_call2r8();
+    if (!g_call2r8) { logf_("call2r8: no thunk"); return -1; }
+    return g_call2r8(fn, self, a1, a2);
+}
+
+static unsigned phys_slot(BYTE *comp)
+{
+    unsigned vt, fn = 0;
+    if (safe_read(comp, &vt, 4) && safe_read((void *)(vt + 0x8C), &fn, 4)) return fn;
+    return 0;
+}
+
+/* Score a candidate component from a snapshot buffer. A real component has a Dunia vtable
+ * whose +0x8C entry is itself a Dunia function. Returning -1 rejects the candidate.
+ * All probing uses safe_read so a stray pointer never faults the game. */
+static int phys_score(const BYTE *c)
+{
+    unsigned vt = *(const unsigned *)c;
+    unsigned b2 = *(const unsigned *)(c + PHYS_BODY2), st = *(const unsigned *)(c + PHYS_STATE), fn, dummy;
+    int s = 2;
+    if (vt <= (unsigned)g_base || vt >= (unsigned)(g_base + 0x2000000)) return -1;
+    if (!safe_read((void *)(vt + 0x8C), &fn, 4)) return -1;
+    if (fn <= (unsigned)g_base || fn >= (unsigned)(g_base + 0x2000000)) return -1;
+    s += 1;
+    if (b2 && safe_read((void *)b2, &dummy, 4)) s += 2;
+    if (st <= 8) s += 1;
+    if (c[PHYS_EN] <= 1) s += 1;
+    if (c[PHYS_EN2] <= 1) s += 1;
+    return s;
+}
+
+/* Find the component whose +0x160 is `body`. The pointer may be stored anywhere in private
+ * committed memory, so scan dwords. Candidates are scored on the field map; the best wins. */
+static BYTE *phys_find(BYTE *body, int verbose)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    BYTE *p = NULL, *best = NULL;
+    unsigned b = (unsigned)body;
+    int cand = 0, bestscore = -1;
+    if (!body) return NULL;
+    while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi) {
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
+            !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (mbi.Protect & PAGE_READWRITE) &&
+            mbi.RegionSize < 0x20000000) {
+            BYTE *base = (BYTE *)mbi.BaseAddress, *rend = base + mbi.RegionSize;
+            BYTE *c;
+            for (c = base; c < rend; c += 0x10000) {
+                static BYTE chunk[0x10000];
+                size_t n = (size_t)(rend - c), k;
+                if (n > sizeof chunk) n = sizeof chunk;
+                if (!safe_read(c, chunk, n)) continue;
+                for (k = 0; k + 4 <= n; k += 4) {
+                    BYTE *comp = c + k - PHYS_BODY;
+                    BYTE snap[0x1B8];
+                    int score;
+                    if (*(unsigned *)(chunk + k) != b) continue;
+                    if (!safe_read(comp, snap, sizeof snap)) continue;
+                    score = phys_score(snap);
+                    if (score < 4) continue;
+                    cand++;
+                    if (verbose && cand <= 8)
+                        logf_("physfind: candidate %p score %d vt %08lx body2 %08lx state %lu en %u/%u slot8c %08lx",
+                             comp, score, *(unsigned *)snap, *(unsigned *)(snap + PHYS_BODY2),
+                             *(unsigned *)(snap + PHYS_STATE), snap[PHYS_EN], snap[PHYS_EN2],
+                             phys_slot(comp));
+                    if (score > bestscore) { bestscore = score; best = comp; }
+                }
+            }
+        }
+        p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+    }
+    if (best) {
+        g_phys = best; g_phys_body = body;
+        logf_("physfind: chose %p (score %d, %d candidate(s))", best, bestscore, cand);
+    } else logf_("physfind: no component with +0x%x == %p (0 candidate(s) passed)", PHYS_BODY, body);
+    return best;
+}
+
+static void phys_dump(const char *tag, BYTE *comp)
+{
+    logf_("%s: comp %p vt %08lx body %08lx body2 %08lx state %lu en %u/%u slot8c %08lx",
+         tag, comp, *(unsigned *)comp, *(unsigned *)(comp + PHYS_BODY), *(unsigned *)(comp + PHYS_BODY2),
+         *(unsigned *)(comp + PHYS_STATE), comp[PHYS_EN], comp[PHYS_EN2], phys_slot(comp));
+}
+
 /* give the NetPlayer avatar a weapon the way the Lua AddWeapon handler (LAB_109f9310) does for the local player:
  * spawn the weapon entity, CWeapon comp (key FE01F8), category = *(vf+0x8C()), inventory = FUN_1007e140(pawn comp),
  * the old weapon of that category FUN_10129de0 -> FUN_1012e3e0(old, 0) and its entity removed, FUN_101289f0(weapon),
@@ -1117,8 +1396,10 @@ static void native_cmd(const char *ln)
 {
     unsigned long long id, k0x;
     unsigned long a, pv, k0, k1;
+    unsigned long f, sf, arg, arg2;
     float fx, fy, fz;
-    int n;
+    int n = 0;
+    char needle[128];
     if (sscanf(ln, "peek %lx %d", &a, &n) == 2) {
         if (IsBadReadPtr((void *)a, n)) logf_("peek %lx: unreadable", a);
         else hexdump_((const BYTE *)a, n);
@@ -1716,6 +1997,9 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "pokef %lx %f", &a, &fx) == 2) {
         if (IsBadWritePtr((void *)a, 4)) logf_("pokef %lx: not writable", a);
         else { *(float *)a = fx; logf_("pokef %lx = %.3f", a, fx); }
+    } else if (sscanf(ln, "pokeb %lx %lx", &a, &pv) == 2) {
+        if (IsBadWritePtr((void *)a, 1)) logf_("pokeb %lx: not writable", a);
+        else { *(BYTE *)a = (BYTE)pv; logf_("pokeb %lx = %02lx", a, pv & 0xFF); }
     } else if (sscanf(ln, "hold %llu %f %f %f", &id, &fx, &fy, &fz) == 4) {
         g_hold_id = id; g_hold_pos[0] = fx; g_hold_pos[1] = fy; g_hold_pos[2] = fz; g_hold_ticks = 0; g_hold = 1;
         logf_("hold on: %llu -> %.3f %.3f %.3f", id, fx, fy, fz);
@@ -1905,6 +2189,160 @@ static void native_cmd(const char *ln)
         r = byptr ? ((vcp_t)(*(void ***)a)[pv / 4])((void *)a, f)
                   : ((vc_t)(*(void ***)a)[pv / 4])((void *)a, f[0], f[1], f[2], f[3]);
         logf_("vcall %lx +%lx (%p) -> %08x, vec %.3f %.3f %.3f %.3f", a, pv, (*(void ***)a)[pv / 4], r, f[0], f[1], f[2], f[3]);
+    } else if (sscanf(ln, "ignore %llu", &id) == 1) {
+        g_interact_ignore = id;
+        logf_("interact: ignoring target %llu (hits=%lu clears=%lu)", id, g_interact_hits, g_interact_clears);
+    } else if (sscanf(ln, "imode %d", &n) == 1) {
+        g_interact_mode = n;
+        logf_("interact: mode %d (hits=%lu clears=%lu)", n, g_interact_hits, g_interact_clears);
+    } else if (strncmp(ln, "ignoreoff", 9) == 0) {
+        g_interact_ignore = 0;
+        logf_("interact: ignore off (hits=%lu clears=%lu)", g_interact_hits, g_interact_clears);
+    } else if (strncmp(ln, "ihits", 5) == 0) {
+        logf_("interact: hook hits=%lu clears=%lu ignore=%llu mode=%d", g_interact_hits, g_interact_clears, g_interact_ignore, g_interact_mode);
+    } else if (strncmp(ln, "itarget", 7) == 0) {
+        int i;
+        for (i = 0; i < g_nmon; i++)
+            logf_("itarget: self=%p target=%llu holder=%08lx", g_mon[i].self, g_mon[i].tid, g_mon[i].holder);
+        logf_("itarget done: %d monitor(s) hits=%lu clears=%lu", g_nmon, g_interact_hits, g_interact_clears);
+    } else if (sscanf(ln, "findd %lx %d", &a, &n) >= 1) {
+        /* Find every occurrence of a 32-bit value in private committed memory. Used to locate live
+         * component instances: the engine's per-class name object address acts as a class tag. */
+        MEMORY_BASIC_INFORMATION mbi;
+        BYTE *p = NULL;
+        int found = 0, max = n > 0 ? n : 64;
+        logf_("findd %08lx (max %d)", a, max);
+        while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi) {
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
+                !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) &&
+                mbi.RegionSize < 0x20000000) {
+                BYTE *base = (BYTE *)mbi.BaseAddress;
+                SIZE_T left = mbi.RegionSize;
+                while (left && found < max) {
+                    static BYTE chunk[0x10000];
+                    SIZE_T m = left > 0x10000 ? 0x10000 : left;
+                    SIZE_T got = 0, i;
+                    if (ReadProcessMemory(GetCurrentProcess(), base, chunk, m, &got)) {
+                        for (i = 0; i + 4 <= got; i += 4) {
+                            if (*(unsigned *)(chunk + i) == (unsigned)a) {
+                                logf_("FINDD %p", base + i);
+                                if (++found >= max) break;
+                            }
+                        }
+                    }
+                    base += m; left -= m;
+                }
+            }
+            if (found >= max) break;
+            p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+        }
+        logf_("findd done: %d hits", found);
+    } else if (sscanf(ln, "call1 %lx %lx %lx", &f, &sf, &arg) == 3) {
+        /* Call a one-argument __thiscall: ecx = self, one dword on the stack, callee `ret 4`.
+         * `fn` is an RVA below 0x1000000 (g_base is added) or an absolute VA. */
+        void *fn = (void *)(f < 0x1000000 ? (unsigned long)g_base + f : f);
+        int r;
+        if (IsBadReadPtr(fn, 1)) { logf_("call1 %08lx: unreadable function", f); return; }
+        r = call1(fn, (void *)sf, (unsigned)arg);
+        logf_("call1 fn %p self %08lx arg %lu -> %d (%08lx)", fn, sf, arg, r, (unsigned)r);
+    } else if (sscanf(ln, "call1r4 %lx %lx %lx", &f, &sf, &arg) == 3) {
+        /* Same as call1, but the callee cleans the argument itself (`ret 4`), so the thunk
+         * must not drop it again. Needed by the PhysicsEnabled chain: the component setter
+         * tail-jumps into a `ret 4` body virtual instead of returning to the thunk. */
+        void *fn = (void *)(f < 0x1000000 ? (unsigned long)g_base + f : f);
+        int r;
+        if (IsBadReadPtr(fn, 1)) { logf_("call1r4 %08lx: unreadable function", f); return; }
+        r = call1r4(fn, (void *)sf, (unsigned)arg);
+        logf_("call1r4 fn %p self %08lx arg %lu -> %d (%08lx)", fn, sf, arg, r, (unsigned)r);
+    } else if (sscanf(ln, "call2r8 %lx %lx %lx %lx", &f, &sf, &arg, &arg2) == 4) {
+        /* Two stack arguments, callee `ret 8`. Used by the entity transform setter
+         * 0x104DF440(matrix*, skipEntity): ecx = entity, [esp+4] = matrix, [esp+8] = skip. */
+        void *fn = (void *)(f < 0x1000000 ? (unsigned long)g_base + f : f);
+        int r;
+        if (IsBadReadPtr(fn, 1)) { logf_("call2r8 %08lx: unreadable function", f); return; }
+        r = call2r8(fn, (void *)sf, (unsigned)arg, (unsigned)arg2);
+        logf_("call2r8 fn %p self %08lx a1 %lu a2 %lu -> %d (%08lx)", fn, sf, arg, arg2, r, (unsigned)r);
+    } else if (sscanf(ln, "physfind %lx", &a) == 1) {
+        phys_find((BYTE *)a, 1);
+    } else if (sscanf(ln, "physset %lx %d", &a, &n) == 2) {
+        /* Direct field write: this is exactly the first thing 0x105446B0 does. The engine
+         * virtual it tail-calls (+0x8C) is a getter, so calling the "setter" does not add
+         * a collision notification; the field is the whole effect. */
+        BYTE *comp = phys_find((BYTE *)a, 0);
+        if (!comp) return;
+        phys_dump("physset before", comp);
+        *(BYTE *)(comp + PHYS_EN) = (BYTE)(n != 0);
+        logf_("physset: wrote +0x%x = %d", PHYS_EN, n != 0);
+        phys_dump("physset after", comp);
+    } else if (sscanf(ln, "physcall %lx %d", &a, &n) == 2) {
+        /* Exercise the engine setter 0x105446B0 itself, choosing the thunk from the state:
+         * states 0/2/3/5 tail-jump to a plain-ret virtual; other states use ret 4. */
+        BYTE *comp = phys_find((BYTE *)a, 0);
+        unsigned st;
+        int r;
+        if (!comp) return;
+        st = *(unsigned *)(comp + PHYS_STATE);
+        phys_dump("physcall before", comp);
+        if (st == 0 || st == 2 || st == 3 || st == 5)
+            r = call1((void *)(g_base + RVA_PHYS_SET_ENABLED), comp, (unsigned)(n != 0));
+        else
+            r = call1r4((void *)(g_base + RVA_PHYS_SET_ENABLED), comp, (unsigned)(n != 0));
+        logf_("physcall: state %u -> %d", st, r);
+        phys_dump("physcall after", comp);
+    } else if (sscanf(ln, "physget %lx", &a) == 1) {
+        BYTE *comp = (g_phys && g_phys_body == (BYTE *)a) ? g_phys : phys_find((BYTE *)a, 0);
+        if (comp) phys_dump("physget", comp);
+    } else if (sscanf(ln, "strscan %127s", needle) == 1) {
+        /* Dump unique printable strings containing `needle` from private committed memory.
+         * Used to read the decoded Lua/Domino constants (event names) out of the running game. */
+        MEMORY_BASIC_INFORMATION mbi;
+        BYTE *p = NULL;
+        static char seen[400][128];
+        int nseen = 0, hits = 0;
+        size_t nl = strlen(needle);
+        logf_("strscan '%s'", needle);
+        while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi) {
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
+                !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) &&
+                mbi.RegionSize < 0x20000000) {
+                BYTE *base = (BYTE *)mbi.BaseAddress;
+                SIZE_T left = mbi.RegionSize;
+                while (left) {
+                    static BYTE chunk[0x10000 + 256];
+                    SIZE_T m = left > 0x10000 ? 0x10000 : left;
+                    SIZE_T got = 0;
+                    if (ReadProcessMemory(GetCurrentProcess(), base, chunk, m, &got) && got >= nl) {
+                        SIZE_T i;
+                        for (i = 0; i + nl <= got; i++) {
+                            if (chunk[i] == (BYTE)needle[0] && memcmp(chunk + i, needle, nl) == 0) {
+                                SIZE_T x = i, y = i + nl;
+                                char s[128];
+                                size_t len;
+                                int k, dup = 0;
+                                while (x > 0 && i - x < 96 && chunk[x - 1] >= 0x20 && chunk[x - 1] < 0x7F) x--;
+                                while (y < got && y - i < 120 && chunk[y] >= 0x20 && chunk[y] < 0x7F) y++;
+                                len = y - x;
+                                if (len > sizeof s - 1) len = sizeof s - 1;
+                                memcpy(s, chunk + x, len);
+                                s[len] = 0;
+                                hits++;
+                                for (k = 0; k < nseen; k++) if (strcmp(seen[k], s) == 0) { dup = 1; break; }
+                                if (!dup && nseen < (int)(sizeof seen / sizeof seen[0])) {
+                                    strcpy(seen[nseen++], s);
+                                    logf_("STR %s", s);
+                                }
+                            }
+                        }
+                    }
+                    base += m;
+                    left -= m;
+                }
+            }
+            p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+        }
+        logf_("strscan done: %d hits, %d unique", hits, nseen);
     } else logf_("native: unknown command: %s", ln);
 }
 
@@ -2047,6 +2485,7 @@ static BYTE *g_av_body, *g_av_mat;
 static void av_init_ptr(void) { g_av_body_p = &g_av_body; }
 static float g_av_cur[3], g_av_dir[2];
 static int g_av_have;
+static int g_av_safe;
 static DWORD g_av_lastspawn, g_av_lastfind;
 
 /* NetPlayer avatar mode (`avmode np [archetype] [yaw offset deg] [offset x] [offset y]`): the avatar is a buddy-archetype
@@ -2567,7 +3006,7 @@ static void av_fire(const float *point, const float *off, int mode)
  * the weapon on its back */
 static int npc_layer0_ok(BYTE *obj)
 {
-    const BYTE *v = npc_animvars(obj);
+    const BYTE *v = (const BYTE *)npc_animvars(obj);
     int ms0 = v ? *(const int *)(v - 0x10 + 0x220) : -1;
     return ms0 > 0;
 }
@@ -2755,6 +3194,33 @@ static int av_valid(void)
     return g_av_mat && g_av_body != g_body && !IsBadWritePtr(g_av_mat, 0x40) && !IsBadReadPtr(g_av_body, 4) && *(unsigned *)g_av_body == (unsigned)(g_base + RVA_BODY_VTABLE);
 }
 
+/* Make the puppet non-interactive and non-colliding. Called once right after the spawn and
+ * again once its physics body is bound, because the body does not exist at spawn time.
+ * The hand/talk prompt comes from the pawn's own usability flag: domino\system\pawninteraction.lua
+ * toggles it with the command event "SetUsability" ("true"/"false", plus IgnoreOrientation),
+ * which flips byte +0x14 of the pawn object. Measured: 0 = the player's interaction monitor
+ * never selects the puppet, 1 = it does. The proximity-trigger events below are kept as
+ * harmless extra measures for the physical trigger, not for the prompt. */
+static void av_safe_calls(unsigned long long id)
+{
+    char code[256], out[64];
+    snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'SetUsability', 'false', 1) __out = 'unusable'", id);
+    lua_eval(code, out, sizeof out);
+    logf_("avatar usability false: status %s", out);
+    snprintf(code, sizeof code, "CDominoManager_GetInstance():SendRegisteredEventToEntity('%llu', 'CProximityTriggerComponent_SetAsUnusable') __out = 'trigunusable'", id);
+    lua_eval(code, out, sizeof out);
+    logf_("avatar trigger unusable: status %s", out);
+    snprintf(code, sizeof code, "CDominoManager_GetInstance():SendRegisteredEventToEntity('%llu', 'CProximityTriggerComponent_SetNotCheckLookAt') __out = 'nochecklook'", id);
+    lua_eval(code, out, sizeof out);
+    logf_("avatar trigger no-check-look: status %s", out);
+    snprintf(code, sizeof code, "SetUsableEntitySize('%llu', 0) __out = 'usable0'", id);
+    lua_eval(code, out, sizeof out);
+    logf_("avatar usable size 0: status %s", out);
+    snprintf(code, sizeof code, "SetToScriptedCollisionGroup('%llu') __out = 'scripted'", id);
+    lua_eval(code, out, sizeof out);
+    logf_("avatar scripted collision group: status %s", out);
+}
+
 static void av_remove(void)
 {
     char code[128], out[64];
@@ -2774,6 +3240,7 @@ static void av_forget(void)
 {
     g_st_obj[0] = NULL;
     g_av_id = 0; g_av_body = g_av_mat = NULL; g_av_have = 0; av_compass(0);
+    g_av_safe = 0; g_interact_ignore = 0;
     memset(g_av_wc, 0, sizeof g_av_wc);
     ply_del("avatar forgotten");
     g_av_mem = NULL; g_av_comp = NULL; g_av_npstate = 0; g_av_weap[0] = 0; g_av_lastseq = 0; g_av_smhave = 0;
@@ -4694,10 +5161,15 @@ static void av_tick(DWORD now)
         id = strtoull(out, NULL, 10);
         if (id == 0 || id == 0xFFFFFFFFFFFFFFFFull) { logf_("avatar spawn failed: %s", out); return; }
         g_av_id = id;
+        g_interact_ignore = id;
         logf_("avatar spawned: %llu", id);
         snprintf(code, sizeof code, "CDominoManager_GetInstance():SendRegisteredEventToEntity('%llu', 'CFCXCountersComponent_SetInvincible') __out = 'ok'", id);
         lua_eval(code, out, sizeof out);
         logf_("avatar set invincible: status %s", out);
+        /* The puppet is a full PawnPlayer: make it non-interactive and non-colliding. These calls
+         * are repeated after the physics body is bound (see the "avatar body bound" branch). */
+        av_safe_calls(id);
+        g_av_safe = 0;
         return;
     }
     {
@@ -4773,7 +5245,12 @@ static void av_tick(DWORD now)
         if (!g_body) return;  /* need our own body first, so it can be excluded */
         if (now - g_av_lastfind < 1000) return;
         g_av_lastfind = now;
-        if (find_body(g_av_id, &g_av_body, &g_av_mat, g_body)) { g_av_have = 0; logf_("avatar body bound: %p (local body %p)", g_av_body, g_body); }
+        g_av_safe = 0;
+        if (find_body(g_av_id, &g_av_body, &g_av_mat, g_body)) {
+            g_av_have = 0;
+            logf_("avatar body bound: %p (local body %p)", g_av_body, g_body);
+            if (!g_av_safe) { av_safe_calls(g_av_id); g_av_safe = 1; logf_("avatar safety calls re-applied after body bind"); }
+        }
         return;
     }
     {
@@ -6458,7 +6935,8 @@ static void install_lua(HMODULE m)
     strcpy(strrchr(g_natpath, '\\') + 1, "coop_native.txt");
     o_gettop = (void *)make_detour(g_base + RVA_GETTOP, 7, h_gettop, 1);
     make_detour(g_base + RVA_ALERT, 6, h_alert, 0);
-    logf_("lua hooks installed (gettop, _ALERT); command file %s", g_cmdpath);
+    o_interact_update = (interact_update_t)make_detour(g_base + RVA_INTERACT_UPDATE, 6, make_interact_hook(), 1);
+    logf_("lua hooks installed (gettop, _ALERT); interaction monitor hook installed; command file %s", g_cmdpath);
     menu_install();
 }
 

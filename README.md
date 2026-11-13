@@ -10,6 +10,13 @@ Maintained by [HitchLangley](https://github.com/HitchLangley). Started from
 [MortyRei/fc2-coop-probe](https://github.com/MortyRei/fc2-coop-probe) (initial import, MIT);
 everything after that is developed here, on the `main` branch.
 
+This repository is a combined fork of
+[HitchLangley/fc2-coop-probe](https://github.com/HitchLangley/fc2-coop-probe) (MIT, works above
+included) with the physics, collision and entity-transform research written up in the
+[coop-anything](https://github.com/cranebeaker/coop-anything/tree/main/games/far-cry-2) Far Cry 2
+notes: see [docs/FINDINGS-physics-and-transform.md](docs/FINDINGS-physics-and-transform.md) and
+the probe commands and scripts added alongside it.
+
 ## Status (November 2026)
 
 Tested with two copies of the game on one PC; items marked "two PCs" were also run between two PCs
@@ -129,6 +136,9 @@ or run `build.bat`. Copy `dinput8.dll` into the `bin` folder of the test copy (n
 - [How it works](docs/HOW-IT-WORKS.md): who runs what, the avatar, hits, NPCs, vehicles, menu and Steam, the packets.
 - [Commands and control files](docs/COMMANDS.md).
 - [Manual setup](docs/MANUAL-SETUP.md): byte patches by hand, the Lua and command files, a direct link, the relay alone.
+- [Physics off and the entity transform](docs/FINDINGS-physics-and-transform.md): why the puppet
+  must be non-physical, how to switch physics off with the engine setter, the collision switches
+  that do not work, and the engine transform setter found with a hardware watchpoint.
 - Research notes and dated evidence: the Far Cry 2 write-up in
   [coop-anything](https://github.com/cranebeaker/coop-anything/tree/main/games/far-cry-2).
 

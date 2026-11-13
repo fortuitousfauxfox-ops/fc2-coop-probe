@@ -294,18 +294,31 @@ try {
         elseif ($l -match "pos ${pid0}: x=(\S+) y=(\S+) z=(\S+)") { $own += ,@($t, [double]$Matches[1], [double]$Matches[2]) }
         elseif ($l -match 'net: .* remote=\((\S+) (\S+) (\S+)\)') { $remote += ,@($t, [double]$Matches[1], [double]$Matches[2]) }
     }
-    # avatar vs A's position (B's `remote`) at the nearest log second
-    $errs = @()
+    # avatar vs A's position (B's `remote`) at the nearest log second.
+    # Skip a sample that sits on a jump in A's received position (the scripted `walk` releases the
+    # body at the end and it keeps the velocity the teleport writes gave it, so A flies off for a
+    # moment). In normal play the peer's position is continuous; pairing a pre-jump avatar sample
+    # with a post-jump remote sample would measure the script, not the sync.
+    $remSorted = @($remote | Sort-Object { [long]$_[0] })
+    $jumps = @()
+    for ($i = 1; $i -lt $remSorted.Count; $i++) {
+        if ((Dist2D @($remSorted[$i - 1][1], $remSorted[$i - 1][2]) @($remSorted[$i][1], $remSorted[$i][2])) -gt 3.0) {
+            $jumps += [long]$remSorted[$i][0]
+        }
+    }
+    $errs = @(); $skipped = 0
     foreach ($s in $samples) {
         $near = $remote | Sort-Object { [math]::Abs($_[0] - $s[0]) } | Select-Object -First 1
-        if ($near -and [math]::Abs($near[0] - $s[0]) -le 1000) { $errs += Dist2D @($s[1], $s[2]) @($near[1], $near[2]) }
+        if (-not $near -or [math]::Abs($near[0] - $s[0]) -gt 1000) { continue }
+        if (@($jumps | Where-Object { [math]::Abs($_ - [long]$s[0]) -le 1500 }).Count) { $skipped++; continue }
+        $errs += Dist2D @($s[1], $s[2]) @($near[1], $near[2])
     }
     $xs = $samples | ForEach-Object { $_[1] }; $ys = $samples | ForEach-Object { $_[2] }
     $span = if ($samples.Count) { [math]::Max(($xs | Measure-Object -Max -Min | ForEach-Object { $_.Maximum - $_.Minimum }), ($ys | Measure-Object -Max -Min | ForEach-Object { $_.Maximum - $_.Minimum })) } else { 0 }
     $maxErr = if ($errs.Count) { ($errs | Measure-Object -Max).Maximum } else { 999 }
     $meanErr = if ($errs.Count) { ($errs | Measure-Object -Average).Average } else { 999 }
     $drift = if ($own.Count -ge 2) { ($own | ForEach-Object { Dist2D @($_[1], $_[2]) @($own[0][1], $own[0][2]) } | Measure-Object -Max).Maximum } else { 999 }
-    Check 'walk samples' ($samples.Count -ge [int]($WalkSeconds / 2) -and $errs.Count -ge [int]($WalkSeconds / 2)) "$($samples.Count) avatar samples, $($errs.Count) paired with a remote position"
+    Check 'walk samples' ($samples.Count -ge [int]($WalkSeconds / 2) -and $errs.Count -ge [int]($WalkSeconds / 2)) "$($samples.Count) avatar samples, $($errs.Count) paired with a remote position, $skipped skipped at a position jump"
     Check 'avatar moved' ($span -ge 1.5 * $WalkRadius) ("avatar span {0:N2} m (needs >= {1:N2})" -f $span, (1.5 * $WalkRadius))
     Check 'avatar follows A' ($maxErr -le 2.5 -and $meanErr -le 1.5) ("distance to A: mean {0:N2} m, max {1:N2} m (limits 1.5 / 2.5)" -f $meanErr, $maxErr)
     Check 'B player stays put' ($drift -le 0.5) ("max drift {0:N2} m over {1} samples (limit 0.5)" -f $drift, $own.Count)
@@ -339,8 +352,14 @@ try {
         Check "window title $k" ($p.MainWindowTitle -eq $k) ("title '{0}', set {1} time(s) during the run" -f $p.MainWindowTitle, $titleSets[$k])
     }
     foreach ($k in $copies.Keys) {
-        $bad = @(LogLines $copies[$k] | Select-String 'CRASH|ACCESS VIOLATION')
-        Check "no crash lines $k" ($bad.Count -eq 0) "$($bad.Count) line(s)"
+        $ll = LogLines $copies[$k]
+        # Only an unhandled exception (the probe's `CRASH:` line) or a first-chance AV inside the
+        # game/probe is a failure. First-chance AVs inside Windows libraries (SPFILEQ.dll,
+        # SETUPAPI.dll, ...) are normal: those libraries handle them.
+        $bad = @($ll | Select-String 'CRASH:|ACCESS VIOLATION .* at (Dunia|FC2|dinput8)\.dll\+')
+        $sysAv = @($ll | Select-String 'ACCESS VIOLATION .* at (?!Dunia|FC2|dinput8)').Count
+        Say "info: $k system-library first-chance AVs: $sysAv (handled, not a crash)"
+        Check "no crash lines $k" ($bad.Count -eq 0) "$($bad.Count) crash line(s), $sysAv handled system AV line(s)"
     }
     @($samples | ForEach-Object { "avatar,{0},{1},{2}" -f $_[0], $_[1], $_[2] }) + @($remote | ForEach-Object { "remote,{0},{1},{2}" -f $_[0], $_[1], $_[2] }) + @($own | ForEach-Object { "own,{0},{1},{2}" -f $_[0], $_[1], $_[2] }) | Set-Content (Join-Path $run 'positions_b.csv')
 }
