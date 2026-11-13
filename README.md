@@ -1,24 +1,32 @@
-# fc2-coop-probe
+# fc2-coop-probe: Far Cry 2 co-op (prototype)
 
-Maintained by [HitchLangley](https://github.com/HitchLangley). Started from [MortyRei/fc2-coop-probe](https://github.com/MortyRei/fc2-coop-probe) (initial import, MIT); everything after that is developed here, on the `sync/avatar-world-npc` line.
+A two-player co-op prototype for the **Far Cry 2** campaign (Steam, version 1.03, Dunia engine).
+It is a `dinput8.dll` proxy that you drop into a **test copy** of the game: the joiner loads the
+host's save, the two games connect over a Steam relay, and each player sees the other as an
+animated avatar in the same world. It is **not** a finished mod: see the status below and the
+[open issues](https://github.com/HitchLangley/fc2-coop-probe/issues).
 
-A research tool for **Far Cry 2** (Steam, version 1.03, Dunia engine): a `dinput8.dll` proxy
-that you drop into a **test copy** of the game. Inside the running game it
+Maintained by [HitchLangley](https://github.com/HitchLangley). Started from
+[MortyRei/fc2-coop-probe](https://github.com/MortyRei/fc2-coop-probe) (initial import, MIT);
+everything after that is developed here, on the `sync/avatar-world-npc` branch.
 
-- logs Winsock, file-open and exit calls of `Dunia.dll`,
-- runs Lua 4.0 code on the game's main thread and gives the result back,
-- runs native commands (read an entity, find the player's physics body, teleport it, scan
-  memory),
-- and, as a prototype, exchanges the player's position between two copies over its own UDP
-  socket and moves an invincible avatar of the peer.
+## Status (November 2026)
 
-Since then it has grown into a two-player co-op prototype (tested with two copies on one PC,
-the latest work not yet on two PCs): an animated avatar with weapons, shots and hit sync, Steam
-relay and friend lobbies, vehicles, and the host's NPCs shown as puppets on the joiner. It is
-**not** a finished mod: missions, world state and many fight details are not synced yet. It is the code behind the Far Cry 2 write-up in
-[coop-anything](https://github.com/cranebeaker/coop-anything/tree/main/games/far-cry-2)
-(pull request: https://github.com/cranebeaker/coop-anything/pull/43); the findings, dates and
-evidence are there.
+Tested with two copies of the game on one PC; items marked "two PCs" were also run between two PCs
+over Steam. The newest work (enemies, NPC fights) has not been run on two PCs yet.
+
+| Area | State |
+|---|---|
+| Joining | Works (two PCs): Story Mode > Cooperative menu row, Steam friend lobby, Steam "Join Game"; the joiner loads the host's save; reload together |
+| Partner avatar | Works: walking and running animations, heading, weapons with switch animations, shots, grenade throw, doors, map and GPS in the hand |
+| Player hits | Works: a hit on the other player's avatar damages that player |
+| Vehicles | Works on one PC: both players in one car, seats with animations |
+| Time of day | Synced from the host |
+| NPCs | The host runs all NPCs; the joiner shows them as puppets: movement, idle actions (sitting, smoking), mounted guns. Fights are rough (see issues) |
+| Enemies attacking the joiner | Experiment, off by default (`avai 1` on the host, needs a patched entity library): host NPCs shoot the joiner and the hits take the joiner's health |
+| Not synced yet | Missions and story, pickups and other world state, death and revive, alarms at outposts |
+
+Known problems are tracked in [Issues](https://github.com/HitchLangley/fc2-coop-probe/issues).
 
 ## Read this first
 
@@ -246,9 +254,8 @@ heading code (the avatar stays at 0 degrees).
 
 ## Known limits
 
-The same as in the write-up: no walking animation for the avatar, no weapons, health or
-mission state, direct UDP has no NAT traversal (use the Steam relay), exact build only, and positions written into a body bypass
-collision (the avatar passes through scenery; it mirrors the peer's already-collided position).
+See [Issues](https://github.com/HitchLangley/fc2-coop-probe/issues) for the current list. Direct UDP has no NAT traversal (use the
+Steam relay), and every address in `src/probe.c` is for this exact `Dunia.dll` build only.
 
 ## License
 
