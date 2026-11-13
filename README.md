@@ -28,6 +28,55 @@ over Steam. The newest work (enemies, NPC fights) has not been run on two PCs ye
 
 Known problems are tracked in [Issues](https://github.com/HitchLangley/fc2-coop-probe/issues).
 
+## What has been built
+
+Everything below was made and checked in this repository after the initial import. "Two PCs" means it also ran
+between two PCs on different networks over Steam.
+
+### Joining and the menu
+- **Cooperative in the game's own menu.** Story Mode now opens a choice of **Singleplayer** and **Cooperative**.
+  Cooperative offers **Host a game** and **Join a friend's game** (a list of up to four friends hosting, with their
+  Steam names), a status line, and **Stop co-op**. Two PCs.
+- **Steam friends lobby under Far Cry 2's own AppID** (19900), so friends see "Far Cry 2". The host's lobby carries its
+  Steam name, the probe build and the save's hash; the joiner is warned about a different build or save. Two PCs.
+- **Steam "Join Game" and invites** reach the joiner's session while it waits in the friends list. Two PCs.
+- **Joining from the host's save**: the joiner loads the same save, is placed 2 m beside the host, and the avatars
+  appear. Two PCs.
+- **Reload together**: when the host loads a save, the joiner restarts with the same file and reconnects. Two PCs.
+- **Host leaves → joiner goes back to the main menu** (after a short notice). One PC.
+- **Notices in the game's corner**: "player … is joining / has left", with Steam names. Two PCs.
+
+### The other player
+- **Animated avatar**: walking, running, heading and aim from the other player, through the game's own network
+  player code (it slid in an idle pose at the start). Two PCs.
+- **Weapons in the avatar's hands**, with the game's holster and draw animations when switching; the map and the GPS
+  are held like the other player holds them. One PC.
+- **Shots and hits**: the avatar fires where the other player fired, and a hit on the avatar damages that player.
+  Two PCs.
+- **Grenade throws and doors** play on the avatar; a door opens for both. One PC.
+- **The other player's arrow on the map**: the host's arrow is green, the joiner's yellow (a new map icon built from
+  the game's own arrow). Two PCs.
+- **Vehicles**: a car driven by one player moves for the other; the avatar gets in, drives and gets out with the
+  game's animations; two players in one car. One PC.
+
+### The world and NPCs
+- **Time of day** follows the host.
+- **One world of NPCs**: the host's AI runs every NPC; the joiner shows them as puppets that walk the host's path,
+  play the same idle actions (sitting on boxes, smoking, phone calls) and man the same mounted guns. The joiner's own
+  reinforcements are switched off. One PC.
+- **NPCs react to the joiner**: the joiner's hits alarm the host's NPCs; hands-up and shove reactions to the joiner
+  are passed to the host. One PC.
+- **Enemies fight the joiner** (experiment, off by default, `avai 1`): host NPCs see and shoot the joiner's avatar
+  and the hits take the joiner's health. One PC.
+
+### Tools for development
+- A Lua channel and about a hundred native commands inside the running game ([commands](docs/COMMANDS.md)).
+- Scripts that set up test copies, fetch the Steam library, start a co-op session from the menu, and route Steam's
+  Join Game into it ([scripts](scripts)).
+- Python tools for the game's archives and entity libraries, used to build the map icon, the two-sided hand map and
+  the experimental AI avatar ([tools](tools)).
+- An automated test that drives two game copies on one PC and checks positions and heading.
+
 ## Read this first
 
 - Single-player campaign only. Do not use it online; PunkBuster is not touched and nothing
@@ -38,6 +87,31 @@ Known problems are tracked in [Issues](https://github.com/HitchLangley/fc2-coop-
   SHA-256 `6353936a54aa841350bb30ff005727859cdef1aa10c209209b220b399e862765`,
   20,183,176 bytes (Steam build id 52164). Other builds need new addresses.
 - The game files are not included and not needed here.
+
+## Quick start
+
+You need: Far Cry 2 from Steam (version 1.03), two test copies of the game folder (or one per PC), Python 3 (64-bit)
+and, on each PC, a Steam account that owns Far Cry 2 and is a friend of the other player's account.
+
+1. **Test copy.** `scripts/setup-copy.ps1 -Letter A -PrivateDir <folder>` (host) or `-Letter B` (joiner) copies your
+   install, checks the
+   `Dunia.dll` build and patches the copy so that it runs next to the normal game with its own profile and saves.
+   It never touches the real install or the real saves.
+   `-PrivateDir` holds a `GamerProfile.xml` and the one save both players load; it goes into the copy's own profile.
+2. **Entity library patch.** The avatar needs the network player archetype from the Far Cry 2 modding guide's
+   "Pre-gathered Files (NO CHANGES)" patch (`patch.fat` / `patch.dat` in `Data_Win32`). On top of it,
+   `tools/make_peer_arrow.py` adds the other player's map arrow and `tools/make_map_twosided.py` makes the hand map
+   visible from both sides. Game files are not shipped here; each tool builds the patch from your own copy.
+3. **Steam library.** `scripts/get-steam-api.ps1` downloads `steam_api64.dll` (Steamworks.NET, checked by SHA-256)
+   for the relay.
+4. **Build or take the probe** (`dinput8.dll`, see Build below) and put it into the copy's `bin` folder.
+5. **Play.** On both PCs run
+   `powershell -ExecutionPolicy Bypass -File scripts\start-coop.ps1 -Role menu -TestDir <test copy> -SteamDll <steam_api64.dll>`.
+   In the game: Story Mode → Cooperative → **Host a game** (host) or **Join a friend's game** (joiner, pick the host),
+   then load the save with the game's own Continue. The joiner needs the host's save file in its profile.
+
+`-Role host` and `-Role join` start the same session without the menu. [Manual setup](docs/MANUAL-SETUP.md) has the
+older, fully manual way and a direct UDP link without Steam.
 
 ## Build
 
@@ -50,156 +124,25 @@ gcc -O1 -shared -o dinput8.dll src/probe.c src/probe.def -lws2_32 -static-libgcc
 or run `build.bat`. Copy `dinput8.dll` into the `bin` folder of the test copy (next to
 `FarCry2.exe`). On start it writes `coop_probe.log` in that folder.
 
-## Use
+## Documentation
 
-The game is controlled through two files that you create in the same `bin` folder. The
-probe polls them from the game's main loop about four times a second, runs them and
-**deletes** them.
+- [How it works](docs/HOW-IT-WORKS.md): who runs what, the avatar, hits, NPCs, vehicles, menu and Steam, the packets.
+- [Commands and control files](docs/COMMANDS.md).
+- [Manual setup](docs/MANUAL-SETUP.md): byte patches by hand, the Lua and command files, a direct link, the relay alone.
+- Research notes and dated evidence: the Far Cry 2 write-up in
+  [coop-anything](https://github.com/cranebeaker/coop-anything/tree/main/games/far-cry-2).
 
-### `coop_cmd.lua`: Lua code
+## Tools
 
-The code runs in the game's main Lua state. Put the answer into the global `__out` (a string);
-it is logged as `cmd executed (N bytes) status=S out(L)=...`. `print` and `_ALERT` show
-nothing in this build. Examples:
-
-```lua
-__out = "alive " .. (1 + 2)
-__out = GetLocalPlayerId()
-__out = tostring(IsEntityValid(GetLocalPlayerId()))
-s = "" foreach(globals(), function(k, v) s = s .. k .. " " end) __out = s
-```
-
-Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1 a run error,
-3 a syntax error. Entity ids are 64-bit and come as decimal strings.
-
-### `coop_native.txt`: native commands, one per line
-
-| Command | What it does |
+| Tool | What |
 |---|---|
-| `pos <id>` | Log position and direction of the entity (matrix at `entity+0x30`) |
-| `setpos <id> <x> <y> <z>` | Write the entity matrix position once (does not stick; the body overrides it) |
-| `ent <id> <len>` | Log the entity object address, vtable and `len` bytes as hex, with a float column |
-| `peek <hexaddr> <len>` | Hex dump of memory (float column) |
-| `poke <hexaddr> <hex32>` / `pokef <hexaddr> <float>` | Write a 32-bit value / a float |
-| `scan <x> <y>` | Scan memory for the float pair (tolerance 0.01; y within 16 bytes after x) |
-| `findbody <id>` | Find the Havok body (class vtable RVA `0xE67658`) nearest to the entity and cache it |
-| `posb` / `tpb <x> <y> <z>` | Read / write the cached body's position (teleport) |
-| `walk <radius> <seconds> <speed>` | Move the cached (local) body on a circle every frame (needs `netstart` running) |
-| `hold <id> <x> <y> <z>` / `unhold` | Write the entity matrix position every tick (does not stick; kept as the negative test) |
-| `follow <id> <hex offsets>` / `tp <id> <x> <y> <z> <hex offsets>` | Follow a pointer chain from the entity; write the position at its end |
-| `bodyvel` / `avvel <x> <y> <z> <hexoffset>` | Write three floats into the cached / avatar body at an offset |
-| `netstart <localport> <peerip> <peerport> <id>` | Open the UDP transport and start the avatar logic (peer `127.x`: loopback only; any other address: listens on all interfaces, accepts packets from that address only) |
-| `netstop` | Stop it and remove the avatar |
-
-## Two copies on one PC
-
-Each test copy needs three same-length byte patches in its own `Dunia.dll` (the copy of the
-file in that test folder, never the original; keep a backup). Offsets for the build above:
-
-1. **Mutex name.** The string `FarCry2Instance` (file offset `0xE08950`): change one
-   character (for example `FarCry2InstancA` / `FarCry2InstancB`) so both copies can run.
-2. **Profile folder.** The 10-byte string `\Far Cry 2` (file offset `0xE0E094`, next to
-   `\GamerProfile.xml` and `\My Games`): replace it with another 10-byte string (for example
-   `\FC2test_A` / `\FC2test_B`). The profile and the save that is opened then come from
-   `Documents\My Games\FC2test_A\`. Give each copy that folder with a copy of your
-   `GamerProfile.xml` (set `Fullscreen="0"` and a small resolution) and, to load a save, a
-   `Saved Games` folder with a copy of one `.sav`. Without a profile file the client quits.
-3. **Save list folder.** The 19-byte string `My Games\Far Cry 2\` (file offset `0xE089A0`):
-   replace it with the same folder, e.g. `My Games\FC2test_A\`. The list of saves behind
-   Continue / Load Game is built from this folder. Without this patch a copy lists the saves in
-   your real profile folder, and on a PC where the game never ran it lists none (only
-   New Story). This patch alone does not move the profile: patch 2 does that (check the
-   `CreateFileW ... GamerProfile.xml` and `... .sav` lines in `coop_probe.log`).
-
-Expect 17 changed bytes in total compared with the original `Dunia.dll`.
-
-Then start each copy by hand, press Continue, and wait until you are in the world.
-
-Then, in each `bin` folder, create `coop_native.txt` (the entity id of the main character
-is the same in both copies when they load the same save; get it with `GetLocalPlayerId()`):
-
-```
-netstart 9101 127.0.0.1 9102 <id>     (copy A)
-netstart 9102 127.0.0.1 9101 <id>     (copy B)
-```
-
-The log shows `net: tx=... rx=... drop=...` once a second. After the first packet each copy
-spawns an avatar of the peer (`SpawnEntityFromArchetype` with the local player's own name),
-makes it invincible (`CFCXCountersComponent_SetInvincible`) and drives its body.
-
-### Two PCs
-
-Give each copy the other PC's address instead of `127.0.0.1` (for example
-`netstart 9101 <IP of PC B> 9102 <id>` on A and `netstart 9102 <IP of PC A> 9101 <id>` on B).
-With a non-loopback peer the probe binds its port on all interfaces and counts only packets
-of the right size and magic from the peer's IP (the source port is not checked, NAT may change
-it); everything else increments `drop`. The PCs must reach each other: same LAN, a virtual LAN
-(VPN), or UDP port forwarding. There is no NAT traversal, relay or encryption, so the port is
-open to anyone who can reach it (only the peer's packets are used). Tested so far only with both
-copies on one PC, sending to that PC's own LAN address.
-
-### Through Steam, without IP addresses: `relay/fc2_relay.py`
-
-A relay next to each game copy carries the probe's packets, so friends don't need IPs or port
-forwarding. The probe talks only to its local relay: `netstart <game port> 127.0.0.1 <relay port> <id>`.
-Python 3, 64-bit; the Steam transport also needs the Steam client running and `steam_api64.dll`
-from the Steamworks.NET Standalone release 2025.164.1 (`Windows-x64/steam_api64.dll`,
-SHA-256 `eb17909a76668cf9ae0b92a618a34a50f6c73d3a6787cb4dd8ce36a8b10bfb75`; not included here).
-It runs as Steam's free "Spacewar" app (AppID 480), so friends see you as "playing Spacewar".
-
-```
-host:   python relay\fc2_relay.py --transport steam --host --steam-dll <steam_api64.dll> --game-port 9101 --relay-port 9201 [--invite "<friend's Steam name>"]
-friend: python relay\fc2_relay.py --transport steam --join friend --steam-dll <steam_api64.dll> --game-port 9102 --relay-port 9202
-   or:  python relay\fc2_relay.py --transport steam --join wait   --steam-dll <steam_api64.dll> --game-port 9102 --relay-port 9202
-```
-
-The host creates a friends-only lobby (tagged `fc2coop=1`), sets its Steam rich presence `connect` to
-`+connect_lobby <id>`, and logs the id; the friend joins by id (`--join <id>`), with `--join friend`, which
-finds a friend hosting one, or with `--join wait`, which joins when the friend accepts the host's Steam
-invite (`--invite`) or clicks Join Game on the host in the Steam friends list (Steam callbacks 333 and 337;
-start the relay before accepting, otherwise Steam starts the real Spacewar instead). Sessions are accepted only
-from lobby members; probe packets go unreliable on channel 0, a keep-alive and goodbye go reliable on
-channel 1, and a peer silent for 20 s is dropped. `--transport udp --udp-local <port> --udp-peer <port>`
-is a stand-in that relays over plain UDP, used by the test to run the whole chain on one PC.
-
-### Two PCs over Steam: `scripts/`
-
-- `scripts/setup-copy.ps1 -Letter A|B -PrivateDir <folder> [-Probe <dinput8.dll>]`: finds the game, checks
-  the Dunia.dll hash, copies the install to `<drive>\fc2-coop\test-<letter>`, backs up and applies the three
-  patches above (checks 17 changed bytes), installs the probe, and creates `Documents\My Games\FC2test_<letter>`
-  from `-PrivateDir` (one `GamerProfile.xml` and the one `.sav` both PCs load).
-- `scripts/get-steam-api.ps1`: downloads Steamworks.NET Standalone 2025.164.1 and checks the zip and
-  `steam_api64.dll` hashes.
-- `scripts/start-coop.ps1 -Role host|join -TestDir <copy> -SteamDll <steam_api64.dll> [-Python <python.exe>]
-  [-Invite "<friend's Steam name>"] [-Join friend|wait]`:
-  checks the copy's patches and that its profile folder has a save (so Enter can never start a New Story),
-  starts the copy (window title `A` / `B`, kept for the run), presses Enter until the save opens, waits for the
-  player id, starts the relay (host: lobby; join: finds the friend's lobby, retrying for up to 10 min), runs
-  `netstart`, prints the link state every 5 s, and on the join side samples the avatar's and the own player's
-  position every 2 s. Kill switch on the real profile path; logs in `<copy>\coop-runs\<time>-<role>\`.
-
-Tested:
-- the whole chain through two udp relays with both copies on one PC (the two-copy test with `-Relay`);
-- **two PCs on different networks, two Steam accounts that are friends (Steam 1.03 on both)**, 2026-10-25:
-  the joining relay found the host's lobby through the friends list, the session was accepted, and the first
-  message was decoded with the sender identity at offset 16 (x64). Probe packets went both ways at about 16/s
-  for ~7 minutes with 0 dropped on both sides and no disconnect. `walk 3 20 2` on the host: on the joining PC the
-  avatar (sampled every 2 s) went round about two circles of radius ~3 m centred on the expected point
-  (2 m/s x 20 s = 40 m), while that PC's own player stayed within ~0.1 m. The owner saw the avatar move on both
-  screens. When the joining PC stopped, the host marked the peer down after the 20 s timeout.
-  Heading was not exercised in that run (`walk` does not turn the player);
-- **heading across the two PCs**, 2026-10-25: the host's player turned with the mouse 171.3 → 81.3 → -171.3 →
-  77.6 degrees; the joining PC's avatar (sampled every 2 s) showed the same four headings, 1-2 s later (the
-  sample step), while staying in place;
-- **Steam invite**, 2026-10-25: host `--invite <name>`, joining relay `--join wait`; when the invite was accepted
-  on the second PC, the relay got callback 333, entered the lobby, and the link and avatar came up within 3 s;
-- **Join Game** from the Steam friends list, 2026-10-25: host without an invite, joining relay `--join wait`;
-  Join Game on the host in the second PC's friends list joined the host's new lobby, also through callback
-  **333** (the host is in a joinable lobby; 337 with only a connect string was not observed, but is handled);
-- in all these runs: 0 dropped, no crash lines, neither probe log named a real profile folder; when one side
-  stopped, the other marked the peer down after the 20 s timeout.
-- Not tested yet: Join Game or an invite while the relay is not running (Steam then starts the real Spacewar),
-  longer sessions, packet loss.
+| `tools/fat_extract.py` | read and extract files from the game's FAT2 archives (with LZO1X) |
+| `tools/fcb.py` | read Dunia binary object files such as the entity libraries |
+| `tools/make_peer_arrow.py` | build a patch pair with the other player's yellow map arrow |
+| `tools/make_map_twosided.py` | build a patch pair whose hand map materials are two-sided |
+| `tools/make_avatar_ai.py` | build a patch pair with `coop.PawnPlayerAI`, the avatar that host NPCs can fight (`avai 1`) |
+| `relay/fc2_relay.py` | the Steam relay that `start-coop` runs |
+| `scripts/*.ps1` | set up a copy, get the Steam library, start a session, Steam launch wrapper |
 
 ## Automated two-copy test
 
@@ -229,28 +172,6 @@ the ~2.5 minutes it runs. Exit code 0 = pass, 1 = a check failed, 2 = setup prob
 `B player stays put` is the one that catches the avatar-binding bug (with the unfixed probe
 B's own player was dragged 16 m); `avatar heading follows A` fails on a probe without the
 heading code (the avatar stays at 0 degrees).
-
-## How it works
-
-- `DllMain` loads the real `dinput8.dll` and a watcher thread patches the import table
-  of `Dunia.dll` (`bind`, `connect`, `sendto`, `recvfrom`, `WSASendTo`, `WSARecvFrom`,
-  `getaddrinfo`, `gethostbyname`, `CreateFileA/W`, `PeekMessageA/W`, `PostQuitMessage`).
-- An inline detour on `lua_gettop` captures the Lua state; the Lua entry points are
-  `lua_dobuffer`, `lua_getglobal`, `lua_settop` and `luaL_check_lstr` at fixed RVAs.
-- `PeekMessage` runs on the main thread when no script runs, so commands, the per-frame body
-  writes and the transport run there.
-- The physics body is found by scanning memory in 64 KiB chunks with `ReadProcessMemory`
-  (a plain read can fault when another thread frees a page) for objects of one class and
-  taking the one whose motion transform is nearest to the entity. Heap addresses change every
-  session; the class does not.
-- Heading: the body is an upright capsule whose rotation is always identity; where a pawn faces
-  is the yaw in the entity matrix (`entity+0x30`, rows `(d0,d1,0)`, `(-d1,d0,0)`, `(0,0,1)`). For
-  the local player the controller rewrites it every frame from mouse look; the avatar has no
-  controller, so the rotation the probe writes there each tick stays (smoothed 25 % per tick).
-  Writing the body's rotation, or calling `TeleportEntity` with angles, changes nothing;
-  `SpawnEntityFromArchetype` only uses its last argument (yaw in degrees) at spawn.
-- An exception filter and a vectored handler log access violations. Many at start-up come
-  from system libraries and are harmless.
 
 ## Known limits
 
