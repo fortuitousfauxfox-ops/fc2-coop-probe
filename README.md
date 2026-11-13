@@ -8,7 +8,7 @@ animated avatar in the same world. It is **not** a finished mod: see the status 
 
 Maintained by [HitchLangley](https://github.com/HitchLangley). Started from
 [MortyRei/fc2-coop-probe](https://github.com/MortyRei/fc2-coop-probe) (initial import, MIT);
-everything after that is developed here, on the `sync/avatar-world-npc` branch.
+everything after that is developed here, on the `main` branch.
 
 ## Status (November 2026)
 
